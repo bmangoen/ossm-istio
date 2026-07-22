@@ -1,5 +1,6 @@
+{{- if or (eq .Values.global.resourceScope "all") (eq .Values.global.resourceScope "namespace") }}
 # Created if this is not a remote istiod, OR if it is and is also a config cluster
-{{- if or (and .Values.istiodRemote.enabled .Values.global.configCluster) (not .Values.istiodRemote.enabled) }}
+{{- if or (not .Values.istiodRemote.enabled) (and .Values.istiodRemote.enabled (or .Values.global.configCluster .Values.istiodRemote.enabledLocalInjectorIstiod)) }}
 {{- if .Values.experimental.stableValidationPolicy }}
 apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingAdmissionPolicy
@@ -39,6 +40,8 @@ spec:
       expression: "object.kind == 'ProxyConfig'"
     - name: isTelemetry
       expression: "object.kind == 'Telemetry'"
+    - name: isAuthorizationPolicy
+      expression: "object.kind == 'AuthorizationPolicy'"
   validations:
     - expression: "!variables.isEnvoyFilter"
     - expression: "!variables.isWasmPlugin"
@@ -51,6 +54,16 @@ spec:
             (has(object.spec.accessLogging) ? object.spec.accessLogging : {}).exists(l, has(l.filter))
           )
         )
+    - expression: |
+        !(
+          variables.isAuthorizationPolicy &&
+          has(object.spec.rules) &&
+          object.spec.rules.exists(r,
+            has(r.from) && r.from.exists(f,
+              has(f.source) && (has(f.source.trustDomains) || has(f.source.notTrustDomains))
+            )
+          )
+        )
 ---
 apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingAdmissionPolicyBinding
@@ -59,5 +72,6 @@ metadata:
 spec:
   policyName: "stable-channel-policy{{- if not (eq .Values.revision "") }}-{{ .Values.revision }}{{- end }}-{{ .Values.global.istioNamespace }}.istio.io"
   validationActions: [Deny]
+{{- end }}
 {{- end }}
 {{- end }}

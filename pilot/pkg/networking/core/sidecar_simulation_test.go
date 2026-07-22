@@ -26,6 +26,7 @@ import (
 	endpoint "github.com/envoyproxy/go-control-plane/envoy/config/endpoint/v3"
 	listener "github.com/envoyproxy/go-control-plane/envoy/config/listener/v3"
 	tls "github.com/envoyproxy/go-control-plane/envoy/extensions/transport_sockets/tls/v3"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 
 	meshconfig "istio.io/api/mesh/v1alpha1"
@@ -1354,6 +1355,7 @@ func TestPassthroughTraffic(t *testing.T) {
 	for _, tp := range []meshconfig.MeshConfig_OutboundTrafficPolicy_Mode{
 		meshconfig.MeshConfig_OutboundTrafficPolicy_REGISTRY_ONLY,
 		meshconfig.MeshConfig_OutboundTrafficPolicy_ALLOW_ANY,
+		meshconfig.MeshConfig_OutboundTrafficPolicy_ALLOW_ANY_DYNAMIC_DNS,
 	} {
 		t.Run(tp.String(), func(t *testing.T) {
 			o := xds.FakeOptions{
@@ -1364,8 +1366,9 @@ func TestPassthroughTraffic(t *testing.T) {
 				}(),
 			}
 			expectedCluster := map[meshconfig.MeshConfig_OutboundTrafficPolicy_Mode]string{
-				meshconfig.MeshConfig_OutboundTrafficPolicy_REGISTRY_ONLY: util.BlackHoleCluster,
-				meshconfig.MeshConfig_OutboundTrafficPolicy_ALLOW_ANY:     util.PassthroughCluster,
+				meshconfig.MeshConfig_OutboundTrafficPolicy_REGISTRY_ONLY:         util.BlackHoleCluster,
+				meshconfig.MeshConfig_OutboundTrafficPolicy_ALLOW_ANY:             util.PassthroughCluster,
+				meshconfig.MeshConfig_OutboundTrafficPolicy_ALLOW_ANY_DYNAMIC_DNS: util.AllowAnyDynamicDNSCluster,
 			}[tp]
 			t.Run("with VIP", func(t *testing.T) {
 				testCalls := []simulation.Expect{}
@@ -1377,11 +1380,25 @@ func TestPassthroughTraffic(t *testing.T) {
 							ClusterMatched: expectedCluster,
 						},
 					}
-					// For blackhole, we will 502 where possible instead of blackhole cluster
-					// This only works for HTTP on HTTP
-					if expectedCluster == util.BlackHoleCluster && call.IsHTTP() && isHTTPPort(call.Port) {
-						e.Result.ClusterMatched = ""
-						e.Result.VirtualHostMatched = util.BlackHole
+					// With VIP, call address doesn't match VIP so traffic goes through
+					// virtualOutbound. Mode-specific overrides:
+					switch tp {
+					case meshconfig.MeshConfig_OutboundTrafficPolicy_REGISTRY_ONLY:
+						// 502 via blackhole VH where possible (HTTP on HTTP ports)
+						if call.IsHTTP() && isHTTPPort(call.Port) {
+							e.Result.ClusterMatched = ""
+							e.Result.VirtualHostMatched = util.BlackHole
+						}
+					case meshconfig.MeshConfig_OutboundTrafficPolicy_ALLOW_ANY:
+						if call.Protocol == simulation.TCP && call.TLS == simulation.Plaintext &&
+							!isHTTPPort(call.Port) {
+							e.Result.ClusterMatched = util.PassthroughCluster
+						}
+					case meshconfig.MeshConfig_OutboundTrafficPolicy_ALLOW_ANY_DYNAMIC_DNS:
+						// Only plaintext HTTP goes via DFP; everything else PassthroughCluster.
+						if call.TLS != simulation.Plaintext || !call.IsHTTP() {
+							e.Result.ClusterMatched = util.PassthroughCluster
+						}
 					}
 					testCalls = append(testCalls, e)
 				}
@@ -1414,11 +1431,21 @@ spec:
 							ClusterMatched: expectedCluster,
 						},
 					}
-					// For blackhole, we will 502 where possible instead of blackhole cluster
-					// This only works for HTTP on HTTP
-					if expectedCluster == util.BlackHoleCluster && call.IsHTTP() && (isHTTPPort(call.Port) || isAutoPort(call.Port)) {
-						e.Result.ClusterMatched = ""
-						e.Result.VirtualHostMatched = util.BlackHole
+					// Without VIP, traffic goes to per-port listeners. Mode-specific overrides:
+					switch tp {
+					case meshconfig.MeshConfig_OutboundTrafficPolicy_REGISTRY_ONLY:
+						// 502 via blackhole VH where possible (HTTP on HTTP/auto ports)
+						if call.IsHTTP() && (isHTTPPort(call.Port) || isAutoPort(call.Port)) {
+							e.Result.ClusterMatched = ""
+							e.Result.VirtualHostMatched = util.BlackHole
+						}
+					case meshconfig.MeshConfig_OutboundTrafficPolicy_ALLOW_ANY_DYNAMIC_DNS:
+						// Only plaintext HTTP on HCM ports (HTTP/GRPC/H2/auto) uses DFP
+						// (already the default); everything else PassthroughCluster.
+						if call.TLS != simulation.Plaintext || !call.IsHTTP() ||
+							!(isHTTPPort(call.Port) || isAutoPort(call.Port)) {
+							e.Result.ClusterMatched = util.PassthroughCluster
+						}
 					}
 					// TCP without a VIP will capture everything.
 					// Auto without a VIP is similar, but HTTP happens to work because routing is done on header
@@ -1802,7 +1829,7 @@ func (args vsArgs) Config(t *testing.T, variant string) string {
 	}
 	switch variant {
 	case "httproute":
-		return tmpl.MustEvaluate(`apiVersion: gateway.networking.k8s.io/v1beta1
+		return tmpl.MustEvaluate(`apiVersion: gateway.networking.k8s.io/v1
 kind: HTTPRoute
 metadata:
   name: "{{.Namespace}}{{.Match | replace "*" "wild"}}{{.Dest}}"
@@ -2614,17 +2641,13 @@ spec:
 					for _, tc := range tt.cfg {
 						cfg = cfg + "\n---\n" + tc.Config(t, variant)
 					}
-					istio, k, err := crd.ParseInputs(cfg)
-					if err != nil {
-						t.Fatal(err)
-					}
-					kubeo, err := kube.SlowConvertKindsToRuntimeObjects(k)
+					istio, _, err := crd.ParseInputs(cfg)
 					if err != nil {
 						t.Fatal(err)
 					}
 					s := xds.NewFakeDiscoveryServer(t, xds.FakeOptions{
-						Configs:           istio,
-						KubernetesObjects: kubeo,
+						Configs:                istio,
+						KubernetesObjectString: cfg,
 					})
 					sim := simulation.NewSimulation(t, s, s.SetupProxy(tt.proxy))
 					xdstest.ValidateListeners(t, sim.Listeners)
@@ -2649,4 +2672,31 @@ spec:
 			}
 		})
 	}
+}
+
+func SlowConvertKindsToRuntimeObjects(in []crd.IstioKind) ([]runtime.Object, error) {
+	res := make([]runtime.Object, 0, len(in))
+	for _, o := range in {
+		r, err := SlowConvertToRuntimeObject(&o)
+		if err != nil {
+			return nil, err
+		}
+		res = append(res, r)
+	}
+	return res, nil
+}
+
+// SlowConvertToRuntimeObject converts an IstioKind to a runtime.Object.
+// As the name implies, it is not efficient.
+func SlowConvertToRuntimeObject(in *crd.IstioKind) (runtime.Object, error) {
+	by, err := config.ToJSON(in)
+	if err != nil {
+		return nil, err
+	}
+	gvk := in.GetObjectKind().GroupVersionKind()
+	obj, _, err := kube.IstioCodec.UniversalDeserializer().Decode(by, &gvk, nil)
+	if err != nil {
+		return nil, err
+	}
+	return obj, nil
 }

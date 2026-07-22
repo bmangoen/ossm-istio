@@ -66,6 +66,7 @@ spec:
       grpc: 3550
       http: 8080
     serviceAccount: test
+    weight: 100
 `
 )
 
@@ -106,14 +107,14 @@ func TestWorkloadGroupCreate(t *testing.T) {
 		{
 			description: "valid case - create full workload group",
 			args: strings.Split("group create --name foo --namespace bar --labels app=foo,bar=baz "+
-				" --annotations annotation=foobar --ports grpc=3550,http=8080 --serviceAccount test", " "),
+				" --annotations annotation=foobar --ports grpc=3550,http=8080 --serviceAccount test --weight 100", " "),
 			expectedException: false,
 			expectedOutput:    customYAML,
 		},
 		{
 			description: "valid case - create full workload group with shortnames",
 			args: strings.Split("group create --name foo -n bar -l app=foo,bar=baz -p grpc=3550,http=8080"+
-				" -a annotation=foobar --serviceAccount test", " "),
+				" -a annotation=foobar --serviceAccount test --weight 100", " "),
 			expectedException: false,
 			expectedOutput:    customYAML,
 		},
@@ -399,7 +400,7 @@ func runTestCmd(t *testing.T, createResourceFunc func(client kube.CLIClient), re
 	})
 	rootCmd := Cmd(ctx)
 	rootCmd.SetArgs(args)
-	client, err := ctx.CLIClientWithRevision(rev)
+	client, err := ctx.CLIClientWithRevision(ctx.RevisionOrDefault(rev))
 	if err != nil {
 		return "", err
 	}
@@ -454,31 +455,6 @@ func TestConvertToMap(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			if got := convertToStringMap(tt.arg); !reflect.DeepEqual(got, tt.want) {
 				t.Errorf("convertToStringMap() = %v, want %v", got, tt.want)
-			}
-		})
-	}
-}
-
-func TestSplitEqual(t *testing.T) {
-	tests := []struct {
-		arg       string
-		wantKey   string
-		wantValue string
-	}{
-		{arg: "key=value", wantKey: "key", wantValue: "value"},
-		{arg: "key==value", wantKey: "key", wantValue: "=value"},
-		{arg: "key=", wantKey: "key", wantValue: ""},
-		{arg: "key", wantKey: "key", wantValue: ""},
-		{arg: "", wantKey: "", wantValue: ""},
-	}
-	for _, tt := range tests {
-		t.Run(tt.arg, func(t *testing.T) {
-			gotKey, gotValue := splitEqual(tt.arg)
-			if gotKey != tt.wantKey {
-				t.Errorf("splitEqual(%v) got = %v, want %v", tt.arg, gotKey, tt.wantKey)
-			}
-			if gotValue != tt.wantValue {
-				t.Errorf("splitEqual(%v) got1 = %v, want %v", tt.arg, gotValue, tt.wantValue)
 			}
 		})
 	}

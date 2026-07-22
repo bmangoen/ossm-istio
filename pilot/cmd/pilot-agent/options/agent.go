@@ -22,6 +22,7 @@ import (
 	meshconfig "istio.io/api/mesh/v1alpha1"
 	"istio.io/istio/pkg/bootstrap/platform"
 	istioagent "istio.io/istio/pkg/istio-agent"
+	"istio.io/istio/pkg/ptr"
 	"istio.io/istio/pkg/util/sets"
 	"istio.io/istio/pkg/wasm"
 )
@@ -49,27 +50,31 @@ func NewAgentOptions(proxy *ProxyArgs, cfg *meshconfig.ProxyConfig, sds istioage
 			HTTPRequestTimeout:    wasmHTTPRequestTimeout,
 			HTTPRequestMaxRetries: wasmHTTPRequestMaxRetries,
 		},
-		ProxyIPAddresses:            proxy.IPAddresses,
-		ServiceNode:                 proxy.ServiceNode(),
-		EnvoyStatusPort:             envoyStatusPortEnv,
-		EnvoyPrometheusPort:         envoyPrometheusPortEnv,
-		MinimumDrainDuration:        minimumDrainDurationEnv,
-		ExitOnZeroActiveConnections: exitOnZeroActiveConnectionsEnv,
-		Platform:                    platform.Discover(proxy.SupportsIPv6()),
-		GRPCBootstrapPath:           grpcBootstrapEnv,
-		DisableEnvoy:                disableEnvoyEnv,
-		ProxyXDSDebugViaAgent:       proxyXDSDebugViaAgent,
-		ProxyXDSDebugViaAgentPort:   proxyXDSDebugViaAgentPort,
-		DNSCapture:                  DNSCaptureByAgent.Get(),
-		DNSAtGateway:                EnableDNSAtGateway.Get(),
-		DNSForwardParallel:          DNSForwardParallel.Get(),
-		DNSAddr:                     DNSCaptureAddr.Get(),
-		ProxyNamespace:              PodNamespaceVar.Get(),
-		ProxyDomain:                 proxy.DNSDomain,
-		IstiodSAN:                   istiodSAN.Get(),
-		MetadataDiscovery:           enableWDSEnv,
-		SDSFactory:                  sds,
-		WorkloadIdentitySocketFile:  workloadIdentitySocketFile,
+		ProxyIPAddresses:             proxy.IPAddresses,
+		ServiceNode:                  proxy.ServiceNode(),
+		EnvoyStatusPort:              envoyStatusPortEnv,
+		EnvoyPrometheusPort:          envoyPrometheusPortEnv,
+		EnvoySecureMetricsPort:       envoySecureMetricsPortEnv,
+		EnvoySecureMergedMetricsPort: envoySecureMergedMetricsPortEnv,
+		MinimumDrainDuration:         minimumDrainDurationEnv,
+		ExitOnZeroActiveConnections:  exitOnZeroActiveConnectionsEnv,
+		Platform:                     platform.Discover(proxy.SupportsIPv6()),
+		GRPCBootstrapPath:            grpcBootstrapEnv,
+		DisableEnvoy:                 disableEnvoyEnv,
+		DNSCapture:                   DNSCaptureByAgent.Get(),
+		DNSAtGateway:                 EnableDNSAtGateway.Get(),
+		DNSForwardParallel:           DNSForwardParallel.Get(),
+		DNSForwardTimeout:            DNSForwardTimeout.Get(),
+		DNSAddr:                      DNSCaptureAddr.Get(),
+		ProxyNamespace:               PodNamespaceVar.Get(),
+		ProxyDomain:                  proxy.DNSDomain,
+		IstiodSAN:                    istiodSAN.Get(),
+		SDSFactory:                   sds,
+		WorkloadIdentitySocketFile:   workloadIdentitySocketFile,
+		EnvoySkipDeprecatedLogs:      envoySkipDeprecatedLogsEnv,
+	}
+	if enableWDSEnvWasSet {
+		o.MetadataDiscovery = ptr.Of(enableWDSEnv)
 	}
 	extractXDSHeadersFromEnv(o)
 	return o

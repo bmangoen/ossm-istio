@@ -17,7 +17,6 @@ package aggregate
 import (
 	"sync"
 
-	"istio.io/istio/pilot/pkg/features"
 	"istio.io/istio/pilot/pkg/model"
 	"istio.io/istio/pilot/pkg/serviceregistry"
 	"istio.io/istio/pilot/pkg/serviceregistry/provider"
@@ -28,7 +27,6 @@ import (
 	"istio.io/istio/pkg/log"
 	"istio.io/istio/pkg/maps"
 	"istio.io/istio/pkg/slices"
-	"istio.io/istio/pkg/util/sets"
 )
 
 // The aggregate controller does not implement serviceregistry.Instance since it may be comprised of various
@@ -40,7 +38,8 @@ var (
 
 // Controller aggregates data across different registries and monitors for changes
 type Controller struct {
-	meshHolder mesh.Holder
+	meshHolder      mesh.Holder
+	configClusterID cluster.ID
 
 	// The lock is used to protect the registries and controller's running status.
 	storeLock  sync.RWMutex
@@ -54,82 +53,6 @@ type Controller struct {
 	model.NetworkGatewaysHandler
 }
 
-func (c *Controller) ServicesForWaypoint(key model.WaypointKey) []model.ServiceInfo {
-	if !features.EnableAmbient {
-		return nil
-	}
-	var res []model.ServiceInfo
-	for _, p := range c.GetRegistries() {
-		res = append(res, p.ServicesForWaypoint(key)...)
-	}
-	return res
-}
-
-func (c *Controller) ServicesWithWaypoint(key string) []model.ServiceWaypointInfo {
-	if !features.EnableAmbient {
-		return nil
-	}
-	var res []model.ServiceWaypointInfo
-	for _, p := range c.GetRegistries() {
-		res = append(res, p.ServicesWithWaypoint(key)...)
-	}
-	return res
-}
-
-func (c *Controller) WorkloadsForWaypoint(key model.WaypointKey) []model.WorkloadInfo {
-	if !features.EnableAmbientWaypoints {
-		return nil
-	}
-	var res []model.WorkloadInfo
-	for _, p := range c.GetRegistries() {
-		res = append(res, p.WorkloadsForWaypoint(key)...)
-	}
-	return res
-}
-
-func (c *Controller) AdditionalPodSubscriptions(proxy *model.Proxy, addr, cur sets.String) sets.String {
-	if !features.EnableAmbient {
-		return nil
-	}
-	res := sets.New[string]()
-	for _, p := range c.GetRegistries() {
-		res = res.Merge(p.AdditionalPodSubscriptions(proxy, addr, cur))
-	}
-	return res
-}
-
-func (c *Controller) Policies(requested sets.Set[model.ConfigKey]) []model.WorkloadAuthorization {
-	var res []model.WorkloadAuthorization
-	if !features.EnableAmbient {
-		return res
-	}
-	for _, p := range c.GetRegistries() {
-		res = append(res, p.Policies(requested)...)
-	}
-	return res
-}
-
-func (c *Controller) AddressInformation(addresses sets.String) ([]model.AddressInfo, sets.String) {
-	i := []model.AddressInfo{}
-	if !features.EnableAmbient {
-		return i, nil
-	}
-	removed := sets.String{}
-	for _, p := range c.GetRegistries() {
-		wis, r := p.AddressInformation(addresses)
-		i = append(i, wis...)
-		removed.Merge(r)
-	}
-	// We may have 'removed' it in one registry but found it in another
-	for _, wl := range i {
-		// TODO(@hzxuzhonghu) This is not right for workload, we may search workload by ip, but the resource name is uid.
-		if removed.Contains(wl.ResourceName()) {
-			removed.Delete(wl.ResourceName())
-		}
-	}
-	return i, removed
-}
-
 type registryEntry struct {
 	serviceregistry.Instance
 	// stop if not nil is the per-registry stop chan. If null, the server stop chan should be used to Run the registry.
@@ -137,13 +60,15 @@ type registryEntry struct {
 }
 
 type Options struct {
-	MeshHolder mesh.Holder
+	MeshHolder      mesh.Holder
+	ConfigClusterID cluster.ID
 }
 
 // NewController creates a new Aggregate controller
 func NewController(opt Options) *Controller {
 	return &Controller{
 		registries:        make([]*registryEntry, 0),
+		configClusterID:   opt.ConfigClusterID,
 		meshHolder:        opt.MeshHolder,
 		running:           false,
 		handlersByCluster: map[cluster.ID]*model.ControllerHandlers{},
@@ -166,7 +91,12 @@ func (c *Controller) addRegistry(registry serviceregistry.Instance, stop <-chan 
 		c.registries = append(c.registries, &registryEntry{Instance: registry, stop: stop})
 	}
 
-	// Observe the registry for events.
+	c.appendHandlers(registry)
+}
+
+// appendHandlers must be called for every registry added to or swapped into c.registries,
+// else its gateway and service notifications never reach the aggregate controller's handlers.
+func (c *Controller) appendHandlers(registry serviceregistry.Instance) {
 	registry.AppendNetworkGatewayHandler(c.NotifyGatewayHandlers)
 	registry.AppendServiceHandler(c.handlers.NotifyServiceHandlers)
 	registry.AppendServiceHandler(func(prev, curr *model.Service, event model.Event) {
@@ -224,6 +154,43 @@ func (c *Controller) DeleteRegistry(clusterID cluster.ID, providerID provider.ID
 	log.Infof("%s registry for the cluster %s has been deleted.", providerID, clusterID)
 }
 
+// UpdateRegistry atomically replaces an existing registry with a new one, used
+// during credential rotation to avoid service disruption. The caller must have
+// already started the new registry; UpdateRegistry only performs the swap.
+func (c *Controller) UpdateRegistry(newRegistry serviceregistry.Instance, stop <-chan struct{}) {
+	if stop == nil {
+		log.Warnf("nil stop channel passed to UpdateRegistry for registry %s/%s", newRegistry.Provider(), newRegistry.Cluster())
+	}
+	c.swapRegistry(newRegistry, stop)
+
+	// On an atomic swap the new registry fires its gateway events before appendHandlers wires it;
+	// reload once here to handle the missed events.
+	c.NotifyGatewayHandlers()
+}
+
+// swapRegistry replaces the existing registry for the new registry's cluster/provider in place,
+// or adds it when none exists, and wires the new registry to the controller's handlers.
+func (c *Controller) swapRegistry(newRegistry serviceregistry.Instance, stop <-chan struct{}) {
+	c.storeLock.Lock()
+	defer c.storeLock.Unlock()
+
+	clusterID := newRegistry.Cluster()
+	providerID := newRegistry.Provider()
+
+	// Find and replace the old registry
+	index, ok := c.getRegistryIndex(clusterID, providerID)
+	if ok {
+		// Replace in place - this is atomic
+		c.registries[index] = &registryEntry{Instance: newRegistry, stop: stop}
+		c.appendHandlers(newRegistry)
+		log.Infof("%s registry for cluster %s has been replaced.", providerID, clusterID)
+	} else {
+		// No existing registry, just add
+		c.addRegistry(newRegistry, stop)
+		log.Infof("%s registry for cluster %s has been added (no previous registry).", providerID, clusterID)
+	}
+}
+
 // GetRegistries returns a copy of all registries
 func (c *Controller) GetRegistries() []serviceregistry.Instance {
 	c.storeLock.RLock()
@@ -276,7 +243,7 @@ func (c *Controller) Services() []*model.Service {
 					if services[previous].ClusterVIPs.Len() < 2 {
 						// Deep copy before merging, otherwise there is a case
 						// a service in remote cluster can be deleted, but the ClusterIP left.
-						services[previous] = services[previous].DeepCopy()
+						services[previous] = services[previous].ShallowCopy()
 					}
 					// If it is seen second time, that means it is from a different cluster, update cluster VIPs.
 					mergeService(services[previous], s, r)
@@ -299,7 +266,7 @@ func (c *Controller) GetService(hostname host.Name) *model.Service {
 			return service
 		}
 		if out == nil {
-			out = service.DeepCopy()
+			out = service.ShallowCopy()
 		} else {
 			// If we are seeing the service for the second time, it means it is available in multiple clusters.
 			mergeService(out, service, r)
@@ -318,6 +285,14 @@ func mergeService(dst, src *model.Service, srcRegistry serviceregistry.Instance)
 	if len(dst.ClusterVIPs.GetAddressesFor(clusterID)) == 0 {
 		newAddresses := src.ClusterVIPs.GetAddressesFor(clusterID)
 		dst.ClusterVIPs.SetAddressesFor(clusterID, newAddresses)
+	}
+	// Merge service accounts from different clusters
+	// Each cluster may have a different trust domain, so we need to collect all unique service accounts
+	if len(src.ServiceAccounts) > 0 {
+		sas := make([]string, 0, len(dst.ServiceAccounts)+len(src.ServiceAccounts))
+		sas = append(sas, dst.ServiceAccounts...)
+		sas = append(sas, src.ServiceAccounts...)
+		dst.ServiceAccounts = slices.FilterDuplicates(sas)
 	}
 }
 
@@ -372,6 +347,11 @@ func (c *Controller) GetProxyServiceTargets(node *model.Proxy) []model.ServiceTa
 		if len(instances) > 0 {
 			out = append(out, instances...)
 		}
+	}
+
+	if len(out) == 0 {
+		log.Debugf("GetProxyServiceTargets(): no service targets found for proxy %s with clusterID %s",
+			node.ID, nodeClusterID.String())
 	}
 
 	return out

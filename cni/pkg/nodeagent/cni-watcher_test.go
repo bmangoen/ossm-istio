@@ -15,10 +15,13 @@
 package nodeagent
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
 	"net"
+	"net/http"
+	"net/http/httptest"
 	"net/netip"
 	"strings"
 	"testing"
@@ -29,11 +32,47 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 
 	"istio.io/api/label"
+	pconstants "istio.io/istio/cni/pkg/constants"
 	"istio.io/istio/cni/pkg/util"
 	"istio.io/istio/pkg/config/constants"
 	"istio.io/istio/pkg/kube"
+	"istio.io/istio/pkg/monitoring/monitortest"
 	"istio.io/istio/pkg/test/util/assert"
 )
+
+var defaultAmbientSelector = compileDefaultSelectors()
+
+func compileDefaultSelectors() *util.CompiledEnablementSelectors {
+	compiled, err := util.NewCompiledEnablementSelectors([]util.EnablementSelector{
+		{
+			PodSelector: metav1.LabelSelector{
+				MatchLabels: map[string]string{
+					label.IoIstioDataplaneMode.Name: constants.DataplaneModeAmbient,
+				},
+			},
+		},
+		{
+			NamespaceSelector: metav1.LabelSelector{
+				MatchLabels: map[string]string{
+					label.IoIstioDataplaneMode.Name: constants.DataplaneModeAmbient,
+				},
+			},
+			PodSelector: metav1.LabelSelector{
+				MatchExpressions: []metav1.LabelSelectorRequirement{
+					{
+						Key:      label.IoIstioDataplaneMode.Name,
+						Operator: metav1.LabelSelectorOpNotIn,
+						Values:   []string{constants.DataplaneModeNone},
+					},
+				},
+			},
+		},
+	})
+	if err != nil {
+		panic(err)
+	}
+	return compiled
+}
 
 func TestProcessAddEventGoodPayload(t *testing.T) {
 	valid := CNIPluginAddEvent{
@@ -79,6 +118,7 @@ func TestCNIPluginServer(t *testing.T) {
 	}
 
 	setupLogging()
+	mt := monitortest.New(t)
 	NodeName = "testnode"
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -111,7 +151,7 @@ func TestCNIPluginServer(t *testing.T) {
 
 	dpServer := getFakeDP(fs, client.Kube())
 
-	handlers := setupHandlers(ctx, client, dpServer, "istio-system")
+	handlers := setupHandlers(ctx, client, dpServer, "istio-system", defaultAmbientSelector, nil)
 
 	// We are not going to start the server, so the sockpath is irrelevant
 	pluginServer := startCniPluginServer(ctx, "/tmp/test.sock", handlers, dpServer)
@@ -127,18 +167,34 @@ func TestCNIPluginServer(t *testing.T) {
 
 	payload, _ := json.Marshal(valid)
 
-	// serialize our fake plugin event
-	addEvent, err := processAddEvent(payload)
-	assert.Equal(t, err, nil)
-
-	// Push it thru the handler
-	pluginServer.ReconcileCNIAddEvent(ctx, addEvent)
+	// Push it thru the plugin event handler
+	rec := httptest.NewRecorder()
+	pluginServer.handleAddEvent(rec, httptest.NewRequest(http.MethodPost, pconstants.CNIAddEventPath, bytes.NewReader(payload)).WithContext(ctx))
+	assert.Equal(t, rec.Code, http.StatusOK)
+	mt.Assert(pluginRequestsTotal.Name(), map[string]string{"response_code": "200"}, monitortest.Exactly(1))
 
 	waitForMockCalls()
 
 	assertPodAnnotated(t, client, pod)
 	// Assert expected calls actually made
 	fs.AssertExpectations(t)
+
+	// An unparseable payload should get a 400
+	rec = httptest.NewRecorder()
+	pluginServer.handleAddEvent(rec, httptest.NewRequest(http.MethodPost, pconstants.CNIAddEventPath, strings.NewReader("notjson")).WithContext(ctx))
+	assert.Equal(t, rec.Code, http.StatusBadRequest)
+	mt.Assert(pluginRequestsTotal.Name(), map[string]string{"response_code": "400"}, monitortest.Exactly(1))
+
+	// An event for a pod we can't find should get a 500
+	payload, _ = json.Marshal(CNIPluginAddEvent{
+		Netns:        "/var/netns/foo",
+		PodName:      "pod-nonexistent",
+		PodNamespace: "funkyns",
+	})
+	rec = httptest.NewRecorder()
+	pluginServer.handleAddEvent(rec, httptest.NewRequest(http.MethodPost, pconstants.CNIAddEventPath, bytes.NewReader(payload)).WithContext(ctx))
+	assert.Equal(t, rec.Code, http.StatusInternalServerError)
+	mt.Assert(pluginRequestsTotal.Name(), map[string]string{"response_code": "500"}, monitortest.Exactly(1))
 }
 
 func TestGetPodWithRetry(t *testing.T) {
@@ -149,6 +205,10 @@ func TestGetPodWithRetry(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	pod := &corev1.Pod{
+		TypeMeta: metav1.TypeMeta{
+			APIVersion: "v1",
+			Kind:       "Pod",
+		},
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      "pod-bingo",
 			Namespace: "funkyns",
@@ -184,7 +244,7 @@ func TestGetPodWithRetry(t *testing.T) {
 
 	dpServer := getFakeDP(fs, client.Kube())
 
-	handlers := setupHandlers(ctx, client, dpServer, "istio-system")
+	handlers := setupHandlers(ctx, client, dpServer, "istio-system", defaultAmbientSelector, nil)
 
 	// We are not going to start the server, so the sockpath is irrelevant
 	pluginServer := startCniPluginServer(ctx, "/tmp/test.sock", handlers, dpServer)
@@ -211,7 +271,7 @@ func TestGetPodWithRetry(t *testing.T) {
 	t.Run("pod out of ambient", func(t *testing.T) {
 		p, err := pluginServer.getPodWithRetry(log, podOutOfAmbient.Name, pod.Namespace)
 		assert.Error(t, err)
-		assert.Equal(t, true, strings.Contains(err.Error(), "unexpectedly not enrolled in ambient"))
+		assert.Equal(t, true, strings.Contains(err.Error(), "unexpectedly not eligible for ambient enrollment"))
 		assert.Equal(t, p, nil)
 	})
 }
@@ -259,7 +319,7 @@ func TestCNIPluginServerPrefersCNIProvidedPodIP(t *testing.T) {
 
 	dpServer := getFakeDP(fs, client.Kube())
 
-	handlers := setupHandlers(ctx, client, dpServer, "istio-system")
+	handlers := setupHandlers(ctx, client, dpServer, "istio-system", defaultAmbientSelector, nil)
 
 	// We are not going to start the server, so the sockpath is irrelevant
 	pluginServer := startCniPluginServer(ctx, "/tmp/test.sock", handlers, dpServer)

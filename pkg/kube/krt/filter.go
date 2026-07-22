@@ -21,6 +21,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 
 	"istio.io/istio/pkg/config/labels"
+	"istio.io/istio/pkg/slices"
 	"istio.io/istio/pkg/util/smallset"
 )
 
@@ -32,9 +33,37 @@ type filter struct {
 	selects         map[string]string
 	labels          map[string]string
 	generic         func(any) bool
+	suppressChange  func(o, n any) bool
 
-	listFromIndex func() any
-	indexMatches  func(any) bool
+	index *indexFilter
+}
+
+type indexFilter struct {
+	filterUID    collectionUID
+	list         func() any
+	indexMatches func(any) bool
+	extractKeys  objectKeyExtractor
+	key          string
+}
+
+type objectKeyExtractor = func(o any) []string
+
+func getKeyExtractor(o any) []string {
+	return []string{GetKey(o)}
+}
+
+// reverseIndexKey
+func (f *filter) reverseIndexKey() ([]string, indexedDependencyType, objectKeyExtractor, collectionUID, bool) {
+	if f.keys.Len() > 0 {
+		if f.index != nil {
+			panic("cannot filter by index and key")
+		}
+		return f.keys.List(), getKeyType, getKeyExtractor, 0, true
+	}
+	if f.index != nil {
+		return []string{f.index.key}, indexType, f.index.extractKeys, f.index.filterUID, true
+	}
+	return nil, unknownIndexType, nil, 0, false
 }
 
 func (f *filter) String() string {
@@ -53,6 +82,9 @@ func (f *filter) String() string {
 	}
 	if f.generic != nil {
 		attrs = append(attrs, "generic")
+	}
+	if f.suppressChange != nil {
+		attrs = append(attrs, "suppressChange")
 	}
 	res := strings.Join(attrs, ",")
 	return fmt.Sprintf("{%s}", res)
@@ -89,11 +121,20 @@ func FilterSelects(lbls map[string]string) FetchOption {
 func FilterIndex[K comparable, I any](idx Index[K, I], k K) FetchOption {
 	return func(h *dependency) {
 		// Index is used to pre-filter on the List, and also to match in Matches. Provide type-erased methods for both
-		h.filter.listFromIndex = func() any {
-			return idx.Lookup(k)
-		}
-		h.filter.indexMatches = func(a any) bool {
-			return idx.objectHasKey(a.(I), k)
+		h.filter.index = &indexFilter{
+			filterUID: idx.id(),
+			list: func() any {
+				return idx.Lookup(k)
+			},
+			indexMatches: func(a any) bool {
+				return idx.objectHasKey(a.(I), k)
+			},
+			extractKeys: func(o any) []string {
+				return slices.Map(idx.extractKeys(o.(I)), func(e K) string {
+					return toString(e)
+				})
+			},
+			key: toString(k),
 		}
 	}
 }
@@ -122,6 +163,25 @@ func FilterGeneric(f func(any) bool) FetchOption {
 	}
 }
 
+// withUnsafeSuppressChange skips incoming update events when fn returns true.
+// This only applies to dependency change handling for Fetch calls; it does not affect the initial list result.
+// This is dangerous to use; if you use any parts of the object *outside* the comparison function, you will get stale data.
+// Recommended to use with PartialFetch
+func withUnsafeSuppressChange[T any](fn func(T, T) bool) FetchOption {
+	return func(h *dependency) {
+		h.filter.suppressChange = func(o, n any) bool {
+			return fn(o.(T), n.(T))
+		}
+	}
+}
+
+func (f *filter) SuppressChange(ev Event[any]) bool {
+	if f.suppressChange == nil || ev.Old == nil || ev.New == nil {
+		return false
+	}
+	return f.suppressChange(*ev.Old, *ev.New)
+}
+
 func (f *filter) Matches(object any, forList bool) bool {
 	// Check each of our defined filters to see if the object matches
 	// This function is called very often and is important to keep fast
@@ -131,18 +191,20 @@ func (f *filter) Matches(object any, forList bool) bool {
 	if !forList {
 		// First, lookup directly by key. This is cheap
 		// an empty set will match none
-		if !f.keys.IsNil() && !f.keys.Contains(string(GetKey[any](object))) {
+		if !f.keys.IsNil() && !f.keys.Contains(GetKey[any](object)) {
 			if log.DebugEnabled() {
-				log.Debugf("no match key: %q vs %q", f.keys, string(GetKey[any](object)))
+				log.Debugf("no match key: %q vs %q", f.keys, GetKey[any](object))
 			}
 			return false
 		}
 		// Index is also cheap, and often used to filter namespaces out. Make sure we do this early
-		if f.indexMatches != nil && !f.indexMatches(object) {
-			if log.DebugEnabled() {
-				log.Debugf("no match index")
+		if f.index != nil {
+			if !f.index.indexMatches(object) {
+				if log.DebugEnabled() {
+					log.Debugf("no match index")
+				}
+				return false
 			}
-			return false
 		}
 	}
 

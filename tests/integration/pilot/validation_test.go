@@ -1,5 +1,4 @@
 //go:build integ
-// +build integ
 
 // Copyright Istio Authors
 //
@@ -23,7 +22,7 @@ import (
 	"strings"
 	"testing"
 
-	json "github.com/go-jose/go-jose/v3/json"
+	json "github.com/go-jose/go-jose/v4/json"
 	"sigs.k8s.io/yaml"
 
 	"istio.io/istio/pkg/config/constants"
@@ -176,8 +175,8 @@ func TestEnsureNoMissingCRDs(t *testing.T) {
 				"gateway.networking.k8s.io/v1beta1/GatewayClass",
 				"gateway.networking.k8s.io/v1/HTTPRoute",
 				"gateway.networking.k8s.io/v1beta1/HTTPRoute",
-				"gateway.networking.k8s.io/v1alpha2/TCPRoute",
-				"gateway.networking.k8s.io/v1alpha2/TLSRoute",
+				"gateway.networking.k8s.io/v1/TCPRoute",
+				"gateway.networking.k8s.io/v1/TLSRoute",
 				"gateway.networking.k8s.io/v1beta1/ReferenceGrant",
 				"gateway.networking.k8s.io/v1alpha2/ReferenceGrant",
 			} {

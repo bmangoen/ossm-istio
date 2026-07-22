@@ -232,7 +232,7 @@ func (lb *ListenerBuilder) buildInboundListeners() []*listener.Listener {
 			cc.port.Protocol = cc.port.Protocol.AfterTLSTermination()
 			lp := istionetworking.ModelProtocolToListenerProtocol(cc.port.Protocol)
 			opts = getTLSFilterChainMatchOptions(lp)
-			mtls.TCP = BuildListenerTLSContext(cc.tlsSettings, lb.node, lb.push.Mesh, istionetworking.TransportProtocolTCP, false)
+			mtls.TCP = BuildListenerTLSContext(cc.tlsSettings, lb.node, lb.push, istionetworking.TransportProtocolTCP, false)
 			mtls.HTTP = mtls.TCP
 		} else {
 			lp := istionetworking.ModelProtocolToListenerProtocol(cc.port.Protocol)
@@ -289,10 +289,11 @@ func (lb *ListenerBuilder) buildInboundListener(name string, addresses []string,
 	}
 	address := util.BuildAddress(addresses[0], tPort)
 	l := &listener.Listener{
-		Name:                             name,
-		Address:                          address,
-		TrafficDirection:                 core.TrafficDirection_INBOUND,
-		ContinueOnListenerFiltersTimeout: true,
+		Name:                                 name,
+		Address:                              address,
+		TrafficDirection:                     core.TrafficDirection_INBOUND,
+		ContinueOnListenerFiltersTimeout:     true,
+		MaxConnectionsToAcceptPerSocketEvent: maxConnectionsToAcceptPerSocketEvent(),
 	}
 	if features.EnableDualStack && len(addresses) > 1 {
 		// add extra addresses for the listener
@@ -307,6 +308,12 @@ func (lb *ListenerBuilder) buildInboundListener(name string, addresses []string,
 	}
 	if !bindToPort && lb.node.GetInterceptionMode() == model.InterceptionTproxy {
 		l.Transparent = proto.BoolTrue
+	}
+	if bindToPort {
+		// This only applies to listeners that actually bind to a port given that only those listeners
+		// interface with the OS.
+		// See https://github.com/envoyproxy/envoy/blob/v1.35.3/source/common/network/tcp_listener_impl.cc#L57
+		l.MaxConnectionsToAcceptPerSocketEvent = maxConnectionsToAcceptPerSocketEvent()
 	}
 
 	accessLogBuilder.setListenerAccessLog(lb.push, lb.node, l, istionetworking.ListenerClassSidecarInbound)
@@ -807,9 +814,9 @@ func buildInboundBlackhole(lb *ListenerBuilder) *listener.FilterChain {
 
 // buildSidecarInboundHTTPOpts sets up HTTP options for a given chain.
 func buildSidecarInboundHTTPOpts(lb *ListenerBuilder, cc inboundChainConfig) *httpListenerOpts {
-	ph := GetProxyHeaders(lb.node, lb.push, istionetworking.ListenerClassSidecarInbound)
+	ph := util.GetProxyHeaders(lb.node, lb.push, istionetworking.ListenerClassSidecarInbound)
 	httpOpts := &httpListenerOpts{
-		routeConfig:      buildSidecarInboundHTTPRouteConfig(lb, cc),
+		routeConfig:      buildSidecarInboundHTTPRouteConfig(nil, lb, cc),
 		rds:              "", // no RDS for inbound traffic
 		useRemoteAddress: false,
 		connectionManager: &hcm.HttpConnectionManager{
@@ -834,6 +841,7 @@ func buildSidecarInboundHTTPOpts(lb *ListenerBuilder, cc inboundChainConfig) *ht
 		statPrefix:                cc.StatPrefix(),
 		hbone:                     cc.hbone,
 	}
+
 	// See https://github.com/grpc/grpc-web/tree/master/net/grpc/gateway/examples/helloworld#configure-the-proxy
 	if cc.port.Protocol.IsHTTP2() {
 		httpOpts.connectionManager.Http2ProtocolOptions = &core.Http2ProtocolOptions{}
@@ -851,12 +859,12 @@ func buildSidecarInboundHTTPOpts(lb *ListenerBuilder, cc inboundChainConfig) *ht
 // buildInboundNetworkFiltersForHTTP builds the network filters that should be inserted before an HCM.
 // This should only be used with HTTP; see buildInboundNetworkFilters for TCP
 func (lb *ListenerBuilder) buildInboundNetworkFiltersForHTTP(cc inboundChainConfig) []*listener.Filter {
-	// Add network level WASM filters if any configured.
+	// Add network level extension filters if any configured.
 	httpOpts := buildSidecarInboundHTTPOpts(lb, cc)
-	wasm := lb.push.WasmPluginsByListenerInfo(lb.node, model.WasmPluginListenerInfo{
+	trafficExtensions := lb.push.TrafficExtensionsByListenerInfo(lb.node, model.ListenerInfo{
 		Port:  httpOpts.port,
 		Class: httpOpts.class,
-	}, model.WasmPluginTypeNetwork)
+	}, model.FilterChainTypeNetwork)
 
 	var filters []*listener.Filter
 	// Metadata exchange goes first, so RBAC failures, etc can access the state. See https://github.com/istio/istio/issues/41066
@@ -865,12 +873,12 @@ func (lb *ListenerBuilder) buildInboundNetworkFiltersForHTTP(cc inboundChainConf
 	}
 
 	// Authn
-	filters = extension.PopAppendNetwork(filters, wasm, extensions.PluginPhase_AUTHN)
+	filters = extension.PopAppendNetworkTrafficExtension(filters, trafficExtensions, extensions.TrafficExtension_AUTHN)
 
-	// Authz. Since this is HTTP, we only add WASM network filters -- not TCP RBAC, stats, etc.
-	filters = extension.PopAppendNetwork(filters, wasm, extensions.PluginPhase_AUTHZ)
-	filters = extension.PopAppendNetwork(filters, wasm, extensions.PluginPhase_STATS)
-	filters = extension.PopAppendNetwork(filters, wasm, extensions.PluginPhase_UNSPECIFIED_PHASE)
+	// Authz. Since this is HTTP, we only add network filters -- not TCP RBAC, stats, etc.
+	filters = extension.PopAppendNetworkTrafficExtension(filters, trafficExtensions, extensions.TrafficExtension_AUTHZ)
+	filters = extension.PopAppendNetworkTrafficExtension(filters, trafficExtensions, extensions.TrafficExtension_STATS)
+	filters = extension.PopAppendNetworkTrafficExtension(filters, trafficExtensions, extensions.TrafficExtension_UNSPECIFIED)
 
 	h := lb.buildHTTPConnectionManager(httpOpts)
 	filters = append(filters, &listener.Filter{

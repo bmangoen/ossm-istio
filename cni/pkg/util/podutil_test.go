@@ -19,12 +19,47 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"sigs.k8s.io/yaml"
 
 	"istio.io/api/annotation"
 	"istio.io/api/label"
 	"istio.io/istio/pkg/config/constants"
 	"istio.io/istio/pkg/test/util/assert"
 )
+
+var defaultAmbientSelector = compileDefaultSelectors()
+
+func compileDefaultSelectors() *CompiledEnablementSelectors {
+	compiled, err := NewCompiledEnablementSelectors([]EnablementSelector{
+		{
+			PodSelector: metav1.LabelSelector{
+				MatchLabels: map[string]string{
+					label.IoIstioDataplaneMode.Name: constants.DataplaneModeAmbient,
+				},
+			},
+		},
+		{
+			NamespaceSelector: metav1.LabelSelector{
+				MatchLabels: map[string]string{
+					label.IoIstioDataplaneMode.Name: constants.DataplaneModeAmbient,
+				},
+			},
+			PodSelector: metav1.LabelSelector{
+				MatchExpressions: []metav1.LabelSelectorRequirement{
+					{
+						Key:      label.IoIstioDataplaneMode.Name,
+						Operator: metav1.LabelSelectorOpNotIn,
+						Values:   []string{constants.DataplaneModeNone},
+					},
+				},
+			},
+		},
+	})
+	if err != nil {
+		panic(err)
+	}
+	return compiled
+}
 
 func TestGetPodIPIfPodIPPresent(t *testing.T) {
 	pod := &corev1.Pod{
@@ -207,9 +242,67 @@ func TestPodRedirectionEnabled(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if got := PodRedirectionEnabled(tt.args.namespace, tt.args.pod); got != tt.want {
+			if got := defaultAmbientSelector.Matches(tt.args.pod.Labels, tt.args.pod.Annotations, tt.args.namespace.Labels); got != tt.want {
 				t.Errorf("PodRedirectionEnabled() = %v, want %v", got, tt.want)
 			}
+		})
+	}
+}
+
+func TestSplitExcludeNamespaces(t *testing.T) {
+	tests := []struct {
+		name  string
+		input string
+		want  []string
+	}{
+		{name: "empty string", input: "", want: []string{}},
+		{name: "string of spaces", input: "  ", want: []string{}},
+		{name: "single namespace", input: "kube-system", want: []string{"kube-system"}},
+		{name: "single namespace with spaces", input: " kube-system ", want: []string{"kube-system"}},
+		{name: "two namespaces", input: "kube-system,istio-system", want: []string{"kube-system", "istio-system"}},
+		{name: "two namespaces with spaces", input: " kube-system , istio-system ", want: []string{"kube-system", "istio-system"}},
+		{name: "trailing comma", input: "kube-system,", want: []string{"kube-system"}},
+		{name: "leading comma", input: ",kube-system", want: []string{"kube-system"}},
+		{name: "embedded empty", input: "kube-system,,istio-system", want: []string{"kube-system", "istio-system"}},
+		{name: "only commas", input: ",,", want: []string{}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := SplitExcludeNamespaces(tt.input)
+			assert.Equal(t, got, tt.want)
+		})
+	}
+}
+
+func TestEnablementFromString(t *testing.T) {
+	tests := []struct {
+		name string
+		args string
+	}{
+		{
+			name: "empty",
+			args: "",
+		},
+		{
+			name: "default",
+			args: "- podSelector:\n    matchLabels:\n      istio.io/dataplane-mode: ambient\n- podSelector:\n    matchExpressions:\n    - { key: istio.io/dataplane-mode, operator: NotIn, values: [none] }\n  namespaceSelector:\n    matchLabels:\n      istio.io/dataplane-mode: ambient", //nolint:all
+		},
+		{
+			name: "namespace only",
+			args: "- namespaceSelector:\n    matchLabels:\n      istio.io/dataplane-mode: ambient",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			selectors := []EnablementSelector{}
+			if err := yaml.Unmarshal([]byte(tt.args), &selectors); err != nil {
+				t.Fatalf("failed to parse ambient enablement selector: %v", err)
+			}
+			_, err := NewCompiledEnablementSelectors(selectors)
+			if err != nil {
+				t.Errorf("failed to instantiate ambient enablement selector: %v", err)
+			}
+			// if the selector compiles, the test passes
 		})
 	}
 }

@@ -139,11 +139,23 @@ type Settings struct {
 	// Skip TProxy related parts for all the tests.
 	SkipTProxy bool
 
+	// Skip user namespace related parts for all the tests.
+	SkipUserNamespace bool
+
 	// Ambient mesh is being used
 	Ambient bool
 
+	// GatewayAPIOnly indicates tests are running against a cluster without Istio mesh capabilities.
+	// When true, echo apps will be deployed without the istio-proxy sidecar container overlay,
+	// as there is no injection webhook to transform the "image: auto" placeholder.
+	GatewayAPIOnly bool
+
 	// Use ambient instead of sidecars
 	AmbientEverywhere bool
+
+	AmbientMultiNetwork bool
+
+	IstioOwnedCNIConfig bool
 
 	// Compatibility determines whether we should transparently deploy echo workloads attached to each revision
 	// specified in `Revisions` when creating echo instances. Used primarily for compatibility testing between revisions
@@ -170,8 +182,8 @@ type Settings struct {
 	// MaxDumps is the maximum number of full test dumps that are allowed to occur within a test suite.
 	MaxDumps uint64
 
-	// EnableDualStack indicates the test should have dual stack enabled or not.
-	EnableDualStack bool
+	// IP Families (IPv6, IPv4) to test with. The order indicates precedence.
+	IPFamilies ArrayFlags
 
 	// Helm repo to be used for tests
 	HelmRepo string
@@ -185,8 +197,18 @@ type Settings struct {
 
 	GatewayConformanceTimeoutConfig gwConformanceConfig.TimeoutConfig
 
+	// GatewayConformanceAllowCRDsMismatch lets gateway conformance tests to run on environments with pre-installed gateway-api CRDs
+	GatewayConformanceAllowCRDsMismatch bool
+
 	// OpenShift indicates the tests run in an OpenShift platform rather than in plain Kubernetes.
 	OpenShift bool
+
+	// If enabled, native nftable rules will be used for traffic redirection instead of iptable rules.
+	NativeNftables bool
+
+	// Agentgateway indicates that the agentgateway tests should be run. This is gated behind a separate flag since
+	// agentgateway support is experimental.
+	Agentgateway bool
 }
 
 // SkipVMs changes the skip settings at runtime
@@ -219,10 +241,7 @@ func (s *Settings) RunDir() string {
 	u := strings.Replace(s.RunID.String(), "-", "", -1)
 	t := strings.Replace(s.TestID, "_", "-", -1)
 	// We want at least 6 characters of uuid padding
-	padding := maxTestIDLength - len(t)
-	if padding < 0 {
-		padding = 0
-	}
+	padding := max(maxTestIDLength-len(t), 0)
 	n := fmt.Sprintf("%s-%s", t, u[0:padding])
 
 	return path.Join(s.BaseDir, n)
@@ -266,7 +285,9 @@ func (s *Settings) String() string {
 	result += fmt.Sprintf("PullSecret:        						 %s\n", s.Image.PullSecret)
 	result += fmt.Sprintf("MaxDumps:          						 %d\n", s.MaxDumps)
 	result += fmt.Sprintf("HelmRepo:          						 %v\n", s.HelmRepo)
+	result += fmt.Sprintf("IPFamilies:							 %v\n", s.IPFamilies)
 	result += fmt.Sprintf("GatewayConformanceStandardOnly: %v\n", s.GatewayConformanceStandardOnly)
+	result += fmt.Sprintf("GatewayConformanceAllowCRDsMismatch: %v\n", s.GatewayConformanceAllowCRDsMismatch)
 	return result
 }
 

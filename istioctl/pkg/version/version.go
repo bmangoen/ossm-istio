@@ -64,7 +64,7 @@ func NewVersionCommand(ctx cli.Context) *cobra.Command {
 }
 
 func getRemoteInfo(ctx cli.Context, opts clioptions.ControlPlaneOptions) (*istioVersion.MeshInfo, error) {
-	kubeClient, err := ctx.CLIClientWithRevision(opts.Revision)
+	kubeClient, err := ctx.CLIClientWithRevision(ctx.RevisionOrDefault(opts.Revision))
 	if err != nil {
 		return nil, err
 	}
@@ -95,7 +95,7 @@ func getRemoteInfoWrapper(ctx cli.Context, pc **cobra.Command, opts *clioptions.
 
 func getProxyInfoWrapper(ctx cli.Context, opts *clioptions.ControlPlaneOptions) func() (*[]istioVersion.ProxyInfo, error) {
 	return func() (*[]istioVersion.ProxyInfo, error) {
-		client, err := ctx.CLIClientWithRevision(opts.Revision)
+		client, err := ctx.CLIClientWithRevision(ctx.RevisionOrDefault(opts.Revision))
 		if err != nil {
 			return nil, err
 		}
@@ -203,6 +203,9 @@ func xdsRemoteVersionWrapper(ctx cli.Context, opts *clioptions.ControlPlaneOptio
 func xdsProxyVersionWrapper(xdsResponse **discovery.DiscoveryResponse) func() (*[]istioVersion.ProxyInfo, error) {
 	return func() (*[]istioVersion.ProxyInfo, error) {
 		pi := []istioVersion.ProxyInfo{}
+		if *xdsResponse == nil {
+			return nil, fmt.Errorf("invalid xdsResponse")
+		}
 		for _, resource := range (*xdsResponse).Resources {
 			switch resource.TypeUrl {
 			case "type.googleapis.com/envoy.config.core.v3.Node":

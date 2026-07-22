@@ -1,10 +1,11 @@
+{{- if or (eq .Values.global.resourceScope "all") (eq .Values.global.resourceScope "namespace") }}
 # Not created if istiod is running remotely
-{{- if not .Values.istiodRemote.enabled }}
+{{- if or (not .Values.istiodRemote.enabled) (and .Values.istiodRemote.enabled .Values.istiodRemote.enabledLocalInjectorIstiod) }}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: istiod{{- if not (eq .Values.revision "") }}-{{ .Values.revision }}{{- end }}
-  namespace: {{ .Release.Namespace }}
+  namespace: {{ .Release.Namespace | quote }}
   labels:
     app: istiod
     istio.io/rev: {{ .Values.revision | default "default" | quote }}
@@ -17,6 +18,10 @@ metadata:
 {{- range $key, $val := .Values.deploymentLabels }}
     {{ $key }}: "{{ $val }}"
 {{- end }}
+  {{- if .Values.deploymentAnnotations }}
+  annotations:
+{{ toYaml .Values.deploymentAnnotations | indent 4 }}
+  {{- end }}
 spec:
 {{- if not .Values.autoscaleEnabled }}
 {{- if .Values.replicaCount }}
@@ -98,6 +103,9 @@ spec:
 {{- if .Values.global.imagePullPolicy }}
           imagePullPolicy: {{ .Values.global.imagePullPolicy }}
 {{- end }}
+{{- if .Values.terminationMessagePolicy }}
+          terminationMessagePolicy: {{ .Values.terminationMessagePolicy }}
+{{- end }}
           args:
           - "discovery"
           - --monitoringAddr=:15014
@@ -169,9 +177,10 @@ spec:
           # Also, check for an explicit ENV override (legacy approach) and prefer that
           # if present
           {{ $ztTrustedNS := or .Values.trustedZtunnelNamespace .Release.Namespace }}
+          {{ $ztTrustedName := or .Values.trustedZtunnelName "ztunnel" }}
           {{- if not .Values.env.CA_TRUSTED_NODE_ACCOUNTS }}
           - name: CA_TRUSTED_NODE_ACCOUNTS
-            value: "{{ $ztTrustedNS }}/ztunnel"
+            value: "{{ $ztTrustedNS }}/{{ $ztTrustedName }}"
           {{- end }}
           {{- if .Values.env }}
           {{- range $key, $val := .Values.env }}
@@ -179,9 +188,22 @@ spec:
             value: "{{ $val }}"
           {{- end }}
           {{- end }}
+          {{- if and .Values.env (eq (.Values.env.COMPLIANCE_POLICY | default "") "fips-140-3") }}
+          - name: GODEBUG
+            value: "fips140=only"
+          {{- end }}
+          {{- with .Values.envVarFrom }}
+          {{- toYaml . | nindent 10 }}
+          {{- end }}
 {{- if .Values.traceSampling }}
           - name: PILOT_TRACE_SAMPLING
             value: "{{ .Values.traceSampling }}"
+{{- end }}
+{{- if .Values.taint.enabled }}
+          - name: PILOT_ENABLE_NODE_UNTAINT_CONTROLLERS
+            value: "true"
+          - name: PILOT_NODE_UNTAINT_CONTROLLERS_TAINT_NAME
+            value: "{{ .Values.taint.name }}"
 {{- end }}
 # If externalIstiod is set via Values.Global, then enable the pilot env variable. However, if it's set via Values.pilot.env, then
 # don't set it here to avoid duplication.
@@ -190,14 +212,18 @@ spec:
           - name: EXTERNAL_ISTIOD
             value: "{{ .Values.global.externalIstiod }}"
 {{- end }}
+{{- if .Values.global.trustBundleName }}
+          - name: PILOT_CA_CERT_CONFIGMAP
+            value: "{{ .Values.global.trustBundleName }}"
+{{- end }}
+{{- if .Values.crlConfigMapName }}
+          - name: PILOT_CRL_CONFIGMAP
+            value: "{{ .Values.crlConfigMapName }}"
+{{- end }}
           - name: PILOT_ENABLE_ANALYSIS
             value: "{{ .Values.global.istiod.enableAnalysis }}"
           - name: CLUSTER_ID
             value: "{{ $.Values.global.multiCluster.clusterName | default `Kubernetes` }}"
-          - name: GOMEMLIMIT
-            valueFrom:
-              resourceFieldRef:
-                resource: limits.memory
           - name: GOMAXPROCS
             valueFrom:
               resourceFieldRef:
@@ -207,9 +233,9 @@ spec:
             value: "{{ coalesce .Values.global.platform .Values.platform }}"
           resources:
 {{- if .Values.resources }}
-{{ toYaml .Values.resources | trim | indent 12 }}
+{{ include "istiod.resources" .Values.resources | trim | indent 12 }}
 {{- else }}
-{{ toYaml .Values.global.defaultResources | trim | indent 12 }}
+{{ include "istiod.resources" .Values.global.defaultResources | trim | indent 12 }}
 {{- end }}
           securityContext:
             allowPrivilegeEscalation: false
@@ -275,10 +301,19 @@ spec:
           secretName: istiod-tls
           optional: true
       - name: istio-csr-ca-configmap
+  {{- if eq (.Values.env).ENABLE_CLUSTER_TRUST_BUNDLE_API true }}
+        projected:
+          sources:
+          - clusterTrustBundle:
+              name: istio.io:istiod-ca:{{ .Values.global.trustBundleName | default "root-cert" }}
+              path: root-cert.pem
+              optional: true
+  {{- else }}
         configMap:
-          name: istio-ca-root-cert
+          name: {{ .Values.global.trustBundleName | default "istio-ca-root-cert" }}
           defaultMode: 420
           optional: true
+  {{- end }}
   {{- if .Values.jwksResolverExtraRootCA }}
       - name: extracacerts
         configMap:
@@ -289,4 +324,5 @@ spec:
       {{- end }}
 
 ---
+{{- end }}
 {{- end }}

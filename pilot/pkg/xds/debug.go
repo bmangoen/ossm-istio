@@ -15,6 +15,7 @@
 package xds
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"html/template"
@@ -41,19 +42,23 @@ import (
 	"istio.io/istio/pilot/pkg/model"
 	"istio.io/istio/pilot/pkg/networking/util"
 	"istio.io/istio/pilot/pkg/util/protoconv"
-	"istio.io/istio/pilot/pkg/xds/endpoints"
 	v3 "istio.io/istio/pilot/pkg/xds/v3"
 	"istio.io/istio/pkg/config"
+	"istio.io/istio/pkg/config/constants"
 	"istio.io/istio/pkg/config/schema/resource"
 	"istio.io/istio/pkg/config/xds"
-	"istio.io/istio/pkg/kube/krt"
 	istiolog "istio.io/istio/pkg/log"
+	"istio.io/istio/pkg/maps"
 	"istio.io/istio/pkg/security"
 	"istio.io/istio/pkg/slices"
+	"istio.io/istio/pkg/spiffe"
 	"istio.io/istio/pkg/util/protomarshal"
 	"istio.io/istio/pkg/util/sets"
 	"istio.io/istio/pkg/workloadapi"
 )
+
+// CallerNamespaceKey is used to store caller namespace in request context
+type CallerNamespaceKey struct{}
 
 var indexTmpl = template.Must(template.New("index").Parse(`<html>
 <head>
@@ -187,9 +192,9 @@ func (s *DiscoveryServer) AddDebugHandlers(mux, internalMux *http.ServeMux, enab
 		s.addDebugHandler(mux, internalMux, "/debug/force_disconnect", "Disconnects a proxy from this Pilot", s.forceDisconnect)
 	}
 
-	s.addDebugHandler(mux, internalMux, "/debug/ecdsz", "Status and debug interface for ECDS", s.ecdsz)
-	s.addDebugHandler(mux, internalMux, "/debug/edsz", "Status and debug interface for EDS", s.Edsz)
-	s.addDebugHandler(mux, internalMux, "/debug/ndsz", "Status and debug interface for NDS", s.ndsz)
+	s.addDebugHandler(mux, internalMux, "/debug/ecdsz", "Status and debug interface for ECDS", s.typedConfigDumpHandler("ecds"))
+	s.addDebugHandler(mux, internalMux, "/debug/edsz", "Status and debug interface for EDS", s.typedConfigDumpHandler("eds"))
+	s.addDebugHandler(mux, internalMux, "/debug/ndsz", "Status and debug interface for NDS", s.typedConfigDumpHandler("nds"))
 	s.addDebugHandler(mux, internalMux, "/debug/adsz", "Status and debug interface for ADS", s.adsz)
 	s.addDebugHandler(mux, internalMux, "/debug/adsz?push=true", "Initiates push of the current state to all connected endpoints", s.adsz)
 
@@ -238,7 +243,8 @@ func (s *DiscoveryServer) addDebugHandler(mux *http.ServeMux, internalMux *http.
 
 func (s *DiscoveryServer) allowAuthenticatedOrLocalhost(next http.Handler) http.HandlerFunc {
 	return func(w http.ResponseWriter, req *http.Request) {
-		// Request is from localhost, no need to authenticate
+		// Localhost gets unrestricted access (istiod talking to itself on 127.0.0.1:8080)
+		// No namespace context set, so namespace checks are skipped
 		if isRequestFromLocalhost(req) {
 			next.ServeHTTP(w, req)
 			return
@@ -262,9 +268,20 @@ func (s *DiscoveryServer) allowAuthenticatedOrLocalhost(next http.Handler) http.
 			w.WriteHeader(http.StatusUnauthorized)
 			return
 		}
-		// TODO: Check that the identity contains istio-system namespace, else block or restrict to only info that
-		// is visible to the authenticated SA. Will require changes in docs and istioctl too.
-		next.ServeHTTP(w, req)
+		// Check namespace-based authorization for debug endpoints
+		if features.EnableDebugEndpointAuth {
+			namespace := s.extractNamespace(ids)
+			if !s.AuthorizeDebugRequest(ids, req) {
+				istiolog.Warnf("Unauthorized debug request from %v to %s", ids, req.URL.Path)
+				w.WriteHeader(http.StatusForbidden)
+				return
+			}
+			// Store caller namespace in context for handlers to enforce proxy-level access
+			ctx := context.WithValue(req.Context(), CallerNamespaceKey{}, namespace)
+			next.ServeHTTP(w, req.WithContext(ctx))
+		} else {
+			next.ServeHTTP(w, req)
+		}
 	}
 }
 
@@ -276,6 +293,45 @@ func isRequestFromLocalhost(r *http.Request) bool {
 
 	userIP, _ := netip.ParseAddr(ip)
 	return userIP.IsLoopback()
+}
+
+// extractNamespace extracts namespace from authenticated identities
+func (s *DiscoveryServer) extractNamespace(identities []string) string {
+	for _, id := range identities {
+		spiffeID, err := spiffe.ParseIdentity(id)
+		if err != nil {
+			continue
+		}
+		return spiffeID.Namespace
+	}
+	return ""
+}
+
+// AuthorizeDebugRequest checks if authenticated identities are authorized to access the requested debug endpoint.
+// Note: non-system namespace requests are further verified at connection time to ensure same-namespace proxy access only.
+func (s *DiscoveryServer) AuthorizeDebugRequest(identities []string, req *http.Request) bool {
+	namespace := s.extractNamespace(identities)
+
+	// deny if no valid identity found
+	if namespace == "" {
+		return false
+	}
+
+	// get system namespace (istio-system by default, or mesh root namespace)
+	systemNamespace := constants.IstioSystemNamespace
+	if s.Env != nil && s.Env.Mesh() != nil && s.Env.Mesh().GetRootNamespace() != "" {
+		systemNamespace = s.Env.Mesh().GetRootNamespace()
+	}
+
+	// allow all if identity is from system namespace or an allowed namespace
+	if namespace == systemNamespace || features.DebugEndpointAuthAllowedNamespaces.Contains(namespace) {
+		return true
+	}
+
+	// non-system namespace: only allow specific endpoints
+	debugPath := strings.TrimPrefix(req.URL.Path, "/debug/")
+	_, allowed := activeNamespaceDebuggers[debugPath]
+	return allowed
 }
 
 // Syncz dumps the synchronization status of all Envoys connected to this Pilot instance
@@ -326,8 +382,8 @@ func (s *DiscoveryServer) registryz(w http.ResponseWriter, req *http.Request) {
 }
 
 // Dumps info about the endpoint shards, tracked using the new direct interface.
-// Legacy registry provides are synced to the new data structure as well, during
-// the full push.
+// Legacy registry providers are synced to the new data structure as well, during
+// push.
 func (s *DiscoveryServer) endpointShardz(w http.ResponseWriter, req *http.Request) {
 	writeJSON(w, s.Env.EndpointIndex.Shardz(), req)
 }
@@ -520,11 +576,7 @@ func (s *DiscoveryServer) adsz(w http.ResponseWriter, req *http.Request) {
 		}
 		c.proxy.RLock()
 		for k, wr := range c.proxy.WatchedResources {
-			r := wr.ResourceNames
-			if r == nil {
-				r = []string{}
-			}
-			adsClient.Watches[k] = r
+			adsClient.Watches[k] = wr.ResourceNames.UnsortedList()
 		}
 		c.proxy.RUnlock()
 		adsClients.Connected = append(adsClients.Connected, adsClient)
@@ -532,24 +584,13 @@ func (s *DiscoveryServer) adsz(w http.ResponseWriter, req *http.Request) {
 	writeJSON(w, adsClients, req)
 }
 
-// ecdsz implements a status and debug interface for ECDS.
-// It is mapped to /debug/ecdsz
-func (s *DiscoveryServer) ecdsz(w http.ResponseWriter, req *http.Request) {
-	if s.handlePushRequest(w, req) {
-		return
+func (s *DiscoveryServer) typedConfigDumpHandler(typ string) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		q := r.URL.Query()
+		q.Set("types", typ)
+		r.URL.RawQuery = q.Encode()
+		s.ConfigDump(w, r)
 	}
-	proxyID, con := s.getDebugConnection(req)
-	if con == nil {
-		s.errorHandler(w, proxyID, con)
-		return
-	}
-
-	dump := s.getConfigDumpByResourceType(con, nil, []string{v3.ExtensionConfigurationType})
-	if len(dump[v3.ExtensionConfigurationType]) == 0 {
-		w.WriteHeader(http.StatusNotFound)
-		return
-	}
-	writeJSON(w, dump[v3.ExtensionConfigurationType], req)
 }
 
 // ConfigDump returns information in the form of the Envoy admin API config dump for the specified proxy
@@ -585,7 +626,7 @@ func (s *DiscoveryServer) ConfigDump(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	includeEds := req.URL.Query().Get("include_eds") == "true"
+	includeEds := req.URL.Query().Has("include_eds")
 	dump, err := s.connectionConfigDump(con, includeEds)
 	if err != nil {
 		handleHTTPError(w, err)
@@ -600,7 +641,13 @@ func (s *DiscoveryServer) getResourceTypes(req *http.Request) []string {
 
 		resourceTypes := sets.New[string]()
 		for _, t := range ts {
-			resourceTypes.Insert(v3.GetResourceType(t))
+			rType := v3.GetResourceType(t)
+			resourceTypes.Insert(rType)
+			// special case for AddressType, include WorkloadType as well
+			// because they shared same short type name `WDS`
+			if rType == v3.AddressType {
+				resourceTypes.Insert(v3.WorkloadType)
+			}
 		}
 
 		return resourceTypes.UnsortedList()
@@ -611,7 +658,7 @@ func (s *DiscoveryServer) getResourceTypes(req *http.Request) []string {
 func (s *DiscoveryServer) getConfigDumpByResourceType(conn *Connection, req *model.PushRequest, ts []string) map[string][]*discoveryv3.Resource {
 	dumps := make(map[string][]*discoveryv3.Resource)
 	if req == nil {
-		req = &model.PushRequest{Push: conn.proxy.LastPushContext, Start: time.Now(), Full: true}
+		req = &model.PushRequest{Push: conn.proxy.LastPushContext, Start: time.Now(), Forced: true}
 	}
 
 	for _, resourceType := range ts {
@@ -636,6 +683,9 @@ func (s *DiscoveryServer) getConfigDumpByResourceType(conn *Connection, req *mod
 						continue
 					}
 					if secret.GetTlsCertificate() != nil {
+						// When utilizing XDS caching, the resource object is shared, so modifying this would modify the cached item
+						// Make a clone
+						rr = protomarshal.Clone(rr)
 						secret.GetTlsCertificate().PrivateKey = &core.DataSource{
 							Specifier: &core.DataSource_InlineBytes{
 								InlineBytes: []byte("[redacted]"),
@@ -688,7 +738,7 @@ func (s *DiscoveryServer) getConfigDumpByResourceType(conn *Connection, req *mod
 // connectionConfigDump converts the connection internal state into an Envoy Admin API config dump proto
 // It is used in debugging to create a consistent object for comparison between Envoy and Pilot outputs
 func (s *DiscoveryServer) connectionConfigDump(conn *Connection, includeEds bool) (*admin.ConfigDump, error) {
-	req := &model.PushRequest{Push: conn.proxy.LastPushContext, Start: time.Now(), Full: true}
+	req := &model.PushRequest{Push: conn.proxy.LastPushContext, Start: time.Now(), Forced: true}
 	version := req.Push.PushVersion
 
 	dump := s.getConfigDumpByResourceType(conn, req, []string{
@@ -877,6 +927,11 @@ func (s *DiscoveryServer) pushContextHandler(w http.ResponseWriter, req *http.Re
 	writeJSON(w, push, req)
 }
 
+// DebugEndpoints lists all the supported debug endpoints.
+func (s *DiscoveryServer) DebugEndpoints() []string {
+	return slices.Sort(maps.Keys(s.debugHandlers))
+}
+
 // Debug lists all the supported debug endpoints.
 func (s *DiscoveryServer) Debug(w http.ResponseWriter, req *http.Request) {
 	type debugEndpoint struct {
@@ -922,57 +977,6 @@ func (s *DiscoveryServer) list(w http.ResponseWriter, req *http.Request) {
 	writeJSON(w, cmdNames, req)
 }
 
-// ndsz implements a status and debug interface for NDS.
-// It is mapped to /debug/ndsz on the monitor port (15014).
-func (s *DiscoveryServer) ndsz(w http.ResponseWriter, req *http.Request) {
-	if s.handlePushRequest(w, req) {
-		return
-	}
-	proxyID, con := s.getDebugConnection(req)
-	if con == nil {
-		s.errorHandler(w, proxyID, con)
-		return
-	}
-	if !con.proxy.Metadata.DNSCapture {
-		w.WriteHeader(http.StatusBadRequest)
-		_, _ = w.Write([]byte("DNS capture is not enabled in the proxy\n"))
-		return
-	}
-
-	if s.Generators[v3.NameTableType] != nil {
-		nds, _, _ := s.Generators[v3.NameTableType].Generate(con.proxy, nil, &model.PushRequest{
-			Push: con.proxy.LastPushContext,
-			Full: true,
-		})
-		if len(nds) == 0 {
-			return
-		}
-		writeJSON(w, nds[0], req)
-	}
-}
-
-// Edsz implements a status and debug interface for EDS.
-// It is mapped to /debug/edsz on the monitor port (15014).
-func (s *DiscoveryServer) Edsz(w http.ResponseWriter, req *http.Request) {
-	if s.handlePushRequest(w, req) {
-		return
-	}
-
-	proxyID, con := s.getDebugConnection(req)
-	if con == nil {
-		s.errorHandler(w, proxyID, con)
-		return
-	}
-
-	clusters := con.Clusters()
-	eps := make([]jsonMarshalProto, 0, len(clusters))
-	for _, clusterName := range clusters {
-		builder := endpoints.NewEndpointBuilder(clusterName, con.proxy, con.proxy.LastPushContext)
-		eps = append(eps, jsonMarshalProto{builder.BuildClusterLoadAssignment(s.Env.EndpointIndex)})
-	}
-	writeJSON(w, eps, req)
-}
-
 func (s *DiscoveryServer) forceDisconnect(w http.ResponseWriter, req *http.Request) {
 	proxyID, con := s.getDebugConnection(req)
 	if con == nil {
@@ -999,6 +1003,7 @@ func cloneProxy(proxy *model.Proxy) *model.Proxy {
 	for k, v := range proxy.WatchedResources {
 		// nolint: govet
 		v := *v
+		v.ResourceNames = v.ResourceNames.Copy()
 		out.WatchedResources[k] = &v
 	}
 	return out
@@ -1029,7 +1034,7 @@ func (s *DiscoveryServer) instancesz(w http.ResponseWriter, req *http.Request) {
 }
 
 func (s *DiscoveryServer) ambientz(w http.ResponseWriter, req *http.Request) {
-	addresses, _ := s.Env.ServiceDiscovery.AddressInformation(nil)
+	addresses, _ := s.Env.AmbientIndexes.AddressInformation(nil)
 	res := struct {
 		Workloads []jsonMarshalProto `json:"workloads"`
 		Services  []jsonMarshalProto `json:"services"`
@@ -1076,14 +1081,14 @@ func (s *DiscoveryServer) ambientz(w http.ResponseWriter, req *http.Request) {
 			res.Services = append(res.Services, jsonMarshalProto{s})
 		}
 	}
-	for _, policy := range s.Env.ServiceDiscovery.Policies(nil) {
+	for _, policy := range s.Env.AmbientIndexes.Policies(nil) {
 		res.Policies = append(res.Policies, jsonMarshalProto{policy.Authorization})
 	}
 	writeJSON(w, res, req)
 }
 
 func (s *DiscoveryServer) krtz(w http.ResponseWriter, req *http.Request) {
-	writeJSON(w, krt.GlobalDebugHandler, req)
+	writeJSON(w, s.krtDebugger, req)
 }
 
 func (s *DiscoveryServer) networkz(w http.ResponseWriter, req *http.Request) {
@@ -1136,9 +1141,25 @@ func (s *DiscoveryServer) handlePushRequest(w http.ResponseWriter, req *http.Req
 }
 
 // getDebugConnection fetches the Connection requested by proxyID
+// For non-system namespaces, restricts access to proxies in the caller's namespace only
 func (s *DiscoveryServer) getDebugConnection(req *http.Request) (string, *Connection) {
 	if proxyID := req.URL.Query().Get("proxyID"); proxyID != "" {
-		return proxyID, s.getProxyConnection(proxyID)
+		con := s.getProxyConnection(proxyID)
+		// Verify namespace if caller is not from system namespace (when auth is enabled)
+		if features.EnableDebugEndpointAuth {
+			callerNamespace, _ := req.Context().Value(CallerNamespaceKey{}).(string)
+			if con != nil && callerNamespace != "" {
+				systemNamespace := constants.IstioSystemNamespace
+				if s.Env != nil && s.Env.Mesh() != nil && s.Env.Mesh().GetRootNamespace() != "" {
+					systemNamespace = s.Env.Mesh().GetRootNamespace()
+				}
+				// Non-system namespaces can only access proxies in their own namespace
+				if callerNamespace != systemNamespace && con.proxy.ConfigNamespace != callerNamespace {
+					return proxyID, nil // Return nil connection to deny access
+				}
+			}
+		}
+		return proxyID, con
 	}
 	return "", nil
 }

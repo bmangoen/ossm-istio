@@ -72,6 +72,9 @@ var (
 	resourceLabels []string
 	annotations    []string
 	namespace      string
+	network        string
+	locality       string
+	weight         uint32
 )
 
 const (
@@ -151,6 +154,9 @@ The default output is serialized YAML, which can be piped into 'kubectl apply -f
 				Template: &networkingv1alpha3.WorkloadEntry{
 					Ports:          convertToUnsignedInt32Map(ports),
 					ServiceAccount: serviceAccount,
+					Network:        network,
+					Locality:       locality,
+					Weight:         weight,
 				},
 			}
 			wgYAML, err := generateWorkloadGroupYAML(u, spec)
@@ -167,6 +173,9 @@ The default output is serialized YAML, which can be piped into 'kubectl apply -f
 	createCmd.PersistentFlags().StringSliceVarP(&annotations, "annotations", "a", nil, "The annotations to apply to the workload instances")
 	createCmd.PersistentFlags().StringSliceVarP(&ports, "ports", "p", nil, "The incoming ports exposed by the workload instance")
 	createCmd.PersistentFlags().StringVarP(&serviceAccount, "serviceAccount", "s", "default", "The service identity to associate with the workload instances")
+	createCmd.PersistentFlags().StringVar(&network, "network", "", "Network enables Istio to group endpoints resident in the same L3 domain/network.")
+	createCmd.PersistentFlags().StringVar(&locality, "locality", "", "The locality associated with the endpoint.")
+	createCmd.PersistentFlags().Uint32VarP(&weight, "weight", "w", 0, "The load balancing weight associated with the endpoint.")
 	_ = createCmd.RegisterFlagCompletionFunc("serviceAccount", func(
 		cmd *cobra.Command, args []string, toComplete string,
 	) ([]string, cobra.ShellCompDirective) {
@@ -213,7 +222,7 @@ Configure requires either the WorkloadGroup artifact path or its location on the
 			return nil
 		},
 		RunE: func(cmd *cobra.Command, args []string) error {
-			kubeClient, err := ctx.CLIClientWithRevision(opts.Revision)
+			kubeClient, err := ctx.CLIClientWithRevision(ctx.RevisionOrDefault(opts.Revision))
 			if err != nil {
 				return err
 			}
@@ -639,7 +648,7 @@ func unstructureIstioType(spec any) (map[string]any, error) {
 func convertToUnsignedInt32Map(s []string) map[string]uint32 {
 	out := make(map[string]uint32, len(s))
 	for _, l := range s {
-		k, v := splitEqual(l)
+		k, v, _ := strings.Cut(l, "=")
 		u64, err := strconv.ParseUint(v, 10, 32)
 		if err != nil {
 			log.Errorf("failed to convert to uint32: %v", err)
@@ -652,25 +661,10 @@ func convertToUnsignedInt32Map(s []string) map[string]uint32 {
 func convertToStringMap(s []string) map[string]string {
 	out := make(map[string]string, len(s))
 	for _, l := range s {
-		k, v := splitEqual(l)
+		k, v, _ := strings.Cut(l, "=")
 		out[k] = v
 	}
 	return out
-}
-
-// splitEqual splits key=value string into key,value. if no = is found
-// the whole string is the key and value is empty.
-func splitEqual(str string) (string, string) {
-	idx := strings.Index(str, "=")
-	var k string
-	var v string
-	if idx >= 0 {
-		k = str[:idx]
-		v = str[idx+1:]
-	} else {
-		k = str
-	}
-	return k, v
 }
 
 // validateFlagIsSetManuallyOrNot can validate that a persistent flag is set manually or not by user for given command

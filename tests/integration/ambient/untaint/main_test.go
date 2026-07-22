@@ -1,5 +1,4 @@
 //go:build integ
-// +build integ
 
 // Copyright Istio Authors
 //
@@ -25,9 +24,9 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
+	"istio.io/istio/pilot/pkg/features"
 	"istio.io/istio/pkg/test/framework"
 	"istio.io/istio/pkg/test/framework/components/istio"
-	"istio.io/istio/pkg/test/framework/label"
 	"istio.io/istio/pkg/test/framework/resource"
 	"istio.io/istio/tests/integration/security/util/cert"
 )
@@ -43,7 +42,6 @@ func TestMain(m *testing.M) {
 	framework.
 		NewSuite(m).
 		RequireMinVersion(24).
-		Label(label.IPv4). // https://github.com/istio/istio/issues/41008
 		Setup(func(t resource.Context) error {
 			t.Settings().Ambient = true
 			return nil
@@ -58,8 +56,6 @@ values:
     taint:
       enabled: true
       namespace: "%s"
-    env:
-      PILOT_ENABLE_NODE_UNTAINT_CONTROLLERS: "true"
   ztunnel:
     terminationGracePeriodSeconds: 5
     env:
@@ -72,6 +68,12 @@ values:
       enabled: false
 
 `, cfg.SystemNamespace)
+			if ctx.Settings().NativeNftables {
+				cfg.ControlPlaneValues += `
+  global:
+    nativeNftables: true
+`
+			}
 		}, cert.CreateCASecretAlt)).
 		Teardown(untaintNodes).
 		Run()
@@ -87,12 +89,12 @@ func taintNodes(t resource.Context) error {
 Outer:
 	for _, node := range nodes.Items {
 		for _, taint := range node.Spec.Taints {
-			if taint.Key == "cni.istio.io/not-ready" {
+			if taint.Key == features.NodeUntaintTaintName {
 				continue Outer
 			}
 		}
 		node.Spec.Taints = append(node.Spec.Taints, corev1.Taint{
-			Key:    "cni.istio.io/not-ready",
+			Key:    features.NodeUntaintTaintName,
 			Value:  "true",
 			Effect: corev1.TaintEffectNoSchedule,
 		})
@@ -118,7 +120,7 @@ func untaintNodes(t resource.Context) {
 	for _, node := range nodes.Items {
 		var taints []corev1.Taint
 		for _, taint := range node.Spec.Taints {
-			if taint.Key == "cni.istio.io/not-ready" {
+			if taint.Key == features.NodeUntaintTaintName {
 				continue
 			}
 			taints = append(taints, taint)

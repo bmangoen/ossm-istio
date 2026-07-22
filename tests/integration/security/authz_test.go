@@ -1,5 +1,4 @@
 //go:build integ
-// +build integ
 
 // Copyright Istio Authors
 //
@@ -95,6 +94,143 @@ func TestAuthz_Principal(t *testing.T) {
 							ports: []echo.Port{ports.HTTP, ports.HTTP2},
 							path:  "/deny?param=value",
 							allow: false,
+						},
+					}
+
+					for _, c := range cases {
+						newAuthzTest().
+							From(from).
+							To(to).
+							Allow(c.allow).
+							Path(c.path).
+							BuildAndRunForPorts(t, c.ports...)
+					}
+				})
+		})
+}
+
+func TestAuthz_ServiceAccount(t *testing.T) {
+	framework.NewTest(t).
+		Run(func(t framework.TestContext) {
+			allowed := apps.Ns1.A
+			denied := apps.Ns2.A
+
+			from := allowed.Append(denied)
+			fromMatch := match.AnyServiceName(from.NamespacedNames())
+			toMatch := match.Not(fromMatch)
+			to := toMatch.GetServiceMatches(apps.Ns1.All)
+			fromAndTo := to.Instances().Append(from)
+
+			config.New(t).
+				Source(config.File("testdata/authz/mtls.yaml.tmpl")).
+				Source(config.File("testdata/authz/allow-serviceaccount.yaml.tmpl").WithParams(
+					param.Params{
+						"Allowed": allowed,
+					})).
+				BuildAll(nil, to).
+				Apply()
+
+			newTrafficTest(t, fromAndTo).
+				FromMatch(fromMatch).
+				ToMatch(toMatch).
+				Run(func(t framework.TestContext, from echo.Instance, to echo.Target) {
+					allow := allowValue(from.NamespacedName() == allowed.NamespacedName())
+
+					cases := []struct {
+						ports []echo.Port
+						path  string
+						allow allowValue
+					}{
+						{
+							ports: []echo.Port{ports.GRPC, ports.TCP},
+							allow: allow,
+						},
+						{
+							ports: []echo.Port{ports.HTTP, ports.HTTP2},
+							path:  "/allow",
+							allow: allow,
+						},
+						{
+							ports: []echo.Port{ports.HTTP, ports.HTTP2},
+							path:  "/allow?param=value",
+							allow: allow,
+						},
+						{
+							ports: []echo.Port{ports.HTTP, ports.HTTP2},
+							path:  "/deny",
+							allow: false,
+						},
+						{
+							ports: []echo.Port{ports.HTTP, ports.HTTP2},
+							path:  "/deny?param=value",
+							allow: false,
+						},
+					}
+
+					for _, c := range cases {
+						newAuthzTest().
+							From(from).
+							To(to).
+							Allow(c.allow).
+							Path(c.path).
+							BuildAndRunForPorts(t, c.ports...)
+					}
+				})
+		})
+}
+
+func TestAuthz_TrustDomain(t *testing.T) {
+	framework.NewTest(t).
+		Run(func(t framework.TestContext) {
+			from := apps.Ns1.A.Append(apps.Ns2.A)
+			fromMatch := match.AnyServiceName(from.NamespacedNames())
+			toMatch := match.Not(fromMatch)
+			to := toMatch.GetServiceMatches(apps.Ns1.All)
+			fromAndTo := to.Instances().Append(from)
+
+			config.New(t).
+				Source(config.File("testdata/authz/mtls.yaml.tmpl")).
+				Source(config.File("testdata/authz/allow-trust-domain.yaml.tmpl")).
+				BuildAll(nil, to).
+				Apply()
+
+			newTrafficTest(t, fromAndTo).
+				FromMatch(fromMatch).
+				ToMatch(toMatch).
+				Run(func(t framework.TestContext, from echo.Instance, to echo.Target) {
+					cases := []struct {
+						ports []echo.Port
+						path  string
+						allow allowValue
+					}{
+						{
+							// All test instances are in cluster.local, so all should be allowed.
+							ports: []echo.Port{ports.GRPC, ports.TCP},
+							allow: true,
+						},
+						{
+							// trustDomains: ["cluster.local"] matches all test instances.
+							ports: []echo.Port{ports.HTTP, ports.HTTP2},
+							path:  "/allow",
+							allow: true,
+						},
+						{
+							// trustDomains: ["bad.example.com"] matches no test instance.
+							ports: []echo.Port{ports.HTTP, ports.HTTP2},
+							path:  "/deny",
+							allow: false,
+						},
+						{
+							// notTrustDomains: ["cluster.local"] excludes all test instances.
+							ports: []echo.Port{ports.HTTP, ports.HTTP2},
+							path:  "/not-trust-domain",
+							allow: false,
+						},
+						{
+							// notTrustDomains: ["bad.example.com"] excludes nothing, so cluster.local is allowed.
+							ports: []echo.Port{ports.HTTP, ports.HTTP2},
+							path:  "/not-deny",
+							allow: true,
 						},
 					}
 
@@ -610,7 +746,9 @@ func TestAuthz_JWT(t *testing.T) {
 			fromAndTo := to.Instances().Append(from)
 
 			config.New(t).
-				Source(config.File("testdata/authz/jwt.yaml.tmpl").WithNamespace(apps.Ns1.Namespace)).
+				Source(config.File("testdata/authz/jwt.yaml.tmpl").WithNamespace(apps.Ns1.Namespace).WithParams(param.Params{
+					"JWTServer": jwtServer,
+				})).
 				BuildAll(nil, to).
 				Apply()
 
@@ -695,10 +833,58 @@ func TestAuthz_JWT(t *testing.T) {
 							allow:  false,
 						},
 						{
-							prefix: "[PermissionTokenWithSpaceDelimitedScope]",
-							jwt:    jwt.TokenIssuer2WithSpaceDelimitedScope,
+							prefix: "[PermissionTokenWithSpaceDelimitedPermission]",
+							jwt:    jwt.TokenIssuer2WithSpaceDelimitedPermission,
 							path:   "/permission",
 							allow:  true,
+						},
+						{
+							prefix: "[PermissionTokenWithSpaceDelimitedScope]",
+							jwt:    jwt.TokenIssuer2WithSpaceDelimitedScope,
+							path:   "/scope",
+							allow:  true,
+						},
+						{
+							prefix: "[PermissionTokenWithSpaceDelimitedScope]",
+							jwt:    jwt.TokenIssuer2WithSpaceDelimitedScope,
+							path:   "/otherscope",
+							allow:  false,
+						},
+						{
+							prefix: "[CustomScopeToken]",
+							jwt:    jwt.TokenIssuer2WithCustomScopeSpaceDelimitedScope,
+							path:   "/custom-scope-admin",
+							allow:  true,
+						},
+						{
+							prefix: "[CustomScopeToken]",
+							jwt:    jwt.TokenIssuer2WithCustomScopeSpaceDelimitedScope,
+							path:   "/custom-scope-user",
+							allow:  true,
+						},
+						{
+							prefix: "[NoJWT]",
+							jwt:    "",
+							path:   "/custom-scope-admin",
+							allow:  false,
+						},
+						{
+							prefix: "[NoJWT]",
+							jwt:    "",
+							path:   "/custom-scope-user",
+							allow:  false,
+						},
+						{
+							prefix: "[Token1]",
+							jwt:    jwt.TokenIssuer1,
+							path:   "/custom-scope-admin",
+							allow:  false,
+						},
+						{
+							prefix: "[Token1]",
+							jwt:    jwt.TokenIssuer1,
+							path:   "/custom-scope-user",
+							allow:  false,
 						},
 						{
 							prefix: "[NestedToken1]",
@@ -1270,6 +1456,7 @@ func TestAuthz_EgressGateway(t *testing.T) {
 					"EgressGatewayServiceName":      i.Settings().EgressGatewayServiceName,
 					"EgressGatewayServiceNamespace": i.Settings().EgressGatewayServiceNamespace,
 					"Allowed":                       allowed,
+					"JWTServer":                     jwtServer,
 				})).
 				Run(func(t framework.TestContext, from echo.Instance, to echo.Target) {
 					allow := allowValue(from.NamespacedName() == allowed.Config().NamespacedName())
@@ -1454,6 +1641,17 @@ func TestAuthz_Conditions(t *testing.T) {
 						{
 							path:  "/source-principal-notValues",
 							allow: allow,
+						},
+
+						// Test source trust domain.
+						// All test instances are in cluster.local, so both cases always allow.
+						{
+							path:  "/source-trust-domain",
+							allow: true,
+						},
+						{
+							path:  "/source-trust-domain-notValues",
+							allow: true,
 						},
 
 						// Test destination IP

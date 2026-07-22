@@ -21,6 +21,7 @@ import (
 
 	"istio.io/istio/pilot/cmd/pilot-agent/status"
 	"istio.io/istio/pkg/config/constants"
+	dnsClient "istio.io/istio/pkg/dns/client"
 	"istio.io/istio/pkg/env"
 	"istio.io/istio/pkg/jwt"
 	"istio.io/istio/pkg/security"
@@ -95,10 +96,12 @@ var (
 		"The type of the credential fetcher. Currently supported types include GoogleComputeEngine").Get()
 	credIdentityProvider = env.Register("CREDENTIAL_IDENTITY_PROVIDER", "GoogleComputeEngine",
 		"The identity provider for credential. Currently default supported identity provider is GoogleComputeEngine").Get()
-	proxyXDSDebugViaAgent = env.Register("PROXY_XDS_DEBUG_VIA_AGENT", true,
-		"If set to true, the agent will listen on tap port and offer pilot's XDS istio.io/debug debug API there.").Get()
-	proxyXDSDebugViaAgentPort = env.Register("PROXY_XDS_DEBUG_VIA_AGENT_PORT", 15004,
-		"Agent debugging port.").Get()
+	// EnableSelfDiscovery controls whether pilot-agent adds a local_cluster static cluster to the bootstrap
+	// for zone-aware routing support. Set ISTIO_META_ENABLE_SELF_DISCOVERY=true via proxyMetadata.
+	EnableSelfDiscovery = env.Register("ISTIO_META_ENABLE_SELF_DISCOVERY", false,
+		"If set to true, pilot-agent will configure a local_cluster static cluster in the Envoy bootstrap "+
+			"to support zone-aware load balancing.")
+
 	// DNSCaptureByAgent is a copy of the env var in the init code.
 	DNSCaptureByAgent = env.Register("ISTIO_META_DNS_CAPTURE", false,
 		"If set to true, enable the capture of outgoing DNS packets on port 53, redirecting to istio-agent on :15053")
@@ -107,12 +110,15 @@ var (
 		"If set to true, starts the DNS server on :15053. This won't automatically capture the DNS traffic and can be used "+
 			"when we want Gateways to resolve DNS using this as Resolver for use cases like Dynamic Forward Proxy")
 
-	// DNSCaptureAddr is the address to listen.
-	DNSCaptureAddr = env.Register("DNS_PROXY_ADDR", "localhost:15053",
+	// DNSCaptureAddr is the address istio-agent listens on for the DNS proxy.
+	DNSCaptureAddr = env.Register("DNS_PROXY_ADDR", constants.DefaultDNSProxyAddr,
 		"Custom address for the DNS proxy. If it ends with :53 and running as root allows running without iptable DNS capture")
 
 	DNSForwardParallel = env.Register("DNS_FORWARD_PARALLEL", false,
 		"If set to true, agent will send parallel DNS queries to all upstream nameservers")
+
+	DNSForwardTimeout = env.Register("DNS_FORWARD_TIMEOUT", dnsClient.DefaultUpstreamTimeout,
+		"Timeout for upstream DNS queries. Defaults to 5 seconds")
 
 	// Ability of istio-agent to retrieve proxyConfig via XDS for dynamic configuration updates
 	enableProxyConfigXdsEnv = env.Register("PROXY_CONFIG_XDS_AGENT", false,
@@ -133,13 +139,19 @@ var (
 	wasmHTTPRequestMaxRetries = env.Register("WASM_HTTP_REQUEST_MAX_RETRIES", wasm.DefaultHTTPRequestMaxRetries,
 		"maximum number of HTTP/HTTPS request retries for pulling a Wasm module via http/https").Get()
 
-	enableWDSEnv = env.Register("PEER_METADATA_DISCOVERY", false,
-		"If set to true, enable the peer metadata discovery extension in Envoy").Get()
+	enableWDSEnv, enableWDSEnvWasSet = env.Register("PEER_METADATA_DISCOVERY", false,
+		"If set to true, enable the peer metadata discovery extension in Envoy").Lookup()
 
 	envoyStatusPortEnv = env.Register("ENVOY_STATUS_PORT", 15021,
 		"Envoy health status port value").Get()
 	envoyPrometheusPortEnv = env.Register("ENVOY_PROMETHEUS_PORT", 15090,
 		"Envoy prometheus redirection port value").Get()
+
+	envoySecureMetricsPortEnv = env.Register("ENVOY_SECURE_METRICS_PORT", 0,
+		"Envoy mTLS metrics port value (Envoy stats only)").Get()
+
+	envoySecureMergedMetricsPortEnv = env.Register("ENVOY_SECURE_MERGED_METRICS_PORT", 0,
+		"Envoy mTLS merged metrics port value (Envoy + app + agent stats)").Get()
 
 	// Defined by https://github.com/grpc/proposal/blob/c5722a35e71f83f07535c6c7c890cf0c58ec90c0/A27-xds-global-load-balancing.md#xdsclient-and-bootstrap-file
 	grpcBootstrapEnv = env.Register("GRPC_XDS_BOOTSTRAP", filepath.Join(constants.ConfigPathDir, "grpc-bootstrap.json"),
@@ -164,4 +176,8 @@ var (
 	exitOnZeroActiveConnectionsEnv = env.Register("EXIT_ON_ZERO_ACTIVE_CONNECTIONS",
 		false,
 		"When set to true, terminates proxy when number of active connections become zero during draining").Get()
+
+	envoySkipDeprecatedLogsEnv = env.Register("ENVOY_SKIP_DEPRECATED_LOGS",
+		true,
+		"By default, deprecated log messages are skipped, Set to 'false' to display all deprecated log messages.").Get()
 )

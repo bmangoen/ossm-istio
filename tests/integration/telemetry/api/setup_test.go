@@ -1,5 +1,4 @@
 //go:build integ
-// +build integ
 
 // Copyright Istio Authors. All Rights Reserved.
 //
@@ -23,6 +22,7 @@ import (
 	"testing"
 
 	"istio.io/api/annotation"
+	"istio.io/istio/pkg/config/protocol"
 	"istio.io/istio/pkg/test/echo/common"
 	"istio.io/istio/pkg/test/framework"
 	"istio.io/istio/pkg/test/framework/components/echo"
@@ -79,6 +79,10 @@ func setupConfig(_ resource.Context, cfg *istio.Config) {
 		return
 	}
 	cfg.ControlPlaneValues = `
+values:
+  pilot:
+    env:
+      PILOT_MX_ADDITIONAL_LABELS: "custom-label"
 meshConfig:
   accessLogFile: "" # disable from install, we will enable via Telemetry layer
   extensionProviders:
@@ -107,6 +111,11 @@ proxyMetadata:
 			e.Subsets[0].Annotations[annotation.SidecarStatsHistogramBuckets.Name] = customBuckets
 		}
 		e.Subsets[0].Annotations[annotation.ProxyConfig.Name] = proxyMetadata
+		// add custom label to echo instances, this will be used to test additional labels exchange.
+		if e.Subsets[0].Labels == nil {
+			e.Subsets[0].Labels = map[string]string{}
+		}
+		e.Subsets[0].Labels["custom-label"] = e.Service
 	}
 
 	proxyMd := `{"proxyMetadata": {"OUTPUT_CERTS": "/etc/certs/custom"}}`
@@ -131,6 +140,29 @@ proxyMetadata:
 	}
 	echos = append(echos, prom)
 
+	// secureMetricsTarget: mTLS metrics ports 15091/15092 enabled; plaintext ports 15090/15020 restricted to localhost.
+	secureMetricsProxyMd := `{"proxyMetadata": {"ENVOY_SECURE_METRICS_PORT": "15091",` +
+		`"ENVOY_SECURE_MERGED_METRICS_PORT": "15092", "METRICS_LOCALHOST_ACCESS_ONLY": "true"}}`
+	secureMetricsTarget := echo.Config{
+		Service: "secure-metrics-target",
+		Subsets: []echo.SubsetConfig{
+			{
+				Annotations: map[string]string{
+					annotation.ProxyConfig.Name: secureMetricsProxyMd,
+				},
+			},
+		},
+		Ports: []echo.Port{
+			{
+				Name:         "http",
+				Protocol:     protocol.HTTP,
+				ServicePort:  8080,
+				WorkloadPort: 8080,
+			},
+		},
+	}
+	echos = append(echos, secureMetricsTarget)
+
 	if err := cdeployment.SetupSingleNamespace(&apps, cdeployment.Config{Configs: echo.ConfigFuture(&echos)})(ctx); err != nil {
 		return err
 	}
@@ -141,7 +173,7 @@ proxyMetadata:
 	mockProm = match.ServiceName(echo.NamespacedName{Name: "mock-prom", Namespace: apps.Namespace}).GetMatches(apps.Echos().All.Instances())
 	promInst, err = prometheus.New(ctx, prometheus.Config{})
 	if err != nil {
-		return
+		return err
 	}
 
 	args := map[string]any{

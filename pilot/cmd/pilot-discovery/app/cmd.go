@@ -153,7 +153,7 @@ func addFlags(c *cobra.Command) {
 	c.PersistentFlags().StringVar((*string)(&serverArgs.RegistryOptions.KubeOptions.ClusterID), "clusterID", features.ClusterName,
 		"The ID of the cluster that this Istiod instance resides")
 	c.PersistentFlags().StringToStringVar(&serverArgs.RegistryOptions.KubeOptions.ClusterAliases, "clusterAliases", map[string]string{},
-		"Alias names for clusters")
+		"Alias names for clusters. Example: alias1=cluster1,alias2=cluster2")
 
 	// using address, so it can be configured as localhost:.. (possibly UDS in future)
 	c.PersistentFlags().StringVar(&serverArgs.ServerOptions.HTTPAddr, "httpAddr", ":8080",
@@ -178,9 +178,13 @@ func addFlags(c *cobra.Command) {
 		"File containing the x509 private key matching --tlsCertFile")
 	c.PersistentFlags().StringSliceVar(&serverArgs.ServerOptions.TLSOptions.TLSCipherSuites, "tls-cipher-suites", nil,
 		"Comma-separated list of cipher suites for istiod TLS server. "+
-			"If omitted, the default Go cipher suites will be used. \n"+
+			"If omitted, the default Go cipher suites will be used. "+
+			"If 'tls-min-version' is set to '1.3', these cipher suites will be ignored.\n"+
 			"Preferred values: "+strings.Join(secureTLSCipherNames(), ", ")+". \n"+
 			"Insecure values: "+strings.Join(insecureTLSCipherNames(), ", ")+".")
+	c.PersistentFlags().StringVar(&serverArgs.ServerOptions.TLSOptions.TLSMinVersion, "tls-min-version", bootstrap.TLSMinVersion1_2,
+		"Minimum TLS version for the istiod TLS server. "+
+			fmt.Sprintf("Only %s and %s are supported.", bootstrap.TLSMinVersion1_2, bootstrap.TLSMinVersion1_3))
 
 	c.PersistentFlags().Float32Var(&serverArgs.RegistryOptions.KubeOptions.KubernetesAPIQPS, "kubernetesApiQPS", 80.0,
 		"Maximum QPS when communicating with the kubernetes API")

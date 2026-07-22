@@ -37,6 +37,7 @@ import (
 
 	"istio.io/api/annotation"
 	"istio.io/istio/pkg/kube"
+	"istio.io/istio/pkg/slices"
 	"istio.io/istio/pkg/test/framework/components/cluster"
 	"istio.io/istio/pkg/test/framework/components/istioctl"
 	"istio.io/istio/pkg/test/framework/resource"
@@ -557,14 +558,7 @@ func hasEnvoy(pod corev1.Pod) bool {
 		// assume VMs run Envoy
 		return true
 	}
-	f := false
-	for _, c := range pod.Spec.Containers {
-		if proxyContainer.IsContainer(c) {
-			f = true
-			break
-		}
-	}
-	if !f {
+	if !slices.ContainsFunc(pod.Spec.Containers, proxyContainer.IsContainer) {
 		// no proxy container
 		return false
 	}
@@ -635,5 +629,20 @@ func DumpPodAgent(ctx resource.Context, c cluster.Cluster, workDir string, _ str
 	}
 	if err := g.Wait(); err != nil {
 		scopes.Framework.Errorf("failed to dump ndsz: %v", err)
+	}
+}
+
+// Will capture pod logs until target pod/container terminates, and then will write them to file.
+// Generally should be run in a goroutine while deletion happens
+func DumpTerminationLogs(ctx context.Context, c cluster.Cluster, workDir string, pod corev1.Pod, containerName string) {
+	fname := podOutputPath(workDir, c, pod, fmt.Sprintf("%s.termination.log", containerName))
+	l, err := c.PodLogsFollow(ctx, pod.Name, pod.Namespace, containerName)
+	if err != nil && len(l) == 0 {
+		scopes.Framework.Warnf("Unable to capture termination logs for cluster/pod/container: %s/%s/%s/%s: %v",
+			c.Name(), pod.Namespace, pod.Name, containerName, err)
+	}
+	if err = os.WriteFile(fname, []byte(l), os.ModePerm); err != nil {
+		scopes.Framework.Warnf("Unable to write termination logs for cluster/pod/container: %s/%s/%s/%s: %v",
+			c.Name(), pod.Namespace, pod.Name, containerName, err)
 	}
 }

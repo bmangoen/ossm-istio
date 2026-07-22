@@ -1,7 +1,6 @@
-apiVersion: gateway.networking.k8s.io/v1beta1
+apiVersion: gateway.networking.k8s.io/v1
 kind: Gateway
 metadata:
-  creationTimestamp: null
   name: eastwestgateway
   namespace: istio-system
 spec: null
@@ -13,11 +12,21 @@ status:
     status: "True"
     type: Accepted
   - lastTransitionTime: fake
+    message: AllowInsecureFallback mode is disabled for frontend validation
+    reason: AllowInsecureFallbackNotConfigured
+    status: "False"
+    type: InsecureFrontendValidationMode
+  - lastTransitionTime: fake
     message: 'Failed to assign to any requested addresses: hostname "eastwestgateway-istio.istio-system.svc.domain.suffix"
       not found'
     reason: AddressNotUsable
     status: "False"
     type: Programmed
+  - lastTransitionTime: fake
+    message: All references resolved
+    reason: ResolvedRefs
+    status: "True"
+    type: ResolvedRefs
   listeners:
   - attachedRoutes: 1
     conditions:
@@ -98,10 +107,9 @@ status:
     - group: gateway.networking.k8s.io
       kind: TLSRoute
 ---
-apiVersion: gateway.networking.k8s.io/v1alpha2
+apiVersion: gateway.networking.k8s.io/v1
 kind: TLSRoute
 metadata:
-  creationTimestamp: null
   name: eastwestgateway-grpc
   namespace: istio-system
 spec: null
@@ -124,10 +132,9 @@ status:
       name: eastwestgateway
       sectionName: istiod-grpc
 ---
-apiVersion: gateway.networking.k8s.io/v1alpha2
+apiVersion: gateway.networking.k8s.io/v1
 kind: TLSRoute
 metadata:
-  creationTimestamp: null
   name: eastwestgateway-webhook
   namespace: istio-system
 spec: null

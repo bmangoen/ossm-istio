@@ -1,5 +1,4 @@
 //go:build integ
-// +build integ
 
 // Copyright Istio Authors
 //
@@ -24,7 +23,6 @@ import (
 	"testing"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	k8ssets "k8s.io/apimachinery/pkg/util/sets" //nolint: depguard
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	v1 "sigs.k8s.io/gateway-api/apis/v1"
 	"sigs.k8s.io/gateway-api/conformance"
@@ -41,6 +39,7 @@ import (
 	"istio.io/istio/pkg/test/env"
 	"istio.io/istio/pkg/test/framework"
 	ambientComponent "istio.io/istio/pkg/test/framework/components/ambient"
+	"istio.io/istio/pkg/test/framework/components/cluster"
 	"istio.io/istio/pkg/test/framework/components/namespace"
 	"istio.io/istio/pkg/test/prow"
 	"istio.io/istio/pkg/test/scopes"
@@ -53,6 +52,7 @@ import (
 type GatewayConformanceInputs struct {
 	Client  kube.CLIClient
 	Cleanup bool
+	Cluster cluster.Cluster
 }
 
 var gatewayConformanceInputs GatewayConformanceInputs
@@ -65,7 +65,20 @@ var conformanceNamespaces = []string{
 	"gateway-conformance-mesh",
 }
 
-var skippedTests = map[string]string{}
+var skippedTests = map[string]string{
+	// The following tests were added in v1.5.0
+
+	"GatewayBackendClientCertificateFeature":                     "TODO",
+	"GatewayFrontendClientCertificateValidationInsecureFallback": "TODO",
+
+	"HTTPRouteHTTPSListenerDetectMisdirectedRequests": "TODO",
+
+	// Fixed upstream, waiting for new gateway api release to pick up fix
+	"MeshHTTPRoute307Redirect": "TODO",
+
+	// The following tests were added in v1.6.0
+	"GatewayListenerUnsupportedProtocol": "TODO",
+}
 
 func TestGatewayConformance(t *testing.T) {
 	framework.
@@ -81,10 +94,8 @@ func TestGatewayConformance(t *testing.T) {
 				}
 			}
 
-			mapper, _ := gatewayConformanceInputs.Client.UtilFactory().ToRESTMapper()
 			clientOptions := client.Options{
 				Scheme: kube.IstioScheme,
-				Mapper: mapper,
 			}
 			c, err := client.New(gatewayConformanceInputs.Client.RESTConfig(), clientOptions)
 			if err != nil {
@@ -95,37 +106,43 @@ func TestGatewayConformance(t *testing.T) {
 			istioVersion, _ := env.ReadVersion()
 			supported := gateway.SupportedFeatures.Clone().Delete(gwfeatures.MeshConsumerRouteFeature)
 			opts := suite.ConformanceOptions{
-				Client:                   c,
-				ClientOptions:            clientOptions,
-				Clientset:                gatewayConformanceInputs.Client.Kube(),
-				RestConfig:               gatewayConformanceInputs.Client.RESTConfig(),
-				GatewayClassName:         "istio",
-				Debug:                    scopes.Framework.DebugEnabled(),
-				CleanupBaseResources:     gatewayConformanceInputs.Cleanup,
-				ManifestFS:               []fs.FS{&conformance.Manifests},
-				SupportedFeatures:        gwfeatures.SetsToNamesSet(supported),
-				SkipTests:                maps.Keys(skippedTests),
-				UsableNetworkAddresses:   []v1.GatewayAddress{{Value: "infra-backend-v1.gateway-conformance-infra.svc.cluster.local", Type: &hostnameType}},
-				UnusableNetworkAddresses: []v1.GatewayAddress{{Value: "foo", Type: &hostnameType}},
-				ConformanceProfiles: k8ssets.New(
-					suite.GatewayHTTPConformanceProfileName,
-					suite.GatewayTLSConformanceProfileName,
-					suite.GatewayGRPCConformanceProfileName,
-					suite.MeshHTTPConformanceProfileName,
-				),
-				Implementation: confv1.Implementation{
-					Organization: "istio",
-					Project:      "istio",
-					URL:          "https://istio.io/",
-					Version:      istioVersion,
-					Contact:      []string{"@istio/maintainers"},
+				ConfigurableOptions: suite.ConfigurableOptions{
+					GatewayClassName:         "istio",
+					Debug:                    scopes.Framework.DebugEnabled(),
+					CleanupBaseResources:     gatewayConformanceInputs.Cleanup,
+					CleanupTestResources:     gatewayConformanceInputs.Cleanup,
+					SupportedFeatures:        gwfeatures.SetsToNamesSet(supported).UnsortedList(),
+					SkipTests:                maps.Keys(skippedTests),
+					UsableNetworkAddresses:   []v1.GatewaySpecAddress{{Value: "infra-backend-v1.gateway-conformance-infra.svc.cluster.local", Type: &hostnameType}},
+					UnusableNetworkAddresses: []v1.GatewaySpecAddress{{Value: "foo", Type: &hostnameType}},
+					ConformanceProfiles: []suite.ConformanceProfileName{
+						suite.GatewayHTTPConformanceProfileName,
+						suite.GatewayTLSConformanceProfileName,
+						suite.GatewayGRPCConformanceProfileName,
+						suite.GatewayTCPConformanceProfileName,
+						suite.MeshHTTPConformanceProfileName,
+					},
+					Implementation: confv1.Implementation{
+						Organization: "istio",
+						Project:      "istio",
+						URL:          "https://istio.io/",
+						Version:      istioVersion,
+						Contact:      []string{"@istio/maintainers"},
+					},
+					NamespaceLabels: map[string]string{
+						label.IoIstioDataplaneMode.Name: "ambient",
+					},
+					TimeoutConfig: ctx.Settings().GatewayConformanceTimeoutConfig,
 				},
-				NamespaceLabels: map[string]string{
-					label.IoIstioDataplaneMode.Name: "ambient",
-				},
-				TimeoutConfig: ctx.Settings().GatewayConformanceTimeoutConfig,
+				Client:        c,
+				ClientOptions: clientOptions,
+				Clientset:     gatewayConformanceInputs.Client.Kube(),
+				RestConfig:    gatewayConformanceInputs.Client.RESTConfig(),
+				ManifestFS:    []fs.FS{&conformance.Manifests},
 			}
-
+			if ctx.Settings().GatewayConformanceAllowCRDsMismatch {
+				opts.AllowCRDsMismatch = true
+			}
 			ctx.Cleanup(func() {
 				if !ctx.Failed() {
 					return
@@ -153,27 +170,28 @@ func TestGatewayConformance(t *testing.T) {
 
 			// create a waypoint for mesh conformance
 			meshNS := namespace.Static("gateway-conformance-mesh")
-			ambientComponent.NewWaypointProxyOrFail(ctx, meshNS, "namespace")
-			for _, k := range ctx.AllClusters() {
-				ns, err := k.Kube().CoreV1().Namespaces().Get(ctx.Context(), meshNS.Name(), metav1.GetOptions{})
-				if err != nil {
-					t.Fatal(err)
-				}
-				labels := ns.Labels
-				if labels == nil {
-					labels = make(map[string]string)
-				}
-				labels[label.IoIstioUseWaypoint.Name] = "namespace"
-				ns.Labels = labels
-				k.Kube().CoreV1().Namespaces().Update(ctx.Context(), ns, metav1.UpdateOptions{})
+			cls := gatewayConformanceInputs.Cluster
+			ambientComponent.NewWaypointProxyOrFailForCluster(ctx, meshNS, "namespace", cls)
+
+			// TODO: Should we even run this in multiple clusters?
+			concreteNS, err := cls.Kube().CoreV1().Namespaces().Get(ctx.Context(), meshNS.Name(), metav1.GetOptions{})
+			if err != nil {
+				t.Fatal(err)
 			}
+			labels := concreteNS.Labels
+			if labels == nil {
+				labels = make(map[string]string)
+			}
+			labels[label.IoIstioUseWaypoint.Name] = "namespace"
+			concreteNS.Labels = labels
+			cls.Kube().CoreV1().Namespaces().Update(ctx.Context(), concreteNS, metav1.UpdateOptions{})
 
 			assert.NoError(t, csuite.Run(t, tests.ConformanceTests))
 			report, err := csuite.Report()
 			assert.NoError(t, err)
 			reportb, err := yaml.Marshal(report)
 			assert.NoError(t, err)
-			fp := filepath.Join(ctx.Settings().BaseDir, "conformance.yaml")
+			fp := filepath.Join(ctx.Settings().BaseDir, "istio-conformance.yaml")
 			t.Logf("writing conformance test to %v (%v)", fp, prow.ArtifactsURL(fp))
 			assert.NoError(t, os.WriteFile(fp, reportb, 0o644))
 		})

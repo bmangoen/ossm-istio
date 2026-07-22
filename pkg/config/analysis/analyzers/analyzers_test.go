@@ -26,7 +26,9 @@ import (
 	"istio.io/istio/pkg/config"
 	"istio.io/istio/pkg/config/analysis"
 	"istio.io/istio/pkg/config/analysis/analyzers/annotations"
+	"istio.io/istio/pkg/config/analysis/analyzers/authn"
 	"istio.io/istio/pkg/config/analysis/analyzers/authz"
+	"istio.io/istio/pkg/config/analysis/analyzers/conditions"
 	"istio.io/istio/pkg/config/analysis/analyzers/deployment"
 	"istio.io/istio/pkg/config/analysis/analyzers/deprecation"
 	"istio.io/istio/pkg/config/analysis/analyzers/destinationrule"
@@ -244,6 +246,23 @@ var testGrid = []testCase{
 	{
 		name:       "conflicting gateways detect",
 		inputFiles: []string{"testdata/conflicting-gateways.yaml"},
+		analyzer:   &gateway.ConflictingGatewayAnalyzer{},
+		expected: []message{
+			{msg.ConflictingGateways, "Gateway alpha"},
+			{msg.ConflictingGateways, "Gateway beta"},
+		},
+	},
+	{
+		name:       "gateways with different port are non-conflicting",
+		inputFiles: []string{"testdata/gateway-different-port.yaml"},
+		analyzer:   &gateway.ConflictingGatewayAnalyzer{},
+		expected:   []message{
+			// no conflict expected, verify that no false-positive conflict is returned
+		},
+	},
+	{
+		name:       "conflicting gateways with multiple port declarations",
+		inputFiles: []string{"testdata/conflicting-gateways-multiple-ports.yaml"},
 		analyzer:   &gateway.ConflictingGatewayAnalyzer{},
 		expected: []message{
 			{msg.ConflictingGateways, "Gateway alpha"},
@@ -511,6 +530,32 @@ var testGrid = []testCase{
 			{msg.UnknownMeshNetworksServiceRegistry, "MeshNetworks istio-system/meshnetworks"},
 			{msg.UnknownMeshNetworksServiceRegistry, "MeshNetworks istio-system/meshnetworks"},
 		},
+	},
+	{
+		name: "blockedCIDRsMissing",
+		inputFiles: []string{
+			"testdata/blocked-cidrs-missing.yaml",
+		},
+		analyzer: &authn.BlockedCIDRsAnalyzer{},
+		expected: []message{
+			{msg.JwksUriFetchUnrestricted, "Deployment istio-system/istiod"},
+		},
+	},
+	{
+		name: "blockedCIDRsConfigured",
+		inputFiles: []string{
+			"testdata/blocked-cidrs-configured.yaml",
+		},
+		analyzer: &authn.BlockedCIDRsAnalyzer{},
+		expected: []message{},
+	},
+	{
+		name: "blockedCIDRsNoRA",
+		inputFiles: []string{
+			"testdata/blocked-cidrs-no-ra.yaml",
+		},
+		analyzer: &authn.BlockedCIDRsAnalyzer{},
+		expected: []message{},
 	},
 	{
 		name: "authorizationpolicies",
@@ -902,7 +947,7 @@ var testGrid = []testCase{
 	{
 		name:       "Analyze invalid telemetry",
 		inputFiles: []string{"testdata/telemetry-invalid-provider.yaml"},
-		analyzer:   &telemetry.ProdiverAnalyzer{},
+		analyzer:   &telemetry.ProviderAnalyzer{},
 		expected: []message{
 			{msg.InvalidTelemetryProvider, "Telemetry istio-system/mesh-default"},
 		},
@@ -910,7 +955,7 @@ var testGrid = []testCase{
 	{
 		name:       "Analyze invalid telemetry",
 		inputFiles: []string{"testdata/telemetry-disable-provider.yaml"},
-		analyzer:   &telemetry.ProdiverAnalyzer{},
+		analyzer:   &telemetry.ProviderAnalyzer{},
 		expected:   []message{},
 	},
 	{
@@ -956,6 +1001,14 @@ var testGrid = []testCase{
 		},
 	},
 	{
+		name:       "GatewayAPICRDVersionBelowMinimum",
+		inputFiles: []string{"testdata/gateway-api-crd-version-old.yaml"},
+		analyzer:   &k8sgateway.CRDVersionAnalyzer{},
+		expected: []message{
+			{msg.GatewayAPICRDVersionBelowMinimum, "CustomResourceDefinition tlsroutes.gateway.networking.k8s.io"},
+		},
+	},
+	{
 		name:       "ServiceEntry Addresses Required Lowercase Protocol",
 		inputFiles: []string{"testdata/serviceentry-address-required-lowercase.yaml"},
 		analyzer:   &serviceentry.ProtocolAddressesAnalyzer{},
@@ -970,6 +1023,86 @@ var testGrid = []testCase{
 		expected: []message{
 			{msg.ServiceEntryAddressesRequired, "ServiceEntry address-missing-uppercase"},
 		},
+	},
+	{
+		name:       "ServiceEntry conflicting protocols on same host and port",
+		inputFiles: []string{"testdata/serviceentry-conflicting-protocol.yaml"},
+		analyzer:   &serviceentry.ConflictingServiceEntryProtocolAnalyzer{},
+		expected: []message{
+			{msg.ConflictingServiceEntryProtocol, "ServiceEntry default/se-http"},
+			{msg.ConflictingServiceEntryProtocol, "ServiceEntry default/se-https"},
+		},
+	},
+	{
+		name:       "ServiceEntry no conflict same protocol",
+		inputFiles: []string{"testdata/serviceentry-no-conflict-protocol.yaml"},
+		analyzer:   &serviceentry.ConflictingServiceEntryProtocolAnalyzer{},
+		expected:   []message{},
+	},
+	{
+		name:       "ServiceEntry no conflict non-overlapping exportTo scopes",
+		inputFiles: []string{"testdata/serviceentry-conflicting-exportto.yaml"},
+		analyzer:   &serviceentry.ConflictingServiceEntryProtocolAnalyzer{},
+		expected:   []message{},
+	},
+	{
+		name:       "Condition Analyzer",
+		inputFiles: []string{"testdata/condition-analyzer.yaml"},
+		analyzer:   &conditions.ConditionAnalyzer{},
+		expected: []message{
+			{msg.NegativeConditionStatus, "Service default/negative-condition-svc"},
+			{msg.NegativeConditionStatus, "ServiceEntry default/negative-condition-svcEntry"},
+			{msg.NegativeConditionStatus, "AuthorizationPolicy default/negative-condition-authz"},
+			{msg.NegativeConditionStatus, "Gateway default/negative-condition-gateway"},
+			{msg.NegativeConditionStatus, "HTTPRoute default/negative-condition-httproute"},
+			{msg.NegativeConditionStatus, "GRPCRoute default/negative-condition-grpcroute"},
+			{msg.NegativeConditionStatus, "AuthorizationPolicy default/negative-condition-authz-partially-invalid"},
+		},
+	},
+	{
+		name:       "DestinationRuleWithFakeHost",
+		inputFiles: []string{"testdata/destinationrule-with-fake-host.yaml"},
+		analyzer:   &destinationrule.PodNotSelectedAnalyzer{},
+		expected: []message{
+			{msg.UnknownDestinationRuleHost, "DestinationRule default/fake-host"},
+		},
+	},
+	{
+		name:       "DestinationRuleSubsetsNotSelectPods",
+		inputFiles: []string{"testdata/destinationrule-subsets-not-select-pods.yaml"},
+		analyzer:   &destinationrule.PodNotSelectedAnalyzer{},
+		expected: []message{
+			{msg.DestinationRuleSubsetNotSelectPods, "DestinationRule default/subsets-not-select-pods"},
+		},
+	},
+	{
+		name:       "DestinationRuleSubsetsWithTopologyLabels",
+		inputFiles: []string{"testdata/destinationrule-subsets-with-topology-labels.yaml"},
+		analyzer:   &destinationrule.PodNotSelectedAnalyzer{},
+		expected:   []message{
+			// Should not report false positives for topology labels
+			// All subsets should match because the analyzer augments pod labels with node topology labels:
+			// - "region-us-west": matches topology.kubernetes.io/region from node
+			// - "zone-us-west-1a": matches topology.kubernetes.io/zone from node
+			// - "app-v1": matches version label from pod
+			// - "mixed-labels": matches both version from pod AND topology.kubernetes.io/region from node
+		},
+	},
+	{
+		name:       "DestinationRuleEmptyTopologyLabels",
+		inputFiles: []string{"testdata/destinationrule-empty-topology-labels.yaml"},
+		analyzer:   &destinationrule.PodNotSelectedAnalyzer{},
+		expected: []message{
+			// Istio doesn't match on empty node locality labels.
+			{msg.DestinationRuleSubsetNotSelectPods, "DestinationRule default/empty-topology-labels"},
+		},
+	},
+	{
+		name:           "ServiceEntry Addresses Allocated",
+		inputFiles:     []string{"testdata/serviceentry-address-allocated.yaml"},
+		meshConfigFile: "testdata/serviceentry-address-allocated-mesh-cfg.yaml",
+		analyzer:       &serviceentry.ProtocolAddressesAnalyzer{},
+		expected:       []message{},
 	},
 }
 

@@ -133,7 +133,7 @@ func (m Map) MergeFrom(other Map) {
 	for k, v := range other {
 		// Might be a Map or map, possibly recurse
 		if vm, ok := v.(Map); ok {
-			v = map[string]any(vm)
+			v = map[string]any(vm.DeepClone())
 		}
 		if v, ok := v.(map[string]any); ok {
 			// It's a map...
@@ -510,10 +510,10 @@ func extractKV(seg string) (string, string, bool) {
 
 // getPV returns the path and value components for the given set flag string, which must be in path=value format.
 func getPV(setFlag string) (path string, value string) {
-	pv := strings.Split(setFlag, "=")
+	pv := strings.SplitN(setFlag, "=", 2)
 	if len(pv) != 2 {
 		return setFlag, ""
 	}
 	path, value = strings.TrimSpace(pv[0]), strings.TrimSpace(pv[1])
-	return
+	return path, value
 }

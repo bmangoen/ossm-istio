@@ -16,10 +16,12 @@ package model
 
 import (
 	"fmt"
+	"regexp"
 	"strings"
 
 	rbacpb "github.com/envoyproxy/go-control-plane/envoy/config/rbac/v3"
 	matcherpb "github.com/envoyproxy/go-control-plane/envoy/type/matcher/v3"
+	"k8s.io/apimachinery/pkg/types"
 
 	"istio.io/istio/pilot/pkg/networking/util"
 	"istio.io/istio/pilot/pkg/security/authz/matcher"
@@ -175,8 +177,67 @@ func (srcNamespaceGenerator) permission(_, _ string, _ bool) (*rbacpb.Permission
 }
 
 func (srcNamespaceGenerator) principal(_, value string, _ bool, useAuthenticated bool) (*rbacpb.Principal, error) {
-	v := strings.Replace(value, "*", ".*", -1)
-	m := matcher.StringMatcherRegex(fmt.Sprintf(".*/ns/%s/.*", v))
+	literalParts := strings.Split(value, "*")
+	for i, lp := range literalParts {
+		literalParts[i] = regexp.QuoteMeta(lp)
+	}
+	regexNamespace := strings.Join(literalParts, ".*")
+	m := matcher.StringMatcherRegex(fmt.Sprintf(".*/ns/%s/.*", regexNamespace))
+	return principalAuthenticated(m, useAuthenticated), nil
+}
+
+type srcServiceAccountGenerator struct {
+	policyName types.NamespacedName
+}
+
+func (g srcServiceAccountGenerator) permission(_, _ string, _ bool) (*rbacpb.Permission, error) {
+	return nil, fmt.Errorf("unimplemented")
+}
+
+func (g srcServiceAccountGenerator) principal(_, value string, _ bool, useAuthenticated bool) (*rbacpb.Principal, error) {
+	regex := serviceAccountRegex(g.policyName.Namespace, value)
+	m := matcher.StringMatcherRegex(regex)
+	return principalAuthenticated(m, useAuthenticated), nil
+}
+
+// serviceAccountRegex builds a regex that will match the SA specifier.
+// The specifier takes a `<name>` or `<namespace>/<name>` value. If namespace is elided, defaultNamespace is used.
+func serviceAccountRegex(defaultNamespace string, value string) string {
+	ns, sa, ok := strings.Cut(value, "/")
+	if !ok {
+		ns = defaultNamespace
+		sa = value
+	}
+	// Format should follow...
+	// 'spiffe://' then a trust domain + arbitrary k/v pairs
+	// '/ns/<namespace>/'
+	// optional arbitrary k/v pairs
+	// '/sa/<serviceAccount>'
+	// Either end of string OR / + arbitrary k/v pairs (the / ensures we do not match <service account>-some-junk)
+	return fmt.Sprintf("spiffe://.+/ns/%s/(.+/|)sa/%s(/.+)?", regexp.QuoteMeta(ns), regexp.QuoteMeta(sa))
+}
+
+type srcTrustDomainGenerator struct{}
+
+func (srcTrustDomainGenerator) permission(_, _ string, _ bool) (*rbacpb.Permission, error) {
+	return nil, fmt.Errorf("unimplemented")
+}
+
+func (srcTrustDomainGenerator) principal(_, value string, _ bool, useAuthenticated bool) (*rbacpb.Principal, error) {
+	var m *matcherpb.StringMatcher
+	switch {
+	case value == "*":
+		// Presence match - any trust domain is accepted
+		m = matcher.StringMatcherPrefix("spiffe://", false)
+	case !strings.Contains(value, "*"):
+		// Exact match — no regex needed
+		m = matcher.StringMatcherPrefix("spiffe://"+value+"/", false)
+	default:
+		// Prefix/Suffix match - need regex, but escape metacharacters first
+		parts := strings.SplitN(value, "*", 2)
+		escaped := regexp.QuoteMeta(parts[0]) + "[^/]*" + regexp.QuoteMeta(parts[1])
+		m = matcher.StringMatcherRegex(fmt.Sprintf("spiffe://%s/.*", escaped))
+	}
 	return principalAuthenticated(m, useAuthenticated), nil
 }
 

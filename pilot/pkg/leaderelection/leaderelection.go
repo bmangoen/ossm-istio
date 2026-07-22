@@ -36,8 +36,9 @@ import (
 
 // Various locks used throughout the code
 const (
-	NamespaceController     = "istio-namespace-controller-election"
-	ServiceExportController = "istio-serviceexport-controller-election"
+	NamespaceController          = "istio-namespace-controller-election"
+	ClusterTrustBundleController = "istio-clustertrustbundle-controller-election"
+	ServiceExportController      = "istio-serviceexport-controller-election"
 	// This holds the legacy name to not conflict with older control plane deployments which are just
 	// doing the ingress syncing.
 	IngressController = "istio-leader"
@@ -55,6 +56,7 @@ const (
 	// * This type is per-revision, so it is higher cost. Leases are cheaper
 	// * Other types use "prioritized leader election", which isn't implemented for Lease
 	GatewayDeploymentController = "istio-gateway-deployment"
+	InferencePoolController     = "istio-gateway-inferencepool"
 	NodeUntaintController       = "istio-node-untaint"
 	IPAutoallocateController    = "istio-ip-autoallocate"
 )
@@ -119,9 +121,15 @@ func (l *LeaderElection) Run(stop <-chan struct{}) {
 		l.cycle.Inc()
 		l.mu.Unlock()
 		ctx, cancel := context.WithCancel(context.Background())
+		// Cancel the current cycle's context when stop closes. The goroutine also exits
+		// once the context is done, so it does not accumulate across election cycles
+		// when leadership is repeatedly lost and re-acquired.
 		go func() {
-			<-stop
-			cancel()
+			defer cancel()
+			select {
+			case <-stop:
+			case <-ctx.Done():
+			}
 		}()
 		le.Run(ctx)
 		select {
@@ -162,14 +170,19 @@ func (l *LeaderElection) create() (*k8sleaderelection.LeaderElector, error) {
 			Key:      key,
 		},
 	}
-	if l.perRevision {
+	if l.perRevision || l.useLeaseLock {
+		leaseKey := key
+		if l.perRevision {
+			// Per revision does not need takeover
+			// See below, where we disable KeyComparison as well
+			leaseKey = ""
+		}
 		lock = &k8sresourcelock.LeaseLock{
 			LeaseMeta: metav1.ObjectMeta{Namespace: l.namespace, Name: l.electionID},
 			Client:    l.client.CoordinationV1(),
-			// Note: Key is NOT used. This is not implemented in the library for Lease nor needed, since this is already per-revision.
-			// See below, where we disable KeyComparison
 			LockConfig: k8sresourcelock.ResourceLockConfig{
 				Identity: l.name,
+				Key:      leaseKey,
 			},
 		}
 	}
@@ -187,10 +200,7 @@ func (l *LeaderElection) create() (*k8sleaderelection.LeaderElector, error) {
 	}
 	if !l.perRevision {
 		// Function to use to decide whether this leader should steal the existing lock.
-		// This is disable when perRevision is used, as this enables the Lease. Lease doesn't have a holderKey field to place our key
-		// as holderKey is an Istio specific fork.
-		// While its possible to make it work with Lease as well (via an annotation to store it), we don't ever need prioritized
-		// for these per-revision ones anyways, since the prioritization is about preferring one revision over others.
+		// For perRevision, we don't ever need prioritized, since the prioritization is about preferring one revision over others.
 		config.KeyComparison = func(leaderKey string) bool {
 			return LocationPrioritizedComparison(leaderKey, l)
 		}
@@ -246,7 +256,11 @@ func NewLeaderElectionMulticluster(namespace, name, electionID, revision string,
 func newLeaderElection(namespace, name, electionID, revision string, perRevision bool, remote bool, leaseLock bool, client kube.Client) *LeaderElection {
 	var watcher revisions.DefaultWatcher
 	if features.EnableLeaderElection {
-		watcher = revisions.NewDefaultWatcher(client, revision)
+		watcher = revisions.NewDefaultWatcher(client, revision, "")
+	}
+	// Default revision for consistency. Note that on Kubernetes, there is ~always a revision set.
+	if revision == "" {
+		revision = "default"
 	}
 	if name == "" {
 		hn, _ := os.Hostname()

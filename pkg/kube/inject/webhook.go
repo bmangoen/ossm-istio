@@ -27,12 +27,14 @@ import (
 	"text/template"
 	"time"
 
+	goversion "github.com/hashicorp/go-version"
 	"github.com/prometheus/prometheus/util/strutil"
 	"gomodules.xyz/jsonpatch/v2"
 	admissionv1 "k8s.io/api/admission/v1"
 	kubeApiAdmissionv1beta1 "k8s.io/api/admission/v1beta1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	klabels "k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/serializer"
 	kjson "k8s.io/apimachinery/pkg/runtime/serializer/json"
@@ -46,11 +48,13 @@ import (
 	meshconfig "istio.io/api/mesh/v1alpha1"
 	opconfig "istio.io/istio/operator/pkg/apis"
 	"istio.io/istio/pilot/cmd/pilot-agent/status"
+	"istio.io/istio/pilot/pkg/features"
 	"istio.io/istio/pilot/pkg/model"
 	"istio.io/istio/pkg/cluster"
 	"istio.io/istio/pkg/config/constants"
 	"istio.io/istio/pkg/config/mesh"
 	"istio.io/istio/pkg/kube"
+	"istio.io/istio/pkg/kube/kclient"
 	"istio.io/istio/pkg/kube/kubetypes"
 	"istio.io/istio/pkg/kube/multicluster"
 	"istio.io/istio/pkg/log"
@@ -58,7 +62,6 @@ import (
 	"istio.io/istio/pkg/slices"
 	"istio.io/istio/pkg/util/protomarshal"
 	"istio.io/istio/pkg/util/sets"
-	iptablesconstants "istio.io/istio/tools/istio-iptables/pkg/constants"
 )
 
 var (
@@ -82,9 +85,11 @@ const (
 	// prometheus will convert annotation to this format
 	// `prometheus.io/scrape` `prometheus.io.scrape` `prometheus-io/scrape` have the same meaning in Prometheus
 	// for more details, please checkout [here](https://github.com/prometheus/prometheus/blob/71a0f42331566a8849863d77078083edbb0b3bc4/util/strutil/strconv.go#L40)
-	prometheusScrapeAnnotation = "prometheus_io_scrape"
-	prometheusPortAnnotation   = "prometheus_io_port"
-	prometheusPathAnnotation   = "prometheus_io_path"
+	prometheusScrapeAnnotation             = "prometheus_io_scrape"
+	prometheusPortAnnotation               = "prometheus_io_port"
+	prometheusPathAnnotation               = "prometheus_io_path"
+	prometheusIstioScrapeTargetsAnnotation = "prometheus_istio_io_scrape_targets"
+	prometheusIstioSecurePortAnnotation    = "prometheus_istio_io_secure_port"
 
 	watchDebounceDelay = 100 * time.Millisecond
 )
@@ -110,6 +115,7 @@ type Webhook struct {
 	meshConfig   *meshconfig.MeshConfig
 	valuesConfig ValuesConfig
 	namespaces   *multicluster.KclientComponent[*corev1.Namespace]
+	nodes        *multicluster.KclientComponent[*corev1.Node]
 
 	// please do not call SetHandler() on this watcher, instead us MultiCast.AddHandler()
 	watcher   Watcher
@@ -213,15 +219,21 @@ func NewWebhook(p WebhookParameters) (*Webhook, error) {
 		}
 	}
 
+	if features.EnableNativeSidecars != features.NativeSidecarModeDisabled {
+		wh.nodes = multicluster.BuildMultiClusterKclientComponent[*corev1.Node](p.MultiCluster, kubetypes.Filter{
+			ObjectTransform: kube.StripNodeUnusedFields,
+		})
+	}
+
 	mc := NewMulticast(p.Watcher, wh.GetConfig)
 	mc.AddHandler(wh.updateConfig)
 	wh.MultiCast = mc
 	sidecarConfig, valuesConfig, err := p.Watcher.Get()
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to get initial configuration: %v", err)
 	}
 	if err := wh.updateConfig(sidecarConfig, valuesConfig); err != nil {
-		log.Errorf("failed to process webhook config: %v", err)
+		return nil, fmt.Errorf("failed to process webhook config: %v", err)
 	}
 
 	p.Mux.HandleFunc("/inject", wh.serveInject)
@@ -247,7 +259,7 @@ func (wh *Webhook) updateConfig(sidecarConfig *Config, valuesConfig string) erro
 	wh.Config = sidecarConfig
 	vc, err := NewValuesConfig(valuesConfig)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to create new values config: %v", err)
 	}
 	wh.valuesConfig = vc
 	return nil
@@ -379,6 +391,7 @@ type InjectionParameters struct {
 	pod                 *corev1.Pod
 	deployMeta          types.NamespacedName
 	namespace           *corev1.Namespace
+	nativeSidecar       bool
 	typeMeta            metav1.TypeMeta
 	templates           map[string]*template.Template
 	defaultTemplate     []string
@@ -610,7 +623,7 @@ func adjustInitContainerUser(finalPod *corev1.Pod, originalPod *corev1.Pod, prox
 	tproxy := false
 	if proxyConfig.InterceptionMode == meshconfig.ProxyConfig_TPROXY {
 		tproxy = true
-	} else if mode, found := finalPod.Annotations[annotation.SidecarInterceptionMode.Name]; found && mode == iptablesconstants.TPROXY {
+	} else if mode, found := finalPod.Annotations[annotation.SidecarInterceptionMode.Name]; found && mode == "TPROXY" {
 		tproxy = true
 	}
 
@@ -740,6 +753,8 @@ func postProcessPod(pod *corev1.Pod, injectedPod corev1.Pod, req InjectionParame
 		return err
 	}
 
+	applySecurePrometheusAnnotation(pod)
+
 	if err := applyRewrite(pod, req); err != nil {
 		return err
 	}
@@ -791,7 +806,6 @@ func reorderPod(pod *corev1.Pod, req InjectionParameters) error {
 	// Proxy container should be last, unless HoldApplicationUntilProxyStarts is set
 	// This is to ensure `kubectl exec` and similar commands continue to default to the user's container
 	pod.Spec.Containers = modifyContainers(pod.Spec.Containers, ProxyContainerName, proxyLocation)
-
 	if hasContainer(pod.Spec.InitContainers, ProxyContainerName) {
 		// This is using native sidecar support in K8s.
 		// We want istio to be first in this case, so init containers are part of the mesh
@@ -866,10 +880,39 @@ func mergeOrAppendProbers(previouslyInjected bool, envVars []corev1.EnvVar, newP
 			return envVars
 		}
 	}
-	return envVars
+	return append(envVars, corev1.EnvVar{Name: status.KubeAppProberEnvName, Value: newProbers})
 }
 
-var emptyScrape = status.PrometheusScrapeConfiguration{}
+// applySecurePrometheusAnnotation auto-populates the "prometheus.istio.io/secure-port"
+// annotation when the istio-proxy container has ENVOY_SECURE_MERGED_METRICS_PORT set.
+// This mirrors applyPrometheusMerge's handling of the plain-text port so that users only
+// need to configure the env variable and Prometheus discovery is wired up automatically.
+//
+// The env var is present at postProcessPod time for both sidecars (where proxyMetadata
+// is expanded into the container env by the injection template) and for injected gateway
+// pods (where the env var is set directly on the istio-proxy container).
+//
+// If the user has already set the annotation explicitly it is left unchanged.
+func applySecurePrometheusAnnotation(pod *corev1.Pod) {
+	// User already opted in explicitly.
+	for k := range pod.Annotations {
+		if strutil.SanitizeLabelName(k) == prometheusIstioSecurePortAnnotation {
+			return
+		}
+	}
+
+	sidecar := FindSidecar(pod)
+	if sidecar == nil {
+		return
+	}
+
+	for _, env := range sidecar.Env {
+		if env.Name == "ENVOY_SECURE_MERGED_METRICS_PORT" && env.Value != "" && env.Value != "0" {
+			pod.Annotations["prometheus.istio.io/secure-port"] = env.Value
+			return
+		}
+	}
+}
 
 // applyPrometheusMerge configures prometheus scraping annotations for the "metrics merge" feature.
 // This moves the current prometheus.io annotations into an environment variable and replaces them
@@ -886,8 +929,40 @@ func applyPrometheusMerge(pod *corev1.Pod, mesh *meshconfig.MeshConfig) error {
 			}
 		}
 		scrape := getPrometheusScrapeConfiguration(pod)
+		// When scrape-targets are present, set legacy Port/Path from the first target so that
+		// old agents (which don't know about Targets) can still scrape the primary endpoint.
+		if len(scrape.Targets) > 0 {
+			scrape.Port = scrape.Targets[0].Port
+			scrape.Path = scrape.Targets[0].Path
+			for _, t := range scrape.Targets {
+				portNum, err := strconv.Atoi(t.Port)
+				if err != nil || portNum < 1 || portNum > 65535 {
+					return fmt.Errorf("invalid prometheus scrape targets: invalid target port %q", t.Port)
+				}
+				canon := strconv.Itoa(portNum)
+				if canon == targetPort {
+					return fmt.Errorf("invalid prometheus scrape targets: target port %s conflicts with agent port", t.Port)
+				}
+				if reason, reserved := status.IstioReservedPortReason(canon); reserved {
+					return fmt.Errorf("invalid prometheus scrape targets: target port %s is reserved for Istio (%s) and cannot be scraped", t.Port, reason)
+				}
+			}
+		} else if scrape.Port != "" {
+			// Validate legacy prometheus.io/port annotation when the new scrape-targets annotation is not used.
+			portNum, err := strconv.Atoi(scrape.Port)
+			if err != nil || portNum < 1 || portNum > 65535 {
+				return fmt.Errorf("invalid prometheus scrape configuration: invalid port %q", scrape.Port)
+			}
+			canon := strconv.Itoa(portNum)
+			if canon == targetPort {
+				return fmt.Errorf("invalid prometheus scrape configuration: port %s conflicts with agent port", scrape.Port)
+			}
+			if reason, reserved := status.IstioReservedPortReason(canon); reserved {
+				return fmt.Errorf("invalid prometheus scrape configuration: port %s is reserved for Istio (%s) and cannot be scraped", scrape.Port, reason)
+			}
+		}
 		sidecar := FindSidecar(pod)
-		if sidecar != nil && scrape != emptyScrape {
+		if sidecar != nil && !scrape.IsEmpty() {
 			by, err := json.Marshal(scrape)
 			if err != nil {
 				return err
@@ -930,6 +1005,7 @@ var prometheusAnnotations = sets.New(
 	prometheusPathAnnotation,
 	prometheusPortAnnotation,
 	prometheusScrapeAnnotation,
+	prometheusIstioScrapeTargetsAnnotation,
 )
 
 func clearPrometheusAnnotations(pod *corev1.Pod) {
@@ -958,6 +1034,13 @@ func getPrometheusScrapeConfiguration(pod *corev1.Pod) status.PrometheusScrapeCo
 			cfg.Scrape = val
 		case prometheusPathAnnotation:
 			cfg.Path = val
+		case prometheusIstioScrapeTargetsAnnotation:
+			targets, err := status.ParseScrapeTargets(val)
+			if err != nil {
+				log.Warnf("failed to parse %s annotation: %v", k, err)
+			} else {
+				cfg.Targets = targets
+			}
 		}
 	}
 
@@ -1143,11 +1226,12 @@ func (wh *Webhook) inject(ar *kube.AdmissionReview, path string) *kube.Admission
 		proxyEnvs:           parseInjectEnvs(path),
 	}
 
+	clusterID, _ := extractClusterAndNetwork(params)
+	if clusterID == "" {
+		clusterID = constants.DefaultClusterName
+	}
+
 	if platform.IsOpenShift() && wh.namespaces != nil {
-		clusterID, _ := extractClusterAndNetwork(params)
-		if clusterID == "" {
-			clusterID = constants.DefaultClusterName
-		}
 		client := wh.namespaces.ForCluster(cluster.ID(clusterID))
 		if client != nil {
 			params.namespace = client.Get(pod.Namespace, "")
@@ -1164,13 +1248,24 @@ func (wh *Webhook) inject(ar *kube.AdmissionReview, path string) *kube.Admission
 		// application container's value. At the same time, if user explicitly configures a RunAsUser in the istio-proxy
 		// container which is different to the application container's value, that setting is still honored.
 		if sideCarProxy := FindSidecar(params.pod); sideCarProxy != nil && sideCarProxy.SecurityContext != nil {
-			if isSidecarUserMatchingAppUser(params.pod.Spec.Containers) {
+			if isSidecarUserMatchingAppUser(params.pod) {
 				log.Infof("Resetting the UserID of sideCar proxy as it matches with the app container for Pod %q", params.pod.Name)
 				sideCarProxy.SecurityContext.RunAsUser = nil
 				sideCarProxy.SecurityContext.RunAsGroup = nil
 			}
 		}
 	}
+
+	var nodes kclient.Client[*corev1.Node]
+
+	if wh.nodes != nil {
+		nodes = wh.nodes.ForCluster(cluster.ID(clusterID))
+		params.nativeSidecar = DetectNativeSidecar(nodes, pod.Spec.NodeName)
+	} else {
+		// only enable native sidecars if the feature is explicitly enabled
+		params.nativeSidecar = (features.EnableNativeSidecars == features.NativeSidecarModeEnabled)
+	}
+
 	wh.mu.RUnlock()
 
 	patchBytes, err := injectPod(params)
@@ -1187,11 +1282,13 @@ func (wh *Webhook) inject(ar *kube.AdmissionReview, path string) *kube.Admission
 			return &pt
 		}(),
 	}
-	totalSuccessfulInjections.Increment()
 	return &reviewResponse
 }
 
-func isSidecarUserMatchingAppUser(containers []corev1.Container) bool {
+func isSidecarUserMatchingAppUser(pod *corev1.Pod) bool {
+	containers := append([]corev1.Container{}, pod.Spec.Containers...)
+	containers = append(containers, pod.Spec.InitContainers...)
+
 	var sideCarUser, appUser int64
 	for i := range containers {
 		if containers[i].Name == ProxyContainerName {
@@ -1208,6 +1305,59 @@ func isSidecarUserMatchingAppUser(containers []corev1.Container) bool {
 	return sideCarUser == appUser
 }
 
+func DetectNativeSidecar(nodes kclient.Client[*corev1.Node], podNodeName string) bool {
+	if features.EnableNativeSidecars == features.NativeSidecarModeDisabled {
+		return false
+	}
+
+	if features.EnableNativeSidecars == features.NativeSidecarModeEnabled {
+		return true
+	}
+
+	if nodes == nil {
+		log.Warnf("configured to auto detect native sidecar support, but couldn't find a client")
+		return false
+	}
+
+	// Native sidecars feature graduated to stable in Kubernetes 1.33
+	// See https://github.com/kubernetes/enhancements/blob/master/keps/sig-node/753-sidecar-containers/README.md#implementation-history
+	minVersion := 33
+
+	checkNodeVersion := func(n *corev1.Node) bool {
+		nodeKubeletVersion := n.Status.NodeInfo.KubeletVersion
+		ver, err := goversion.NewVersion(nodeKubeletVersion)
+		if err != nil {
+			log.Warnf("could not read node version for %v %v: %v", n.Name, nodeKubeletVersion, err)
+			return false
+		}
+		minor := ver.Segments()[1]
+		if minor < minVersion {
+			log.Debugf("detected kubelet version 1.%v < 1.%v on node %v; native sidecars disabled",
+				minor, minVersion, n.Name)
+			return false
+		}
+		return true
+	}
+
+	if podNodeName != "" {
+		node := nodes.Get(podNodeName, "")
+		if node != nil {
+			return checkNodeVersion(node)
+		}
+		log.Warnf("pod assigned to node %q but node not found in cluster", podNodeName)
+	}
+	// Check all nodes to see if they are eligible to support native sidecars. If any node is below the minimum version, we disable the feature.
+	// This means when an older ineligible node is added to the cluster and the webhook runs
+	// NativeSidecar will be disabled since that node will fail the kubelet version check.
+	// This avoids issues with mixed clusters where some nodes support native sidecars and others do not.
+	for _, n := range nodes.List(metav1.NamespaceAll, klabels.Everything()) {
+		if !checkNodeVersion(n) {
+			return false
+		}
+	}
+	return true
+}
+
 func (wh *Webhook) serveInject(w http.ResponseWriter, r *http.Request) {
 	log := log.WithLabels("path", r.URL.Path)
 	totalInjections.Increment()
@@ -1218,6 +1368,7 @@ func (wh *Webhook) serveInject(w http.ResponseWriter, r *http.Request) {
 		if data, err := kube.HTTPConfigReader(r); err == nil {
 			body = data
 		} else {
+			handleError(log, err.Error())
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
@@ -1274,14 +1425,17 @@ func (wh *Webhook) serveInject(w http.ResponseWriter, r *http.Request) {
 	responseKube = kube.AdmissionReviewAdapterToKube(&response, apiVersion)
 	resp, err := json.Marshal(responseKube)
 	if err != nil {
-		log.Errorf("Could not encode response: %v", err)
+		handleError(log, fmt.Sprintf("Could not encode response: %v", err))
 		http.Error(w, fmt.Sprintf("could not encode response: %v", err), http.StatusInternalServerError)
 		return
 	}
 	if _, err := w.Write(resp); err != nil {
 		log.Errorf("Could not write response: %v", err)
+		handleError(log, fmt.Sprintf("could not write response: %v", err))
 		http.Error(w, fmt.Sprintf("could not write response: %v", err), http.StatusInternalServerError)
+		return
 	}
+	totalSuccessfulInjections.Increment()
 }
 
 // parseInjectEnvs parse new envs from inject url path. format: /inject/k1/v1/k2/v2

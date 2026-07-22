@@ -17,10 +17,12 @@ package core
 import (
 	"reflect"
 	"sort"
+	"strings"
 	"testing"
 	"time"
 
 	core "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
+	listener "github.com/envoyproxy/go-control-plane/envoy/config/listener/v3"
 	route "github.com/envoyproxy/go-control-plane/envoy/config/route/v3"
 	hcm "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/network/http_connection_manager/v3"
 	auth "github.com/envoyproxy/go-control-plane/envoy/extensions/transport_sockets/tls/v3"
@@ -55,6 +57,7 @@ import (
 	"istio.io/istio/pkg/proto"
 	"istio.io/istio/pkg/slices"
 	"istio.io/istio/pkg/test"
+	"istio.io/istio/pkg/test/util/assert"
 	"istio.io/istio/pkg/util/sets"
 	"istio.io/istio/pkg/wellknown"
 )
@@ -375,6 +378,42 @@ func TestBuildGatewayListenerTlsContext(t *testing.T) {
 				RequireClientCertificate: proto.BoolFalse,
 			},
 		},
+		{ // Multiple credential names and subject alternative names are specified, generate SDS configs for
+			// key/cert and static validation context config.
+			name: "multiple credential names subject alternative name no key no cert tls SIMPLE",
+			server: &networking.Server{
+				Hosts: []string{"httpbin.example.com", "bookinfo.example.com"},
+				Port: &networking.Port{
+					Protocol: string(protocol.HTTPS),
+				},
+				Tls: &networking.ServerTLSSettings{
+					Mode:            networking.ServerTLSSettings_SIMPLE,
+					CredentialNames: []string{"ingress-sds-resource-name", "ingress-sds-resource-name2"},
+					SubjectAltNames: []string{"subject.name.a.com", "subject.name.b.com"},
+				},
+			},
+			result: &auth.DownstreamTlsContext{
+				CommonTlsContext: &auth.CommonTlsContext{
+					AlpnProtocols: util.ALPNHttp,
+					TlsCertificateSdsSecretConfigs: []*auth.SdsSecretConfig{
+						{
+							Name:      "kubernetes://ingress-sds-resource-name",
+							SdsConfig: model.SDSAdsConfig,
+						},
+						{
+							Name:      "kubernetes://ingress-sds-resource-name2",
+							SdsConfig: model.SDSAdsConfig,
+						},
+					},
+					ValidationContextType: &auth.CommonTlsContext_ValidationContext{
+						ValidationContext: &auth.CertificateValidationContext{
+							MatchSubjectAltNames: util.StringToExactMatch([]string{"subject.name.a.com", "subject.name.b.com"}),
+						},
+					},
+				},
+				RequireClientCertificate: proto.BoolFalse,
+			},
+		},
 		{
 			name: "no credential name key and cert tls SIMPLE",
 			server: &networking.Server{
@@ -418,6 +457,76 @@ func TestBuildGatewayListenerTlsContext(t *testing.T) {
 			},
 		},
 		{
+			name: "no credential name multiple certificates with SIMPLE mode",
+			server: &networking.Server{
+				Hosts: []string{"httpbin.example.com", "bookinfo.example.com"},
+				Port: &networking.Port{
+					Protocol: string(protocol.HTTPS),
+				},
+				Tls: &networking.ServerTLSSettings{
+					Mode: networking.ServerTLSSettings_SIMPLE,
+					TlsCertificates: []*networking.ServerTLSSettings_TLSCertificate{
+						{
+							ServerCertificate: "server-cert.crt",
+							PrivateKey:        "private-key.key",
+						},
+						{
+							ServerCertificate: "server-cert2.crt",
+							PrivateKey:        "private-key2.key",
+						},
+					},
+				},
+			},
+			result: &auth.DownstreamTlsContext{
+				CommonTlsContext: &auth.CommonTlsContext{
+					AlpnProtocols: util.ALPNHttp,
+					TlsCertificateSdsSecretConfigs: []*auth.SdsSecretConfig{
+						{
+							Name: "file-cert:server-cert.crt~private-key.key",
+							SdsConfig: &core.ConfigSource{
+								ResourceApiVersion: core.ApiVersion_V3,
+								ConfigSourceSpecifier: &core.ConfigSource_ApiConfigSource{
+									ApiConfigSource: &core.ApiConfigSource{
+										ApiType:                   core.ApiConfigSource_GRPC,
+										SetNodeOnFirstMessageOnly: true,
+										TransportApiVersion:       core.ApiVersion_V3,
+										GrpcServices: []*core.GrpcService{
+											{
+												TargetSpecifier: &core.GrpcService_EnvoyGrpc_{
+													EnvoyGrpc: &core.GrpcService_EnvoyGrpc{ClusterName: model.SDSClusterName},
+												},
+											},
+										},
+									},
+								},
+							},
+						},
+						{
+							Name: "file-cert:server-cert2.crt~private-key2.key",
+							SdsConfig: &core.ConfigSource{
+								ResourceApiVersion: core.ApiVersion_V3,
+								ConfigSourceSpecifier: &core.ConfigSource_ApiConfigSource{
+									ApiConfigSource: &core.ApiConfigSource{
+										ApiType:                   core.ApiConfigSource_GRPC,
+										SetNodeOnFirstMessageOnly: true,
+										TransportApiVersion:       core.ApiVersion_V3,
+										GrpcServices: []*core.GrpcService{
+											{
+												TargetSpecifier: &core.GrpcService_EnvoyGrpc_{
+													EnvoyGrpc: &core.GrpcService_EnvoyGrpc{ClusterName: model.SDSClusterName},
+												},
+											},
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+				RequireClientCertificate: proto.BoolFalse,
+			},
+		},
+		{
 			name: "no credential name key and cert tls MUTUAL",
 			server: &networking.Server{
 				Hosts: []string{"httpbin.example.com", "bookinfo.example.com"},
@@ -437,6 +546,102 @@ func TestBuildGatewayListenerTlsContext(t *testing.T) {
 					TlsCertificateSdsSecretConfigs: []*auth.SdsSecretConfig{
 						{
 							Name: "file-cert:server-cert.crt~private-key.key",
+							SdsConfig: &core.ConfigSource{
+								ResourceApiVersion: core.ApiVersion_V3,
+								ConfigSourceSpecifier: &core.ConfigSource_ApiConfigSource{
+									ApiConfigSource: &core.ApiConfigSource{
+										ApiType:                   core.ApiConfigSource_GRPC,
+										SetNodeOnFirstMessageOnly: true,
+										TransportApiVersion:       core.ApiVersion_V3,
+										GrpcServices: []*core.GrpcService{
+											{
+												TargetSpecifier: &core.GrpcService_EnvoyGrpc_{
+													EnvoyGrpc: &core.GrpcService_EnvoyGrpc{ClusterName: model.SDSClusterName},
+												},
+											},
+										},
+									},
+								},
+							},
+						},
+					},
+					ValidationContextType: &auth.CommonTlsContext_CombinedValidationContext{
+						CombinedValidationContext: &auth.CommonTlsContext_CombinedCertificateValidationContext{
+							DefaultValidationContext: &auth.CertificateValidationContext{},
+							ValidationContextSdsSecretConfig: &auth.SdsSecretConfig{
+								Name: "file-root:ca-cert.crt",
+								SdsConfig: &core.ConfigSource{
+									ResourceApiVersion: core.ApiVersion_V3,
+									ConfigSourceSpecifier: &core.ConfigSource_ApiConfigSource{
+										ApiConfigSource: &core.ApiConfigSource{
+											ApiType:                   core.ApiConfigSource_GRPC,
+											SetNodeOnFirstMessageOnly: true,
+											TransportApiVersion:       core.ApiVersion_V3,
+											GrpcServices: []*core.GrpcService{
+												{
+													TargetSpecifier: &core.GrpcService_EnvoyGrpc_{
+														EnvoyGrpc: &core.GrpcService_EnvoyGrpc{ClusterName: model.SDSClusterName},
+													},
+												},
+											},
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+				RequireClientCertificate: proto.BoolTrue,
+			},
+		},
+		{
+			name: "no credential name multiple certificates tls MUTUAL",
+			server: &networking.Server{
+				Hosts: []string{"httpbin.example.com", "bookinfo.example.com"},
+				Port: &networking.Port{
+					Protocol: string(protocol.HTTPS),
+				},
+				Tls: &networking.ServerTLSSettings{
+					Mode:           networking.ServerTLSSettings_MUTUAL,
+					CaCertificates: "ca-cert.crt",
+					TlsCertificates: []*networking.ServerTLSSettings_TLSCertificate{
+						{
+							ServerCertificate: "server-cert.crt",
+							PrivateKey:        "private-key.key",
+						},
+						{
+							ServerCertificate: "server-cert2.crt",
+							PrivateKey:        "private-key2.key",
+						},
+					},
+				},
+			},
+			result: &auth.DownstreamTlsContext{
+				CommonTlsContext: &auth.CommonTlsContext{
+					AlpnProtocols: util.ALPNHttp,
+					TlsCertificateSdsSecretConfigs: []*auth.SdsSecretConfig{
+						{
+							Name: "file-cert:server-cert.crt~private-key.key",
+							SdsConfig: &core.ConfigSource{
+								ResourceApiVersion: core.ApiVersion_V3,
+								ConfigSourceSpecifier: &core.ConfigSource_ApiConfigSource{
+									ApiConfigSource: &core.ApiConfigSource{
+										ApiType:                   core.ApiConfigSource_GRPC,
+										SetNodeOnFirstMessageOnly: true,
+										TransportApiVersion:       core.ApiVersion_V3,
+										GrpcServices: []*core.GrpcService{
+											{
+												TargetSpecifier: &core.GrpcService_EnvoyGrpc_{
+													EnvoyGrpc: &core.GrpcService_EnvoyGrpc{ClusterName: model.SDSClusterName},
+												},
+											},
+										},
+									},
+								},
+							},
+						},
+						{
+							Name: "file-cert:server-cert2.crt~private-key2.key",
 							SdsConfig: &core.ConfigSource{
 								ResourceApiVersion: core.ApiVersion_V3,
 								ConfigSourceSpecifier: &core.ConfigSource_ApiConfigSource{
@@ -1421,7 +1626,10 @@ func TestBuildGatewayListenerTlsContext(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			ret := buildGatewayListenerTLSContext(tc.mesh, tc.server, &pilot_model.Proxy{
+			push := &pilot_model.PushContext{
+				Mesh: tc.mesh,
+			}
+			ret := buildGatewayListenerTLSContext(push, tc.server, &pilot_model.Proxy{
 				Metadata: &pilot_model.NodeMetadata{},
 			}, tc.transportProtocol)
 			if diff := cmp.Diff(tc.result, ret, protocmp.Transform()); diff != "" {
@@ -2156,7 +2364,7 @@ func TestGatewayHTTPRouteConfig(t *testing.T) {
 			Selector: map[string]string{"istio": "ingressgateway"},
 			Servers: []*networking.Server{
 				{
-					Hosts: []string{"example.org"},
+					Hosts: []string{"Example.org"},
 					Port:  &networking.Port{Name: "http", Number: 80, Protocol: "HTTP"},
 					Tls:   &networking.ServerTLSSettings{HttpsRedirect: true},
 				},
@@ -3349,6 +3557,168 @@ func TestBuildGatewayListeners(t *testing.T) {
 			},
 			[]string{"10.0.0.1_443", "10.0.0.2_443"},
 		},
+		{
+			"gateway with multiple QUIC/HTTP3 servers with bind",
+			&pilot_model.Proxy{
+				ServiceTargets: []pilot_model.ServiceTarget{
+					{
+						Service: &pilot_model.Service{
+							Hostname: "test",
+						},
+						Port: pilot_model.ServiceInstancePort{
+							ServicePort: &pilot_model.Port{
+								Port:     443,
+								Protocol: protocol.UDP,
+							},
+							TargetPort: 443,
+						},
+					},
+				},
+			},
+			[]config.Config{
+				{
+					Meta: config.Meta{Name: "gateway1", Namespace: "testns", GroupVersionKind: gvk.Gateway},
+					Spec: &networking.Gateway{
+						Servers: []*networking.Server{
+							{
+								Port:  &networking.Port{Name: "https", Number: 443, Protocol: "HTTPS"},
+								Hosts: []string{"*.example.com"},
+								Bind:  "10.0.0.1",
+								Tls:   &networking.ServerTLSSettings{CredentialName: "test1", Mode: networking.ServerTLSSettings_SIMPLE},
+							},
+						},
+					},
+				},
+				{
+					Meta: config.Meta{Name: "gateway2", Namespace: "testns", GroupVersionKind: gvk.Gateway},
+					Spec: &networking.Gateway{
+						Servers: []*networking.Server{
+							{
+								Port:  &networking.Port{Name: "https", Number: 443, Protocol: "HTTPS"},
+								Hosts: []string{"*.example.org"},
+								Bind:  "10.0.0.2",
+								Tls:   &networking.ServerTLSSettings{CredentialName: "test2", Mode: networking.ServerTLSSettings_SIMPLE},
+							},
+						},
+					},
+				},
+			},
+			[]config.Config{
+				{
+					Meta: config.Meta{Name: uuid.NewString(), Namespace: uuid.NewString(), GroupVersionKind: gvk.VirtualService},
+					Spec: &networking.VirtualService{
+						Gateways: []string{"testns/gateway1"},
+						Hosts:    []string{"*.example.com"},
+						Http: []*networking.HTTPRoute{
+							{
+								Route: []*networking.HTTPRouteDestination{
+									{
+										Destination: &networking.Destination{
+											Host: "foo.example.com",
+											Port: &networking.PortSelector{
+												Number: 80,
+											},
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+				{
+					Meta: config.Meta{Name: uuid.NewString(), Namespace: uuid.NewString(), GroupVersionKind: gvk.VirtualService},
+					Spec: &networking.VirtualService{
+						Gateways: []string{"testns/gateway2"},
+						Hosts:    []string{"*.example.org"},
+						Http: []*networking.HTTPRoute{
+							{
+								Route: []*networking.HTTPRouteDestination{
+									{
+										Destination: &networking.Destination{
+											Host: "bar.example.org",
+											Port: &networking.PortSelector{
+												Number: 80,
+											},
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			// Expect both TCP listeners for HTTPS and UDP listeners for QUIC/HTTP3 when PILOT_ENABLE_QUIC_LISTENERS=true
+			// Without QUIC enabled: []string{"10.0.0.1_443", "10.0.0.2_443"}
+			// With QUIC enabled: []string{"10.0.0.1_443", "10.0.0.2_443", "udp_10.0.0.1_443", "udp_10.0.0.2_443"}
+			[]string{"10.0.0.1_443", "10.0.0.2_443"},
+		},
+		{
+			"gateway TCP server with VS TCP empty route",
+			&pilot_model.Proxy{},
+			[]config.Config{
+				{
+					Meta: config.Meta{Name: "gateway1", Namespace: "testns", GroupVersionKind: gvk.Gateway},
+					Spec: &networking.Gateway{
+						Servers: []*networking.Server{
+							{
+								Port:  &networking.Port{Name: "tcp", Number: 9000, Protocol: "TCP"},
+								Hosts: []string{"tcp.example.com"},
+							},
+						},
+					},
+				},
+			},
+			[]config.Config{
+				{
+					Meta: config.Meta{Name: uuid.NewString(), Namespace: "testns", GroupVersionKind: gvk.VirtualService},
+					Spec: &networking.VirtualService{
+						Gateways: []string{"testns/gateway1"},
+						Hosts:    []string{"tcp.example.com"},
+						Tcp: []*networking.TCPRoute{
+							{
+								Match: []*networking.L4MatchAttributes{{Port: 9000}},
+								// Route intentionally left empty
+							},
+						},
+					},
+				},
+			},
+			[]string{},
+		},
+		{
+			"gateway TLS terminate server with VS TCP empty route",
+			&pilot_model.Proxy{},
+			[]config.Config{
+				{
+					Meta: config.Meta{Name: "gateway1", Namespace: "testns", GroupVersionKind: gvk.Gateway},
+					Spec: &networking.Gateway{
+						Servers: []*networking.Server{
+							{
+								Port:  &networking.Port{Name: "tls", Number: 9443, Protocol: "TLS"},
+								Hosts: []string{"tcp.example.com"},
+								Tls:   &networking.ServerTLSSettings{CredentialName: "test", Mode: networking.ServerTLSSettings_SIMPLE},
+							},
+						},
+					},
+				},
+			},
+			[]config.Config{
+				{
+					Meta: config.Meta{Name: uuid.NewString(), Namespace: "testns", GroupVersionKind: gvk.VirtualService},
+					Spec: &networking.VirtualService{
+						Gateways: []string{"testns/gateway1"},
+						Hosts:    []string{"tcp.example.com"},
+						Tcp: []*networking.TCPRoute{
+							{
+								Match: []*networking.L4MatchAttributes{{Port: 9443}},
+								// Route intentionally left empty
+							},
+						},
+					},
+				},
+			},
+			[]string{},
+		},
 	}
 
 	for _, tt := range cases {
@@ -3721,7 +4091,7 @@ func TestBuildGatewayListenersFilters(t *testing.T) {
 			expectedListener: listenertest.ListenerTest{FilterChains: []listenertest.FilterChainTest{
 				{
 					NetworkFilters: []string{
-						xdsfilters.TCPListenerMx.GetName(),
+						xdsfilters.MxFilterName,
 						wellknown.TCPProxy,
 					},
 					HTTPFilters: []string{},
@@ -3814,7 +4184,7 @@ func TestBuildGatewayListenersFilters(t *testing.T) {
 					{
 						TotalMatch: true, // there must be only 1 `istio_authn` network filter
 						NetworkFilters: []string{
-							xdsfilters.TCPListenerMx.GetName(),
+							xdsfilters.MxFilterName,
 							wellknown.TCPProxy,
 						},
 						HTTPFilters: []string{},
@@ -3970,7 +4340,7 @@ func TestBuildGatewayListenersFilters(t *testing.T) {
 			},
 		},
 		{
-			name: "mTLS, RBAC, WASM, and Stats",
+			name: "mTLS, RBAC, WASM, TrafficExtension, and Stats",
 			configs: []config.Config{
 				{
 					Meta: config.Meta{Name: "gateway", Namespace: "testns", GroupVersionKind: gvk.Gateway},
@@ -4003,24 +4373,43 @@ func TestBuildGatewayListenersFilters(t *testing.T) {
 					},
 				},
 				{
-					Meta: config.Meta{Name: "wasm-authz", Namespace: "istio-system", GroupVersionKind: gvk.WasmPlugin},
-					Spec: &extensions.WasmPlugin{
-						Phase: extensions.PluginPhase_AUTHZ,
-						Type:  extensions.PluginType_NETWORK,
+					Meta: config.Meta{Name: "extension-wasm-network-authz", Namespace: "istio-system", GroupVersionKind: gvk.TrafficExtension},
+					Spec: &extensions.TrafficExtension{
+						Phase: extensions.TrafficExtension_AUTHZ,
+						FilterConfig: &extensions.TrafficExtension_Wasm{Wasm: &extensions.WasmConfig{
+							Url:  "file:///etc/istio/filters/authz.wasm",
+							Type: extensions.PluginType_NETWORK,
+						}},
 					},
 				},
 				{
-					Meta: config.Meta{Name: "wasm-authn", Namespace: "istio-system", GroupVersionKind: gvk.WasmPlugin},
-					Spec: &extensions.WasmPlugin{
-						Phase: extensions.PluginPhase_AUTHN,
-						Type:  extensions.PluginType_NETWORK,
+					Meta: config.Meta{Name: "extension-wasm-network-authn", Namespace: "istio-system", GroupVersionKind: gvk.TrafficExtension},
+					Spec: &extensions.TrafficExtension{
+						Phase: extensions.TrafficExtension_AUTHN,
+						FilterConfig: &extensions.TrafficExtension_Wasm{Wasm: &extensions.WasmConfig{
+							Url:  "file:///etc/istio/filters/authn.wasm",
+							Type: extensions.PluginType_NETWORK,
+						}},
 					},
 				},
 				{
-					Meta: config.Meta{Name: "wasm-stats", Namespace: "istio-system", GroupVersionKind: gvk.WasmPlugin},
-					Spec: &extensions.WasmPlugin{
-						Phase: extensions.PluginPhase_STATS,
-						Type:  extensions.PluginType_NETWORK,
+					Meta: config.Meta{Name: "extension-wasm-network-stats", Namespace: "istio-system", GroupVersionKind: gvk.TrafficExtension},
+					Spec: &extensions.TrafficExtension{
+						Phase: extensions.TrafficExtension_STATS,
+						FilterConfig: &extensions.TrafficExtension_Wasm{Wasm: &extensions.WasmConfig{
+							Url:  "file:///etc/istio/filters/stats.wasm",
+							Type: extensions.PluginType_NETWORK,
+						}},
+					},
+				},
+				{
+					Meta: config.Meta{Name: "extension-wasm-unspecified", Namespace: "istio-system", GroupVersionKind: gvk.TrafficExtension},
+					Spec: &extensions.TrafficExtension{
+						Phase: extensions.TrafficExtension_UNSPECIFIED,
+						FilterConfig: &extensions.TrafficExtension_Wasm{Wasm: &extensions.WasmConfig{
+							Url:  "oci://example.com/unspecified:v1",
+							Type: extensions.PluginType_NETWORK,
+						}},
 					},
 				},
 				{
@@ -4051,10 +4440,11 @@ func TestBuildGatewayListenersFilters(t *testing.T) {
 							// Ext auth makes 2 filters
 							wellknown.RoleBasedAccessControl,
 							wellknown.ExternalAuthorization,
-							"extenstions.istio.io/wasmplugin/istio-system.wasm-authn",
-							"extenstions.istio.io/wasmplugin/istio-system.wasm-authz",
+							"extensions.istio.io/trafficextension/istio-system.extension-wasm-network-authn",
+							"extensions.istio.io/trafficextension/istio-system.extension-wasm-network-authz",
 							wellknown.RoleBasedAccessControl,
-							"extenstions.istio.io/wasmplugin/istio-system.wasm-stats",
+							"extensions.istio.io/trafficextension/istio-system.extension-wasm-network-stats",
+							"extensions.istio.io/trafficextension/istio-system.extension-wasm-unspecified",
 							xds.StatsFilterName,
 							wellknown.TCPProxy,
 						},
@@ -4063,7 +4453,7 @@ func TestBuildGatewayListenersFilters(t *testing.T) {
 			},
 		},
 		{
-			name: "HTTP RBAC, WASM, and Stats",
+			name: "HTTP RBAC, WASM, TrafficExtension, and Stats",
 			configs: []config.Config{
 				{
 					Meta: config.Meta{Name: "gateway", Namespace: "testns", GroupVersionKind: gvk.Gateway},
@@ -4077,42 +4467,91 @@ func TestBuildGatewayListenersFilters(t *testing.T) {
 					},
 				},
 				{
-					Meta: config.Meta{Name: "wasm-network-authz", Namespace: "istio-system", GroupVersionKind: gvk.WasmPlugin},
-					Spec: &extensions.WasmPlugin{
-						Phase: extensions.PluginPhase_AUTHZ,
-						Type:  extensions.PluginType_NETWORK,
+					Meta: config.Meta{Name: "extension-wasm-network-authz", Namespace: "istio-system", GroupVersionKind: gvk.TrafficExtension},
+					Spec: &extensions.TrafficExtension{
+						Phase: extensions.TrafficExtension_AUTHZ,
+						FilterConfig: &extensions.TrafficExtension_Wasm{Wasm: &extensions.WasmConfig{
+							Url:  "file:///etc/istio/filters/authz.wasm",
+							Type: extensions.PluginType_NETWORK,
+						}},
 					},
 				},
 				{
-					Meta: config.Meta{Name: "wasm-network-authn", Namespace: "istio-system", GroupVersionKind: gvk.WasmPlugin},
-					Spec: &extensions.WasmPlugin{
-						Phase: extensions.PluginPhase_AUTHN,
-						Type:  extensions.PluginType_NETWORK,
+					Meta: config.Meta{Name: "extension-wasm-network-authn", Namespace: "istio-system", GroupVersionKind: gvk.TrafficExtension},
+					Spec: &extensions.TrafficExtension{
+						Phase: extensions.TrafficExtension_AUTHN,
+						FilterConfig: &extensions.TrafficExtension_Wasm{Wasm: &extensions.WasmConfig{
+							Url:  "file:///etc/istio/filters/authn.wasm",
+							Type: extensions.PluginType_NETWORK,
+						}},
 					},
 				},
 				{
-					Meta: config.Meta{Name: "wasm-network-stats", Namespace: "istio-system", GroupVersionKind: gvk.WasmPlugin},
-					Spec: &extensions.WasmPlugin{
-						Phase: extensions.PluginPhase_STATS,
-						Type:  extensions.PluginType_NETWORK,
+					Meta: config.Meta{Name: "extension-wasm-network-stats", Namespace: "istio-system", GroupVersionKind: gvk.TrafficExtension},
+					Spec: &extensions.TrafficExtension{
+						Phase: extensions.TrafficExtension_STATS,
+						FilterConfig: &extensions.TrafficExtension_Wasm{Wasm: &extensions.WasmConfig{
+							Url:  "file:///etc/istio/filters/stats.wasm",
+							Type: extensions.PluginType_NETWORK,
+						}},
 					},
 				},
 				{
-					Meta: config.Meta{Name: "wasm-authz", Namespace: "istio-system", GroupVersionKind: gvk.WasmPlugin},
-					Spec: &extensions.WasmPlugin{
-						Phase: extensions.PluginPhase_AUTHZ,
+					Meta: config.Meta{Name: "extension-wasm-authz", Namespace: "istio-system", GroupVersionKind: gvk.TrafficExtension},
+					Spec: &extensions.TrafficExtension{
+						Phase: extensions.TrafficExtension_AUTHZ,
+						FilterConfig: &extensions.TrafficExtension_Wasm{Wasm: &extensions.WasmConfig{
+							Url:  "oci://example.com/http-authz:v1",
+							Type: extensions.PluginType_HTTP,
+						}},
 					},
 				},
 				{
-					Meta: config.Meta{Name: "wasm-authn", Namespace: "istio-system", GroupVersionKind: gvk.WasmPlugin},
-					Spec: &extensions.WasmPlugin{
-						Phase: extensions.PluginPhase_AUTHN,
+					Meta: config.Meta{Name: "extension-wasm-authn", Namespace: "istio-system", GroupVersionKind: gvk.TrafficExtension},
+					Spec: &extensions.TrafficExtension{
+						Phase: extensions.TrafficExtension_AUTHN,
+						FilterConfig: &extensions.TrafficExtension_Wasm{Wasm: &extensions.WasmConfig{
+							Url:  "oci://example.com/http-authn:v1",
+							Type: extensions.PluginType_HTTP,
+						}},
 					},
 				},
 				{
-					Meta: config.Meta{Name: "wasm-stats", Namespace: "istio-system", GroupVersionKind: gvk.WasmPlugin},
-					Spec: &extensions.WasmPlugin{
-						Phase: extensions.PluginPhase_STATS,
+					Meta: config.Meta{Name: "extension-wasm-stats", Namespace: "istio-system", GroupVersionKind: gvk.TrafficExtension},
+					Spec: &extensions.TrafficExtension{
+						Phase: extensions.TrafficExtension_STATS,
+						FilterConfig: &extensions.TrafficExtension_Wasm{Wasm: &extensions.WasmConfig{
+							Url:  "oci://example.com/http-stats:v1",
+							Type: extensions.PluginType_HTTP,
+						}},
+					},
+				},
+				{
+					Meta: config.Meta{Name: "extension-lua-authn", Namespace: "istio-system", GroupVersionKind: gvk.TrafficExtension},
+					Spec: &extensions.TrafficExtension{
+						Phase: extensions.TrafficExtension_AUTHN,
+						FilterConfig: &extensions.TrafficExtension_Lua{Lua: &extensions.LuaConfig{
+							InlineCode: "function envoy_on_request(request_handle) end",
+						}},
+					},
+				},
+				{
+					Meta: config.Meta{Name: "extension-lua-authz", Namespace: "istio-system", GroupVersionKind: gvk.TrafficExtension},
+					Spec: &extensions.TrafficExtension{
+						Phase: extensions.TrafficExtension_AUTHZ,
+						FilterConfig: &extensions.TrafficExtension_Lua{Lua: &extensions.LuaConfig{
+							InlineCode: "function envoy_on_request(request_handle) end",
+						}},
+					},
+				},
+				{
+					Meta: config.Meta{Name: "extension-wasm-network-unspecified", Namespace: "istio-system", GroupVersionKind: gvk.TrafficExtension},
+					Spec: &extensions.TrafficExtension{
+						Phase: extensions.TrafficExtension_UNSPECIFIED,
+						FilterConfig: &extensions.TrafficExtension_Wasm{Wasm: &extensions.WasmConfig{
+							Url:  "oci://example.com/unspecified:v1",
+							Type: extensions.PluginType_NETWORK,
+						}},
 					},
 				},
 				{
@@ -4157,9 +4596,10 @@ func TestBuildGatewayListenersFilters(t *testing.T) {
 					{
 						TotalMatch: true,
 						NetworkFilters: []string{
-							"extenstions.istio.io/wasmplugin/istio-system.wasm-network-authn",
-							"extenstions.istio.io/wasmplugin/istio-system.wasm-network-authz",
-							"extenstions.istio.io/wasmplugin/istio-system.wasm-network-stats",
+							"extensions.istio.io/trafficextension/istio-system.extension-wasm-network-authn",
+							"extensions.istio.io/trafficextension/istio-system.extension-wasm-network-authz",
+							"extensions.istio.io/trafficextension/istio-system.extension-wasm-network-stats",
+							"extensions.istio.io/trafficextension/istio-system.extension-wasm-network-unspecified",
 							wellknown.HTTPConnectionManager,
 						},
 						HTTPFilters: []string{
@@ -4167,10 +4607,12 @@ func TestBuildGatewayListenersFilters(t *testing.T) {
 							// Ext auth makes 2 filters
 							wellknown.HTTPRoleBasedAccessControl,
 							wellknown.HTTPExternalAuthorization,
-							"extenstions.istio.io/wasmplugin/istio-system.wasm-authn",
-							"extenstions.istio.io/wasmplugin/istio-system.wasm-authz",
+							"extensions.istio.io/trafficextension/istio-system.extension-wasm-authn",
+							"extensions.istio.io/trafficextension/istio-system.extension-lua-authn",
+							"extensions.istio.io/trafficextension/istio-system.extension-wasm-authz",
+							"extensions.istio.io/trafficextension/istio-system.extension-lua-authz",
 							wellknown.HTTPRoleBasedAccessControl,
-							"extenstions.istio.io/wasmplugin/istio-system.wasm-stats",
+							"extensions.istio.io/trafficextension/istio-system.extension-wasm-stats",
 							wellknown.HTTPGRPCStats,
 							xdsfilters.Alpn.Name,
 							xdsfilters.Fault.Name,
@@ -4439,6 +4881,363 @@ func TestGatewayHCMInternalAddressConfig(t *testing.T) {
 			if !reflect.DeepEqual(tt.expectedconfig, httpConnManager.InternalAddressConfig) {
 				t.Errorf("unexpected internal address config, expected: %v, got :%v", tt.expectedconfig, httpConnManager.InternalAddressConfig)
 			}
+		})
+	}
+}
+
+func TestListenerTransportSocketConnectTimeoutForGateway(t *testing.T) {
+	gatewayConfig := config.Config{
+		Meta: config.Meta{Name: "http-server", Namespace: "testns", GroupVersionKind: gvk.Gateway},
+		Spec: &networking.Gateway{
+			Servers: []*networking.Server{
+				{
+					Port: &networking.Port{Name: "http", Number: 80, Protocol: "HTTP"},
+				},
+			},
+		},
+	}
+	cases := []struct {
+		name            string
+		expectedTimeout int64
+		timeoutDisabled bool
+		configuredValue time.Duration
+		configs         []config.Config
+	}{
+		{
+			name:            "should set default timeout",
+			expectedTimeout: durationpb.New(defaultGatewayTransportSocketConnectTimeout).GetSeconds(),
+			configs:         []config.Config{gatewayConfig},
+		},
+		{
+			name:            "should set custom timeout",
+			expectedTimeout: 30,
+			configuredValue: 30 * time.Second,
+			configs:         []config.Config{gatewayConfig},
+		},
+		{
+			name:            "should disable timeout when set to 0",
+			timeoutDisabled: true,
+			configuredValue: 0,
+			configs:         []config.Config{gatewayConfig},
+		},
+	}
+	for _, tt := range cases {
+		t.Run(tt.name, func(t *testing.T) {
+			if tt.configuredValue > 0 {
+				test.SetForTest(t, &features.GatewayTransportSocketConnectTimeout, tt.configuredValue)
+			} else if tt.timeoutDisabled {
+				test.SetForTest(t, &features.GatewayTransportSocketConnectTimeout, time.Duration(0))
+			}
+			cg := NewConfigGenTest(t, TestOptions{
+				Configs:    tt.configs,
+				MeshConfig: mesh.DefaultMeshConfig(),
+			})
+			cg.PushContext().ServiceIndex.HostnameAndNamespace = map[host.Name]map[string]*pilot_model.Service{
+				"example.local": {
+					"foo": &pilot_model.Service{
+						Hostname: "example.local",
+					},
+				},
+			}
+			proxy := cg.SetupProxy(&proxyGateway)
+			metadata := proxyGatewayMetadata
+			metadata.ProxyConfig = &pilot_model.NodeMetaProxyConfig{
+				GatewayTopology: &meshconfig.Topology{ProxyProtocol: &meshconfig.Topology_ProxyProtocolConfiguration{}},
+			}
+			proxy.Metadata = &metadata
+
+			lb := NewListenerBuilder(proxy, cg.PushContext())
+			builder := cg.ConfigGen.buildGatewayListeners(lb)
+			fc := builder.gatewayListeners[0].FilterChains[0]
+			if tt.timeoutDisabled {
+				if fc.TransportSocketConnectTimeout != nil {
+					t.Errorf("expected no transport socket connect timeout on gateway listener's filter chain %v, got %v",
+						fc.Name, fc.TransportSocketConnectTimeout)
+				}
+			} else if fc.TransportSocketConnectTimeout == nil || fc.TransportSocketConnectTimeout.Seconds != tt.expectedTimeout {
+				t.Errorf("expected transport socket connect timeout to be %v on gateway listener's filter chain %v, got %v",
+					tt.expectedTimeout, fc.Name, fc.TransportSocketConnectTimeout)
+			}
+		})
+	}
+}
+
+func TestGatewayExternalSDSProvider(t *testing.T) {
+	cases := []struct {
+		name                string
+		credentialName      string
+		tlsMode             networking.ServerTLSSettings_TLSmode
+		providerName        string
+		providerService     string
+		providerPort        uint32
+		expectedClusterName string
+		expectSDS           bool
+		expectADSFallback   bool
+		noSDSProvider       bool
+	}{
+		{
+			name:                "external SDS provider with SIMPLE TLS",
+			credentialName:      "sds://my-credential",
+			tlsMode:             networking.ServerTLSSettings_SIMPLE,
+			providerName:        "my-sds-provider",
+			providerService:     "sds-service.sds-ns.svc.cluster.local",
+			providerPort:        8443,
+			expectedClusterName: "outbound|8443||sds-service.sds-ns.svc.cluster.local",
+			expectSDS:           true,
+		},
+		{
+			name:                "external SDS provider with MUTUAL TLS",
+			credentialName:      "sds://mutual-credential",
+			tlsMode:             networking.ServerTLSSettings_MUTUAL,
+			providerName:        "my-sds-provider",
+			providerService:     "sds-mutual.sds-ns.svc.cluster.local",
+			providerPort:        9443,
+			expectedClusterName: "outbound|9443||sds-mutual.sds-ns.svc.cluster.local",
+			expectSDS:           true,
+		},
+		{
+			name:                "sds:// prefix without any SDS provider falls back to ADS",
+			credentialName:      "sds://some-credential",
+			tlsMode:             networking.ServerTLSSettings_SIMPLE,
+			providerName:        "",
+			providerService:     "",
+			providerPort:        0,
+			expectedClusterName: "",
+			expectSDS:           false,
+			expectADSFallback:   true,
+			noSDSProvider:       true,
+		},
+	}
+
+	for _, tt := range cases {
+		t.Run(tt.name, func(t *testing.T) {
+			mc := mesh.DefaultMeshConfig()
+			if !tt.noSDSProvider {
+				mc.ExtensionProviders = append(mc.ExtensionProviders, &meshconfig.MeshConfig_ExtensionProvider{
+					Name: tt.providerName,
+					Provider: &meshconfig.MeshConfig_ExtensionProvider_Sds{
+						Sds: &meshconfig.MeshConfig_ExtensionProvider_SDSProvider{
+							Name:    tt.providerName,
+							Service: tt.providerService,
+							Port:    tt.providerPort,
+						},
+					},
+				})
+			}
+
+			gatewayConfig := config.Config{
+				Meta: config.Meta{Name: "tls-gateway", Namespace: "testns", GroupVersionKind: gvk.Gateway},
+				Spec: &networking.Gateway{
+					Servers: []*networking.Server{
+						{
+							Port:  &networking.Port{Name: "https", Number: 443, Protocol: "HTTPS"},
+							Hosts: []string{"secure.example.com"},
+							Tls: &networking.ServerTLSSettings{
+								Mode:           tt.tlsMode,
+								CredentialName: tt.credentialName,
+							},
+						},
+					},
+				},
+			}
+			vsConfig := config.Config{
+				Meta: config.Meta{Name: "vs", Namespace: "testns", GroupVersionKind: gvk.VirtualService},
+				Spec: &networking.VirtualService{
+					Gateways: []string{"testns/tls-gateway"},
+					Hosts:    []string{"secure.example.com"},
+					Http: []*networking.HTTPRoute{
+						{
+							Route: []*networking.HTTPRouteDestination{
+								{
+									Destination: &networking.Destination{
+										Host: "backend.testns.svc.cluster.local",
+										Port: &networking.PortSelector{Number: 80},
+									},
+								},
+							},
+						},
+					},
+				},
+			}
+
+			cg := NewConfigGenTest(t, TestOptions{
+				Configs:    []config.Config{gatewayConfig, vsConfig},
+				MeshConfig: mc,
+			})
+			cg.PushContext().ServiceIndex.HostnameAndNamespace = map[host.Name]map[string]*pilot_model.Service{
+				host.Name(tt.providerService): {
+					"sds-ns": {
+						Hostname: host.Name(tt.providerService),
+						Ports: []*pilot_model.Port{
+							{
+								Name:     "grpc",
+								Port:     int(tt.providerPort),
+								Protocol: protocol.GRPC,
+							},
+						},
+					},
+				},
+			}
+
+			proxy := cg.SetupProxy(&proxyGateway)
+			proxy.Metadata = &proxyGatewayMetadata
+
+			lb := NewListenerBuilder(proxy, cg.PushContext())
+			builder := cg.ConfigGen.buildGatewayListeners(lb)
+
+			if len(builder.gatewayListeners) == 0 {
+				t.Fatal("expected at least one gateway listener")
+			}
+
+			listener := builder.gatewayListeners[0]
+			if len(listener.FilterChains) == 0 {
+				t.Fatal("expected at least one filter chain")
+			}
+
+			fc := listener.FilterChains[0]
+			if fc.GetTransportSocket() == nil {
+				t.Fatal("expected transport socket to be set for TLS")
+			}
+
+			tlsContext := xdstest.UnmarshalAny[auth.DownstreamTlsContext](t, fc.GetTransportSocket().GetTypedConfig())
+			sdsConfigs := tlsContext.GetCommonTlsContext().GetTlsCertificateSdsSecretConfigs()
+
+			if tt.expectSDS {
+				if len(sdsConfigs) == 0 {
+					t.Fatal("expected SDS secret configs to be set")
+				}
+				sdsConfig := sdsConfigs[0]
+				expectedResourceName := strings.TrimPrefix(tt.credentialName, "sds://")
+				if sdsConfig.GetName() != expectedResourceName {
+					t.Errorf("expected SDS secret name %q, got %q", expectedResourceName, sdsConfig.GetName())
+				}
+				grpcServices := sdsConfig.GetSdsConfig().GetApiConfigSource().GetGrpcServices()
+				if len(grpcServices) == 0 {
+					t.Fatal("expected gRPC services in SDS config")
+				}
+				clusterName := grpcServices[0].GetEnvoyGrpc().GetClusterName()
+				if clusterName != tt.expectedClusterName {
+					t.Errorf("expected cluster name %q, got %q", tt.expectedClusterName, clusterName)
+				}
+			} else if tt.expectADSFallback {
+				if len(sdsConfigs) == 0 {
+					t.Fatal("expected SDS secret configs for ADS fallback")
+				}
+				expectedName := "kubernetes://" + strings.TrimPrefix(tt.credentialName, "sds://")
+				if sdsConfigs[0].GetName() != expectedName {
+					t.Errorf("expected ADS fallback SDS name %q, got %q", expectedName, sdsConfigs[0].GetName())
+				}
+			}
+
+			if tt.tlsMode == networking.ServerTLSSettings_MUTUAL {
+				validationCtx := tlsContext.GetCommonTlsContext().GetCombinedValidationContext()
+				if validationCtx == nil {
+					t.Error("expected combined validation context for MUTUAL TLS")
+				}
+			}
+		})
+	}
+}
+
+func TestGatewayListenerConnectionSettings(t *testing.T) {
+	tests := []struct {
+		name      string
+		cs        *meshconfig.ProxyConfig_ConnectionSettings
+		verifyBuf func(t *testing.T, buf *wrappers.UInt32Value)
+		verifyHCM func(t *testing.T, cm *hcm.HttpConnectionManager)
+	}{
+		{
+			name: "EDGE profile sets buffer limit and HCM defaults",
+			cs: &meshconfig.ProxyConfig_ConnectionSettings{
+				Profile: meshconfig.ProxyConfig_ConnectionSettings_EDGE,
+			},
+			verifyBuf: func(t *testing.T, buf *wrappers.UInt32Value) {
+				assert.Equal(t, uint32(32768), buf.GetValue())
+			},
+			verifyHCM: func(t *testing.T, cm *hcm.HttpConnectionManager) {
+				assert.Equal(t, int64(300), cm.StreamIdleTimeout.GetSeconds())
+				assert.Equal(t, true, cm.MergeSlashes)
+			},
+		},
+		{
+			name: "explicit buffer limit overrides EDGE",
+			cs: &meshconfig.ProxyConfig_ConnectionSettings{
+				Profile:                               meshconfig.ProxyConfig_ConnectionSettings_EDGE,
+				ListenerPerConnectionBufferLimitBytes: &wrappers.Int32Value{Value: 16384},
+			},
+			verifyBuf: func(t *testing.T, buf *wrappers.UInt32Value) {
+				assert.Equal(t, uint32(16384), buf.GetValue())
+			},
+			verifyHCM: func(t *testing.T, cm *hcm.HttpConnectionManager) {
+				// Other EDGE defaults still applied
+				assert.Equal(t, int64(300), cm.StreamIdleTimeout.GetSeconds())
+			},
+		},
+		{
+			name: "no connection settings does not set buffer limit",
+			cs:   nil,
+			verifyBuf: func(t *testing.T, buf *wrappers.UInt32Value) {
+				assert.Equal(t, (*wrappers.UInt32Value)(nil), buf)
+			},
+			verifyHCM: func(t *testing.T, cm *hcm.HttpConnectionManager) {
+				// Default 0s stream idle timeout
+				assert.Equal(t, time.Duration(0), cm.StreamIdleTimeout.AsDuration())
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			mc := mesh.DefaultMeshConfig()
+			mc.DefaultConfig.ConnectionSettings = tc.cs
+
+			cg := NewConfigGenTest(t, TestOptions{
+				MeshConfig: mc,
+				Configs: []config.Config{
+					{
+						Meta: config.Meta{
+							GroupVersionKind: gvk.Gateway,
+							Name:             "test-gw",
+							Namespace:        "not-default",
+						},
+						Spec: &networking.Gateway{
+							Selector: map[string]string{"istio": "ingressgateway"},
+							Servers: []*networking.Server{
+								{
+									Port:  &networking.Port{Number: 80, Name: "http", Protocol: "HTTP"},
+									Hosts: []string{"*.example.com"},
+								},
+							},
+						},
+					},
+				},
+			})
+
+			proxy := cg.SetupProxy(&proxyGateway)
+			lb := NewListenerBuilder(proxy, cg.PushContext())
+			builder := cg.ConfigGen.buildGatewayListeners(lb)
+
+			// Find the gateway listener by port
+			var l *listener.Listener
+			for _, lst := range builder.gatewayListeners {
+				if strings.Contains(lst.Name, "_80") {
+					l = lst
+					break
+				}
+			}
+			if l == nil {
+				t.Fatal("expected to find gateway listener")
+			}
+
+			tc.verifyBuf(t, l.PerConnectionBufferLimitBytes)
+
+			// Verify HCM settings
+			// Single-server gateway produces one unnamed filter chain.
+			if len(l.GetFilterChains()) == 0 {
+				t.Fatalf("listener %q has no filter chains", l.Name)
+			}
+			hcmFilter := xdstest.ExtractHTTPConnectionManager(t, l.GetFilterChains()[0])
+			tc.verifyHCM(t, hcmFilter)
 		})
 	}
 }

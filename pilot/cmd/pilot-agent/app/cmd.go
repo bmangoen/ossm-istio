@@ -42,9 +42,7 @@ import (
 	"istio.io/istio/pkg/util/protomarshal"
 	"istio.io/istio/pkg/util/sets"
 	"istio.io/istio/pkg/version"
-	cleaniptables "istio.io/istio/tools/istio-clean-iptables/pkg/cmd"
 	iptables "istio.io/istio/tools/istio-iptables/pkg/cmd"
-	iptableslog "istio.io/istio/tools/istio-iptables/pkg/log"
 )
 
 const (
@@ -81,7 +79,6 @@ func NewRootCommand(sds istioagent.SDSServiceFactory) *cobra.Command {
 	rootCmd.AddCommand(waitCmd)
 	rootCmd.AddCommand(version.CobraCommand())
 	rootCmd.AddCommand(iptables.GetCommand(loggingOptions))
-	rootCmd.AddCommand(cleaniptables.GetCommand(loggingOptions))
 
 	rootCmd.AddCommand(collateral.CobraCommand(rootCmd, collateral.Metadata{
 		Title:   "Istio Pilot Agent",
@@ -104,8 +101,6 @@ func newProxyCommand(sds istioagent.SDSServiceFactory) *cobra.Command {
 		RunE: func(c *cobra.Command, args []string) error {
 			cmd.PrintFlags(c.Flags())
 			log.Infof("Version %s", version.Info.String())
-
-			raiseLimits()
 
 			err := initProxy(args)
 			if err != nil {
@@ -132,12 +127,14 @@ func newProxyCommand(sds istioagent.SDSServiceFactory) *cobra.Command {
 			}
 
 			envoyOptions := envoy.ProxyConfig{
-				LogLevel:          proxyArgs.ProxyLogLevel,
-				ComponentLogLevel: proxyArgs.ProxyComponentLogLevel,
-				LogAsJSON:         loggingOptions.JSONEncoding,
-				NodeIPs:           proxyArgs.IPAddresses,
-				Sidecar:           proxyArgs.Type == model.SidecarProxy,
-				OutlierLogPath:    proxyArgs.OutlierLogPath,
+				LogLevel:           proxyArgs.ProxyLogLevel,
+				ComponentLogLevel:  proxyArgs.ProxyComponentLogLevel,
+				LogAsJSON:          loggingOptions.JSONEncoding,
+				NodeIPs:            proxyArgs.IPAddresses,
+				Sidecar:            proxyArgs.Type == model.SidecarProxy,
+				OutlierLogPath:     proxyArgs.OutlierLogPath,
+				FileFlushInterval:  proxyConfig.FileFlushInterval,
+				FileFlushMinSizeKB: proxyConfig.FileFlushMinSizeKb,
 			}
 			agentOptions := options.NewAgentOptions(&proxyArgs, proxyConfig, sds)
 			agent := istioagent.NewAgent(proxyConfig, agentOptions, secOpts, envoyOptions)
@@ -152,8 +149,6 @@ func newProxyCommand(sds istioagent.SDSServiceFactory) *cobra.Command {
 					return err
 				}
 			}
-
-			go iptableslog.ReadNFLOGSocket(ctx)
 
 			// On SIGINT or SIGTERM, cancel the context, triggering a graceful shutdown
 			go cmd.WaitSignalFunc(cancel)
@@ -183,7 +178,7 @@ func addFlags(proxyCmd *cobra.Command) {
 	// DEPRECATED. Flags for proxy configuration
 	proxyCmd.PersistentFlags().StringVar(&proxyArgs.ServiceCluster, "serviceCluster", constants.ServiceClusterName, "Service cluster")
 	// Log levels are provided by the library https://github.com/gabime/spdlog, used by Envoy.
-	proxyCmd.PersistentFlags().StringVar(&proxyArgs.ProxyLogLevel, "proxyLogLevel", "warning,misc:error",
+	proxyCmd.PersistentFlags().StringVar(&proxyArgs.ProxyLogLevel, "proxyLogLevel", "warning",
 		fmt.Sprintf("The log level used to start the Envoy proxy (choose from {%s, %s, %s, %s, %s, %s, %s})."+
 			"Level may also include one or more scopes, such as 'info,misc:error,upstream:debug'",
 			"trace", "debug", "info", "warning", "error", "critical", "off"))
@@ -343,13 +338,4 @@ func getExcludeInterfaces() sets.String {
 
 	log.Infof("Exclude IPs %v based on %s annotation", excludeAddrs, annotation.SidecarTrafficExcludeInterfaces.Name)
 	return excludeAddrs
-}
-
-func raiseLimits() {
-	limit, err := RaiseFileLimits()
-	if err != nil {
-		log.Warnf("failed setting file limit: %v", err)
-	} else {
-		log.Infof("Set max file descriptors (ulimit -n) to: %d", limit)
-	}
 }

@@ -84,6 +84,9 @@ const (
 
 	// DefaultEgressGatewayServiceName is the default service name for the egress gateway.
 	DefaultEgressGatewayServiceName = "istio-egressgateway"
+
+	// DefaultGatewayClassName is the default name of the GatewayClass for created by istio.
+	DefaultGatewayClassName = "istio"
 )
 
 var (
@@ -93,6 +96,7 @@ var (
 	settingsFromCommandline = &Config{
 		SystemNamespace:               DefaultSystemNamespace,
 		TelemetryNamespace:            DefaultSystemNamespace,
+		ZtunnelNamespace:              DefaultSystemNamespace,
 		DeployIstio:                   true,
 		PrimaryClusterIOPFile:         IntegrationTestDefaultsIOP,
 		ConfigClusterIOPFile:          IntegrationTestDefaultsIOP,
@@ -105,6 +109,8 @@ var (
 		EgressGatewayServiceNamespace: DefaultSystemNamespace,
 		EgressGatewayServiceName:      DefaultEgressGatewayServiceName,
 		EgressGatewayIstioLabel:       DefaultEgressGatewayIstioLabel,
+		DeployGatewayAPI:              true,
+		GatewayClassName:              DefaultGatewayClassName,
 	}
 )
 
@@ -115,6 +121,9 @@ type Config struct {
 
 	// The namespace in which kiali, tracing providers, graphana, prometheus are deployed.
 	TelemetryNamespace string
+
+	// The namespace where the ztunnel daemonset resides (default: "istio-system").
+	ZtunnelNamespace string
 
 	// The IstioOperator spec file to be used for Control plane cluster by default
 	PrimaryClusterIOPFile string
@@ -209,6 +218,17 @@ type Config struct {
 	// upon installing Istio.
 	// This field should only be set when DeployIstio is false.
 	SharedMeshConfigName string
+
+	// ControlPlaneInstaller allows installation of custom control planes on istio deployments via an external script
+	// This field should only be set when DeployIstio is false
+	ControlPlaneInstaller string
+
+	// DeployGatewayAPI indicates that the test should deploy Gateway API during tests execution
+	DeployGatewayAPI bool
+
+	// GatewayClassName is the name of the GatewayClass to use for Gateway API tests.
+	// This sets the PILOT_GATEWAY_API_DEFAULT_GATEWAYCLASS_NAME environment variable for istiod.
+	GatewayClassName string
 }
 
 func (c *Config) OverridesYAML(s *resource.Settings) string {
@@ -383,6 +403,7 @@ func (c *Config) String() string {
 	result += fmt.Sprintf("EgressGatewayServiceNamespace:  %v\n", c.EgressGatewayServiceNamespace)
 	result += fmt.Sprintf("EgressGatewayIstioLabel:        %v\n", c.EgressGatewayIstioLabel)
 	result += fmt.Sprintf("SharedMeshConfigName:           %v\n", c.SharedMeshConfigName)
+	result += fmt.Sprintf("ControlPlaneInstaller:          %v\n", c.ControlPlaneInstaller)
 
 	return result
 }

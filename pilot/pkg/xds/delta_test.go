@@ -17,8 +17,10 @@ package xds_test
 import (
 	"fmt"
 	"reflect"
+	"sync"
 	"testing"
 
+	endpoint "github.com/envoyproxy/go-control-plane/envoy/config/endpoint/v3"
 	discovery "github.com/envoyproxy/go-control-plane/envoy/service/discovery/v3"
 
 	"istio.io/istio/pilot/pkg/features"
@@ -28,8 +30,8 @@ import (
 	"istio.io/istio/pilot/test/xdstest"
 	"istio.io/istio/pkg/config/protocol"
 	"istio.io/istio/pkg/config/schema/kind"
+	"istio.io/istio/pkg/maps"
 	"istio.io/istio/pkg/slices"
-	"istio.io/istio/pkg/test"
 	"istio.io/istio/pkg/test/util/assert"
 	"istio.io/istio/pkg/test/util/retry"
 	"istio.io/istio/pkg/util/sets"
@@ -80,6 +82,7 @@ func TestDeltaCDS(t *testing.T) {
 		assert.Equal(t, sets.New(got...), sets.New(names...).Merge(base))
 	}
 	s := xds.NewFakeDiscoveryServer(t, xds.FakeOptions{})
+	spamDebugEndpointsToDetectRace(t, s)
 	addTestClientEndpoints(s.MemRegistry)
 	s.MemRegistry.AddHTTPService(edsIncSvc, edsIncVip, 8080)
 	s.MemRegistry.SetEndpoints(edsIncSvc, "",
@@ -227,12 +230,20 @@ func TestDeltaEDS(t *testing.T) {
 	// delete svc, only send eds for this service
 	s.MemRegistry.RemoveService(edsIncSvc)
 
+	// service deletion pushes and EDS update for the service with empty endpoints
 	resp = ads.ExpectResponse()
-	if len(resp.RemovedResources) != 1 || resp.RemovedResources[0] != "outbound|8080||"+edsIncSvc {
-		t.Fatalf("received unexpected removed eds resource %v", resp.RemovedResources)
-	}
-	if len(resp.Resources) != 0 {
+	if len(resp.Resources) != 1 || resp.Resources[0].Name != "outbound|8080||"+edsIncSvc {
 		t.Fatalf("received unexpected eds resource %v", resp.Resources)
+	}
+	cla := &endpoint.ClusterLoadAssignment{}
+	if err := resp.Resources[0].Resource.UnmarshalTo(cla); err != nil {
+		t.Fatalf("invalid eds push: %s", err)
+	}
+	if len(cla.Endpoints) > 0 {
+		t.Fatalf("received non-empty endpoints for service: %v", cla)
+	}
+	if len(resp.RemovedResources) != 0 {
+		t.Fatalf("received unexpected removed eds resource %v", resp.RemovedResources)
 	}
 }
 
@@ -283,7 +294,7 @@ func TestDeltaReconnectRequests(t *testing.T) {
 	}
 
 	// A push should get a response
-	s.Discovery.ConfigUpdate(&model.PushRequest{Full: true})
+	s.Discovery.ConfigUpdate(&model.PushRequest{Forced: true})
 	ads.ExpectResponse()
 
 	// Close the connection
@@ -292,7 +303,6 @@ func TestDeltaReconnectRequests(t *testing.T) {
 	// Service is removed while connection is closed
 	s.MemRegistry.RemoveService("adsupdate.example.com")
 	s.Discovery.ConfigUpdate(&model.PushRequest{
-		Full:           true,
 		ConfigsUpdated: sets.New(model.ConfigKey{Kind: kind.ServiceEntry, Name: "adsupdate.example.com", Namespace: "default"}),
 	})
 	s.EnsureSynced(t)
@@ -330,9 +340,87 @@ func TestDeltaReconnectRequests(t *testing.T) {
 	}
 }
 
+func init() {
+	features.EnableAmbient = true
+}
+
+// testAmbientStore is a simple in-memory AmbientIndexes for testing.
+type testAmbientStore struct {
+	model.NoopAmbientIndexes
+	mu        sync.Mutex
+	addresses map[string]model.AddressInfo
+}
+
+func newTestAmbientStore() *testAmbientStore {
+	return &testAmbientStore{
+		addresses: map[string]model.AddressInfo{},
+	}
+}
+
+func (s *testAmbientStore) AddressInformation(requests sets.String) ([]model.AddressInfo, sets.String) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if len(requests) == 0 {
+		return maps.Values(s.addresses), nil
+	}
+	var infos []model.AddressInfo
+	removed := sets.String{}
+	for req := range requests {
+		if _, found := s.addresses[req]; !found {
+			removed.Insert(req)
+		} else {
+			infos = append(infos, s.addresses[req])
+		}
+	}
+	return infos, removed
+}
+
+func (s *testAmbientStore) AddWorkloadInfo(infos ...*model.WorkloadInfo) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, info := range infos {
+		s.addresses[info.ResourceName()] = model.AddressInfo{
+			Address: &workloadapi.Address{
+				Type: &workloadapi.Address_Workload{
+					Workload: info.Workload,
+				},
+			},
+		}
+	}
+}
+
+func (s *testAmbientStore) RemoveWorkloadInfo(info *model.WorkloadInfo) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.addresses, info.ResourceName())
+}
+
+func (s *testAmbientStore) AddServiceInfo(infos ...*model.ServiceInfo) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, info := range infos {
+		s.addresses[info.ResourceName()] = model.AddressInfo{
+			Address: &workloadapi.Address{
+				Type: &workloadapi.Address_Service{
+					Service: info.Service,
+				},
+			},
+		}
+	}
+}
+
+func (s *testAmbientStore) RemoveServiceInfo(info *model.ServiceInfo) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.addresses, info.ResourceName())
+}
+
 func TestDeltaWDS(t *testing.T) {
-	test.SetForTest(t, &features.EnableAmbient, true)
-	s := xds.NewFakeDiscoveryServer(t, xds.FakeOptions{})
+	store := newTestAmbientStore()
+	s := xds.NewFakeDiscoveryServer(t, xds.FakeOptions{
+		AmbientIndex: store,
+	})
+
 	wlA := &model.WorkloadInfo{
 		Workload: &workloadapi.Workload{
 			Uid:       fmt.Sprintf("Kubernetes//Pod/%s/%s", "test", "a"),
@@ -375,8 +463,8 @@ func TestDeltaWDS(t *testing.T) {
 			Hostname:  "c.default.svc.cluster.local",
 		},
 	}
-	s.MemRegistry.AddWorkloadInfo(wlA, wlB, wlC)
-	s.MemRegistry.AddServiceInfo(svcA, svcB, svcC)
+	store.AddWorkloadInfo(wlA, wlB, wlC)
+	store.AddServiceInfo(svcA, svcB, svcC)
 
 	// Wait until the above debounce, to ensure we can precisely check XDS responses without spurious pushes
 	s.EnsureSynced(t)
@@ -395,9 +483,7 @@ func TestDeltaWDS(t *testing.T) {
 
 	// simulate a svc update
 	s.XdsUpdater.ConfigUpdate(&model.PushRequest{
-		ConfigsUpdated: sets.New(model.ConfigKey{
-			Kind: kind.Address, Name: svcA.ResourceName(), Namespace: svcA.Namespace,
-		}),
+		AddressesUpdated: sets.New(svcA.ResourceName()),
 	})
 
 	resp = ads.ExpectResponse()
@@ -409,11 +495,9 @@ func TestDeltaWDS(t *testing.T) {
 	}
 
 	// simulate a svc delete
-	s.MemRegistry.RemoveServiceInfo(svcA)
+	store.RemoveServiceInfo(svcA)
 	s.XdsUpdater.ConfigUpdate(&model.PushRequest{
-		ConfigsUpdated: sets.New(model.ConfigKey{
-			Kind: kind.Address, Name: svcA.ResourceName(), Namespace: svcA.Namespace,
-		}),
+		AddressesUpdated: sets.New(svcA.ResourceName()),
 	})
 
 	resp = ads.ExpectResponse()
@@ -425,19 +509,18 @@ func TestDeltaWDS(t *testing.T) {
 	}
 
 	// delete workload
-	s.MemRegistry.RemoveWorkloadInfo(wlA)
-	// a full push and a pod delete event
-	// This is a merged push request
+	store.RemoveWorkloadInfo(wlA)
+	// a pod delete event
 	s.XdsUpdater.ConfigUpdate(&model.PushRequest{
-		Full: true,
+		AddressesUpdated: sets.New(wlA.ResourceName()),
 	})
 
 	resp = ads.ExpectResponse()
 	if len(resp.RemovedResources) != 1 || resp.RemovedResources[0] != wlA.ResourceName() {
-		t.Fatalf("received unexpected removed eds resource %v", resp.RemovedResources)
+		t.Fatalf("received unexpected removed wds resource %v", resp.RemovedResources)
 	}
-	if len(resp.Resources) != 4 {
-		t.Fatalf("received unexpected eds resource %v", resp.Resources)
+	if len(resp.Resources) != 0 {
+		t.Fatalf("received unexpected wds resource %v", resp.Resources)
 	}
 }
 

@@ -27,6 +27,7 @@ import (
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/portforward"
 	"k8s.io/client-go/transport/spdy"
+	"k8s.io/streaming/pkg/httpstream"
 
 	"istio.io/istio/pkg/log"
 )
@@ -167,9 +168,19 @@ func (f *forwarder) buildK8sPortForwarder(readyCh chan struct{}) (*portforward.P
 		return nil, fmt.Errorf("failure creating roundtripper: %v", err)
 	}
 
-	dialer := spdy.NewDialer(upgrader, &http.Client{Transport: roundTripper}, http.MethodPost, serverURL)
+	dialer := spdy.NewDialerForStreaming(spdy.NewUpgraderForStreaming(upgrader), &http.Client{Transport: roundTripper}, http.MethodPost, serverURL)
+	if !portForwardWebsockets.IsDisabled() {
+		tunnelingDialer, err := portforward.NewSPDYOverWebsocketDialerForStreaming(serverURL, f.restConfig)
+		if err != nil {
+			return nil, err
+		}
+		// First attempt tunneling (websocket) dialer, then fallback to spdy dialer.
+		dialer = portforward.NewFallbackDialerForStreaming(tunnelingDialer, dialer, func(err error) bool {
+			return httpstream.IsUpgradeFailure(err) || httpstream.IsHTTPSProxyError(err)
+		})
+	}
 
-	fw, err := portforward.NewOnAddresses(dialer,
+	fw, err := portforward.NewOnAddressesForStreaming(dialer,
 		[]string{f.localAddress},
 		[]string{fmt.Sprintf("%d:%d", f.localPort, f.podPort)},
 		f.stopCh,

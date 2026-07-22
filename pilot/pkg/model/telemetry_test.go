@@ -40,6 +40,7 @@ import (
 	"istio.io/istio/pilot/pkg/serviceregistry/provider"
 	"istio.io/istio/pkg/config"
 	"istio.io/istio/pkg/config/mesh"
+	"istio.io/istio/pkg/config/mesh/meshwatcher"
 	"istio.io/istio/pkg/config/schema/collection"
 	"istio.io/istio/pkg/config/schema/gvk"
 	"istio.io/istio/pkg/ptr"
@@ -115,7 +116,6 @@ var (
 			LogFormat: &core.SubstitutionFormatString{
 				Formatters: []*core.TypedExtensionConfig{
 					reqWithoutQueryFormatter,
-					metadataFormatter,
 				},
 				Format: &core.SubstitutionFormatString_JsonFormat{
 					JsonFormat: &structpb.Struct{
@@ -138,7 +138,6 @@ var (
 			LogFormat: &core.SubstitutionFormatString{
 				Formatters: []*core.TypedExtensionConfig{
 					reqWithoutQueryFormatter,
-					metadataFormatter,
 				},
 				Format: &core.SubstitutionFormatString_TextFormatSource{
 					TextFormatSource: &core.DataSource{
@@ -165,7 +164,7 @@ func createTestTelemetries(configs []config.Config, t *testing.T) (*Telemetries,
 
 	environment := &Environment{
 		ConfigStore: store,
-		Watcher:     mesh.NewFixedWatcher(m),
+		Watcher:     meshwatcher.NewTestWatcher(m),
 	}
 	telemetries := getTelemetries(environment)
 
@@ -324,7 +323,7 @@ func TestTracing(t *testing.T) {
 			},
 		},
 	}
-	nonExistant := &tpb.Telemetry{
+	nonExistent := &tpb.Telemetry{
 		Tracing: []*tpb.Tracing{
 			{
 				Providers: []*tpb.ProviderRef{
@@ -357,6 +356,13 @@ func TestTracing(t *testing.T) {
 					Mode: tpb.WorkloadMode_SERVER,
 				},
 				DisableSpanReporting: &wrappers.BoolValue{Value: true},
+			},
+		},
+	}
+	disableContextPropagation := &tpb.Telemetry{
+		Tracing: []*tpb.Tracing{
+			{
+				DisableContextPropagation: &wrappers.BoolValue{Value: true},
 			},
 		},
 	}
@@ -426,7 +432,7 @@ func TestTracing(t *testing.T) {
 		},
 		{
 			"non existing",
-			[]config.Config{newTelemetry("default", nonExistant)},
+			[]config.Config{newTelemetry("default", nonExistent)},
 			sidecar,
 			[]string{"envoy"},
 			&TracingConfig{
@@ -559,6 +565,26 @@ func TestTracing(t *testing.T) {
 				},
 			},
 		},
+		{
+			"disable context propagation",
+			[]config.Config{newTelemetry("istio-system", envoy), newTelemetry("default", disableContextPropagation)},
+			sidecar,
+			nil,
+			&TracingConfig{
+				ClientSpec: TracingSpec{
+					Provider:                     &meshconfig.MeshConfig_ExtensionProvider{Name: "envoy"},
+					UseRequestIDForTraceSampling: true,
+					EnableIstioTags:              true,
+					DisableContextPropagation:    true,
+				},
+				ServerSpec: TracingSpec{
+					Provider:                     &meshconfig.MeshConfig_ExtensionProvider{Name: "envoy"},
+					UseRequestIDForTraceSampling: true,
+					EnableIstioTags:              true,
+					DisableContextPropagation:    true,
+				},
+			},
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -588,6 +614,22 @@ func TestTelemetryFilters(t *testing.T) {
 			"add": {
 				Operation: tpb.MetricsOverrides_TagOverride_UPSERT,
 				Value:     "bar",
+			},
+		},
+	}}
+	overridesOther := []*tpb.MetricsOverrides{{
+		Match: &tpb.MetricSelector{
+			MetricMatch: &tpb.MetricSelector_Metric{
+				Metric: tpb.MetricSelector_REQUEST_DURATION,
+			},
+		},
+		TagOverrides: map[string]*tpb.MetricsOverrides_TagOverride{
+			"removeOther": {
+				Operation: tpb.MetricsOverrides_TagOverride_REMOVE,
+			},
+			"add": {
+				Operation: tpb.MetricsOverrides_TagOverride_UPSERT,
+				Value:     "otherBar",
 			},
 		},
 	}}
@@ -695,6 +737,20 @@ func TestTelemetryFilters(t *testing.T) {
 		Metrics: []*tpb.Metrics{
 			{
 				Overrides: overrides,
+			},
+		},
+	}
+
+	targetRefsOther := &tpb.Telemetry{
+		TargetRefs: []*v1beta1.PolicyTargetReference{{
+			Group:     gvk.Service.Group,
+			Kind:      gvk.Service.Kind,
+			Namespace: "other",
+			Name:      "sample-svc",
+		}},
+		Metrics: []*tpb.Metrics{
+			{
+				Overrides: overridesOther,
 			},
 		},
 	}
@@ -1071,6 +1127,63 @@ func TestTelemetryFilters(t *testing.T) {
 			want: map[string]string{
 				"istio.stats": `{"disable_host_header_fallback":true,"metrics":[{"dimensions":{"add":"bar"},"name":"requests_total"` +
 					`,"tags_to_remove":["remove"]}],"reporter":"SERVER_GATEWAY"}`,
+			},
+		},
+		{
+			name: "targetRef match cross namespace",
+			cfgs: []config.Config{
+				newTelemetry("default", targetRefs),
+				{
+					Meta: config.Meta{
+						GroupVersionKind: gvk.Telemetry,
+						Name:             "default",
+						Namespace:        "other",
+					},
+					Spec: targetRefsOther,
+				},
+			},
+			service: &Service{
+				Attributes: ServiceAttributes{
+					Name:            "sample-svc",
+					Namespace:       "other",
+					ServiceRegistry: provider.Kubernetes,
+				},
+			},
+			proxy:            waypoint,
+			class:            networking.ListenerClassSidecarInbound,
+			protocol:         networking.ListenerProtocolHTTP,
+			defaultProviders: &meshconfig.MeshConfig_DefaultProviders{Metrics: []string{"prometheus"}},
+			want: map[string]string{
+				"istio.stats": `{"disable_host_header_fallback":true,"metrics":[{"dimensions":{"add":"otherBar"}` +
+					`,"name":"request_duration_milliseconds","tags_to_remove":["removeOther"]}],"reporter":"SERVER_GATEWAY"}`,
+			},
+		},
+		{
+			name: "cross namespace wide",
+			cfgs: []config.Config{
+				{
+					Meta: config.Meta{
+						GroupVersionKind: gvk.Telemetry,
+						Name:             "default",
+						Namespace:        "other",
+					},
+					Spec: overridesPrometheus,
+				},
+			},
+			service: &Service{
+				Attributes: ServiceAttributes{
+					Name:            "sample-svc",
+					Namespace:       "other",
+					ServiceRegistry: provider.Kubernetes,
+				},
+			},
+			proxy:            waypoint,
+			class:            networking.ListenerClassSidecarInbound,
+			protocol:         networking.ListenerProtocolHTTP,
+			defaultProviders: &meshconfig.MeshConfig_DefaultProviders{Metrics: []string{"prometheus"}},
+			want: map[string]string{
+				"istio.stats": `{"disable_host_header_fallback":true,"metrics":[{"dimensions":{"add":"bar"}` +
+					`,"name":"requests_total","tags_to_remove":["remove"]}],"reporter":"SERVER_GATEWAY"}`,
 			},
 		},
 	}

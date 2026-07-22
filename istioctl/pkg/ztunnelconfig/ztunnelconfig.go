@@ -32,6 +32,7 @@ import (
 
 	"istio.io/istio/istioctl/pkg/cli"
 	"istio.io/istio/istioctl/pkg/completion"
+	"istio.io/istio/istioctl/pkg/util"
 	ambientutil "istio.io/istio/istioctl/pkg/util/ambient"
 	ztunnelDump "istio.io/istio/istioctl/pkg/writer/ztunnel/configdump"
 	"istio.io/istio/pkg/config"
@@ -45,8 +46,6 @@ const (
 	jsonOutput    = "json"
 	yamlOutput    = "yaml"
 	summaryOutput = "short"
-
-	defaultProxyAdminPort = 15000
 )
 
 func ZtunnelConfig(ctx cli.Context) *cobra.Command {
@@ -91,7 +90,7 @@ func certificatesConfigCmd(ctx cli.Context) *cobra.Command {
 `,
 		Aliases: []string{"certificates", "certs", "cert"},
 		Args:    common.validateArgs,
-		RunE: runConfigDump(ctx, common, func(cw *ztunnelDump.ConfigWriter) error {
+		RunE: runConfigDump(ctx, common, true, func(cw *ztunnelDump.ConfigWriter) error {
 			switch common.outputFormat {
 			case summaryOutput:
 				return cw.PrintSecretSummary()
@@ -124,7 +123,7 @@ func servicesCmd(ctx cli.Context) *cobra.Command {
 `,
 		Aliases: []string{"services", "s", "svc"},
 		Args:    common.validateArgs,
-		RunE: runConfigDump(ctx, common, func(cw *ztunnelDump.ConfigWriter) error {
+		RunE: runConfigDump(ctx, common, false, func(cw *ztunnelDump.ConfigWriter) error {
 			filter := ztunnelDump.ServiceFilter{
 				Namespace: serviceNamespace,
 			}
@@ -162,7 +161,7 @@ func policiesCmd(ctx cli.Context) *cobra.Command {
 `,
 		Aliases: []string{"policies", "p", "pol"},
 		Args:    common.validateArgs,
-		RunE: runConfigDump(ctx, common, func(cw *ztunnelDump.ConfigWriter) error {
+		RunE: runConfigDump(ctx, common, false, func(cw *ztunnelDump.ConfigWriter) error {
 			filter := ztunnelDump.PolicyFilter{
 				Namespace: policyNamespace,
 			}
@@ -186,6 +185,7 @@ func policiesCmd(ctx cli.Context) *cobra.Command {
 }
 
 func allCmd(ctx cli.Context) *cobra.Command {
+	var withHeaders bool
 	common := new(commonFlags)
 	cmd := &cobra.Command{
 		Use:   "all",
@@ -198,10 +198,10 @@ func allCmd(ctx cli.Context) *cobra.Command {
   istioctl ztunnel-config all <ztunnel-name[.namespace]> -o json
 `,
 		Args: common.validateArgs,
-		RunE: runConfigDump(ctx, common, func(cw *ztunnelDump.ConfigWriter) error {
+		RunE: runConfigDump(ctx, common, false, func(cw *ztunnelDump.ConfigWriter) error {
 			switch common.outputFormat {
 			case summaryOutput:
-				return cw.PrintFullSummary()
+				return cw.PrintFullSummary(withHeaders)
 			case jsonOutput, yamlOutput:
 				return cw.PrintFullDump(common.outputFormat)
 			default:
@@ -212,6 +212,7 @@ func allCmd(ctx cli.Context) *cobra.Command {
 	}
 
 	common.attach(cmd)
+	cmd.PersistentFlags().BoolVar(&withHeaders, "with-headers", false, "Print summary with headers")
 
 	return cmd
 }
@@ -241,15 +242,22 @@ func workloadConfigCmd(ctx cli.Context) *cobra.Command {
   istioctl ztunnel-config workloads --file ztunnel-config.json
 
   # Retrieve workload summary for a specific namespace
-  istioctl ztunnel-config workloads <ztunnel-name[.namespace]> --workloads-namespace foo
+  istioctl ztunnel-config workloads <ztunnel-name[.namespace]> --workload-namespace foo
+
+  # Retrieve workload info for a specific workload pod (auto-resolves to its ztunnel).
+  istioctl ztunnel-config workload <workload-pod-name[.namespace]>
 `,
 		Aliases: []string{"w", "workloads"},
 		Args:    common.validateArgs,
-		RunE: runConfigDump(ctx, common, func(cw *ztunnelDump.ConfigWriter) error {
+		RunE: runConfigDump(ctx, common, false, func(cw *ztunnelDump.ConfigWriter) error {
 			filter := ztunnelDump.WorkloadFilter{
 				Namespace: workloadsNamespace,
 				Address:   address,
 				Node:      workloadNode,
+			}
+			if cw.TargetWorkload != nil {
+				filter.Name = cw.TargetWorkload.Name
+				filter.Namespace = cw.TargetWorkload.Namespace
 			}
 			switch common.outputFormat {
 			case summaryOutput:
@@ -280,23 +288,29 @@ func connectionsCmd(ctx cli.Context) *cobra.Command {
 
 	common := new(commonFlags)
 	cmd := &cobra.Command{
-		Use:    "connections [<type>/]<name>[.<namespace>]",
-		Hidden: true,
-		Short:  "Retrieves connections for the specified Ztunnel pod.",
-		Long:   `Retrieve information about connections for the Ztunnel instance.`,
+		Use:   "connections [<type>/]<name>[.<namespace>]",
+		Short: "Retrieves connections for the specified Ztunnel pod.",
+		Long:  `Retrieve information about connections for the Ztunnel instance.`,
 		Example: `  # Retrieve summary about connections for the ztunnel on a specific node.
   istioctl ztunnel-config connections --node ambient-worker
 
   # Retrieve summary of connections for a given Ztunnel instance.
   istioctl ztunnel-config connections <ztunnel-name[.namespace]>
+
+  # Retrieve connections for a specific workload pod (auto-resolves to its ztunnel).
+  istioctl ztunnel-config connections <workload-pod-name[.namespace]>
 `,
 		Aliases: []string{"cons"},
 		Args:    common.validateArgs,
-		RunE: runConfigDump(ctx, common, func(cw *ztunnelDump.ConfigWriter) error {
+		RunE: runConfigDump(ctx, common, true, func(cw *ztunnelDump.ConfigWriter) error {
 			filter := ztunnelDump.ConnectionsFilter{
 				Namespace: workloadsNamespace,
 				Direction: direction,
 				Raw:       raw,
+			}
+			if cw.TargetWorkload != nil {
+				filter.Workload = cw.TargetWorkload.Name
+				filter.Namespace = cw.TargetWorkload.Namespace
 			}
 			switch common.outputFormat {
 			case summaryOutput:
@@ -421,7 +435,7 @@ func logCmd(ctx cli.Context) *cobra.Command {
 			var podNames []string
 			var podNamespace string
 			if len(args) == 1 {
-				podName, ns, err := getComponentPodName(ctx, args[0])
+				podName, ns, err := getComponentPodName(ctx, args[0], false)
 				if err != nil {
 					return err
 				}
@@ -522,13 +536,22 @@ func setupZtunnelLogs(kubeClient kube.CLIClient, param, podName, podNamespace st
 }
 
 // getComponentPodName returns the pod name and namespace of the Istio component
-func getComponentPodName(ctx cli.Context, podflag string) (string, string, error) {
+func getComponentPodName(ctx cli.Context, podflag string, enforceSinglePod bool) (string, string, error) {
 	// If user passed --namespace, respect it. Else fallback to --istio-namespace (which is typically defaulted, to istio-system).
-	return getPodNameWithNamespace(ctx, podflag, model.GetOrDefault(ctx.Namespace(), ctx.IstioNamespace()))
+	return getPodNameWithNamespace(ctx, podflag, enforceSinglePod, model.GetOrDefault(ctx.Namespace(), ctx.IstioNamespace()))
 }
 
-func getPodNameWithNamespace(ctx cli.Context, podflag, ns string) (string, string, error) {
-	var podName, podNamespace string
+func getPodNameWithNamespace(ctx cli.Context, podflag string, enforceSinglePod bool, ns string) (string, string, error) {
+	if enforceSinglePod {
+		pods, podNamespace, err := ctx.InferPodsFromTypedResource(podflag, ns)
+		if err != nil {
+			return "", "", err
+		}
+		if len(pods) != 1 {
+			return "", "", fmt.Errorf("ztunnel pod name or --node must be set")
+		}
+		return pods[0], podNamespace, nil
+	}
 	podName, podNamespace, err := ctx.InferPodInfoFromTypedResource(podflag, ns)
 	if err != nil {
 		return "", "", err
@@ -536,8 +559,8 @@ func getPodNameWithNamespace(ctx cli.Context, podflag, ns string) (string, strin
 	return podName, podNamespace, nil
 }
 
-func setupZtunnelConfigDumpWriter(kubeClient kube.CLIClient, podName, podNamespace string, out io.Writer) (*ztunnelDump.ConfigWriter, error) {
-	debug, err := extractZtunnelConfigDump(kubeClient, podName, podNamespace)
+func setupZtunnelConfigDumpWriter(kubeClient kube.CLIClient, podName, podNamespace string, out io.Writer, port int) (*ztunnelDump.ConfigWriter, error) {
+	debug, err := extractZtunnelConfigDump(kubeClient, podName, podNamespace, port)
 	if err != nil {
 		return nil, err
 	}
@@ -561,9 +584,9 @@ func readFile(filename string) ([]byte, error) {
 	return io.ReadAll(file)
 }
 
-func extractZtunnelConfigDump(kubeClient kube.CLIClient, podName, podNamespace string) ([]byte, error) {
+func extractZtunnelConfigDump(kubeClient kube.CLIClient, podName, podNamespace string, port int) ([]byte, error) {
 	path := "config_dump"
-	debug, err := kubeClient.EnvoyDoWithPort(context.TODO(), podName, podNamespace, "GET", path, 15000)
+	debug, err := kubeClient.EnvoyDoWithPort(context.TODO(), podName, podNamespace, "GET", path, port)
 	if err != nil {
 		return nil, fmt.Errorf("failed to execute command on %s.%s Ztunnel: %v", podName, podNamespace, err)
 	}
@@ -587,7 +610,15 @@ func setupFileZtunnelConfigdumpWriter(filename string, out io.Writer) (*ztunnelD
 	return setupConfigdumpZtunnelConfigWriter(data, out)
 }
 
-func runConfigDump(ctx cli.Context, common *commonFlags, f func(cw *ztunnelDump.ConfigWriter) error) func(c *cobra.Command, args []string) error {
+// runConfigDump runs a function that acts on a configdump.
+// enforceSinglePod can be set for commands where we enforce a user to explicitly specify a pod. This should be 'true' when
+// the content is specific to a single Ztunnel pod, but 'false' if it is the same across all pods.
+func runConfigDump(
+	ctx cli.Context,
+	common *commonFlags,
+	enforceSinglePod bool,
+	f func(cw *ztunnelDump.ConfigWriter) error,
+) func(c *cobra.Command, args []string) error {
 	return func(c *cobra.Command, args []string) error {
 		var podName, podNamespace string
 		kubeClient, err := ctx.CLIClient()
@@ -601,7 +632,10 @@ func runConfigDump(ctx cli.Context, common *commonFlags, f func(cw *ztunnelDump.
 			lookup := "daemonset/ztunnel"
 			if len(args) > 0 {
 				lookup = args[0]
+				// If they explicitly asked for an unreliable container, allow it
+				enforceSinglePod = false
 			}
+			var targetWorkload *ztunnelDump.TargetWorkload
 			if common.node != "" {
 				nsn, err := PodOnNodeFromDaemonset(common.node, "ztunnel", ctx.IstioNamespace(), kubeClient)
 				if err != nil {
@@ -609,15 +643,36 @@ func runConfigDump(ctx cli.Context, common *commonFlags, f func(cw *ztunnelDump.
 				}
 				podName, podNamespace = nsn.Name, nsn.Namespace
 			} else {
-				if podName, podNamespace, err = getComponentPodName(ctx, lookup); err != nil {
+				if podName, podNamespace, err = getComponentPodName(ctx, lookup, enforceSinglePod); err != nil {
 					return err
 				}
 			}
 			ztunnelPod := ambientutil.IsZtunnelPod(kubeClient, podName, podNamespace)
 			if !ztunnelPod {
-				return fmt.Errorf("workloads command is only supported by Ztunnel proxies: %v", podName)
+				// The user targeted a workload pod, not a ztunnel. Resolve to the ztunnel
+				// on the same node and filter output to this workload.
+				workloadPod, podErr := kubeClient.Kube().CoreV1().Pods(podNamespace).Get(context.Background(), podName, metav1.GetOptions{})
+				if podErr != nil {
+					return fmt.Errorf("failed to get pod %s.%s: %v", podName, podNamespace, podErr)
+				}
+				nodeName := workloadPod.Spec.NodeName
+				if nodeName == "" {
+					return fmt.Errorf("pod %s.%s is not scheduled to a node", podName, podNamespace)
+				}
+				targetWorkload = &ztunnelDump.TargetWorkload{
+					Name:      podName,
+					Namespace: podNamespace,
+				}
+				nsn, nodeErr := PodOnNodeFromDaemonset(nodeName, "ztunnel", ctx.IstioNamespace(), kubeClient)
+				if nodeErr != nil {
+					return fmt.Errorf("failed to find ztunnel on node %s for pod %s.%s: %v", nodeName, podName, podNamespace, nodeErr)
+				}
+				podName, podNamespace = nsn.Name, nsn.Namespace
 			}
-			configWriter, err = setupZtunnelConfigDumpWriter(kubeClient, podName, podNamespace, c.OutOrStdout())
+			configWriter, err = setupZtunnelConfigDumpWriter(kubeClient, podName, podNamespace, c.OutOrStdout(), common.proxyAdminPort)
+			if err == nil && targetWorkload != nil {
+				configWriter.TargetWorkload = targetWorkload
+			}
 		}
 		if err != nil {
 			return err
@@ -671,7 +726,7 @@ type commonFlags struct {
 }
 
 func (c *commonFlags) attach(cmd *cobra.Command) {
-	cmd.PersistentFlags().IntVar(&c.proxyAdminPort, "proxy-admin-port", defaultProxyAdminPort, "Ztunnel proxy admin port")
+	cmd.PersistentFlags().IntVar(&c.proxyAdminPort, "proxy-admin-port", util.DefaultProxyAdminPort, "Ztunnel proxy admin port")
 	cmd.PersistentFlags().StringVarP(&c.outputFormat, "output", "o", summaryOutput, "Output format: one of json|yaml|short")
 	cmd.PersistentFlags().StringVar(&c.node, "node", "", "Filter workloads by node field")
 	cmd.PersistentFlags().StringVarP(&c.configDumpFile, "file", "f", "",
@@ -692,6 +747,9 @@ func (c *commonFlags) validateArgs(cmd *cobra.Command, args []string) error {
 	if set > 1 {
 		cmd.Println(cmd.UsageString())
 		return fmt.Errorf("at most one of --file, --node, or pod name must be passed")
+	}
+	if err := util.ValidatePort(c.proxyAdminPort); err != nil {
+		return err
 	}
 	return nil
 }

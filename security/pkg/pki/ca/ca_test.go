@@ -304,8 +304,7 @@ func TestCreateSelfSignedIstioCAReadSigningCertOnly(t *testing.T) {
 	}
 	signingCertPem := secret.Data[CACertFile]
 
-	ctx1, cancel1 := context.WithCancel(context.Background())
-	defer cancel1()
+	ctx1 := t.Context()
 	caopts, err := NewSelfSignedIstioCAOptions(ctx1, 0,
 		caCertTTL, defaultCertTTL, rootCertCheckInverval, maxCertTTL, org, false, false,
 		caNamespace, client.CoreV1(), rootCertFile, false, rsaKeySize)
@@ -411,7 +410,7 @@ func TestCreatePluggedCertCA(t *testing.T) {
 	defaultWorkloadCertTTL := 99999 * time.Hour
 	maxWorkloadCertTTL := time.Hour
 
-	caopts, err := NewPluggedCertIstioCAOptions(SigningCAFileBundle{rootCertFile, certChainFile, signingCertFile, signingKeyFile},
+	caopts, err := NewPluggedCertIstioCAOptions(SigningCAFileBundle{rootCertFile, certChainFile, signingCertFile, signingKeyFile, ""},
 		defaultWorkloadCertTTL, maxWorkloadCertTTL, rsaKeySize)
 	if err != nil {
 		t.Fatalf("Failed to create a plugged-cert CA Options: %v", err)
@@ -438,6 +437,64 @@ func TestCreatePluggedCertCA(t *testing.T) {
 	}
 	if !comparePem(rootCertBytes, rootCertFile) {
 		t.Errorf("Failed to verify loading of root cert pem.")
+	}
+
+	certChain, err := util.ParsePemEncodedCertificate(certChainBytes)
+	if err != nil {
+		t.Fatal("Failed to parse cert chain pem.")
+	}
+	// if CA cert becomes invalid before workload cert it's going to cause workload cert to be invalid too,
+	// however citatel won't rotate if that happens
+	delta := certChain.NotAfter.Sub(t0.Add(ca.defaultCertTTL))
+	if delta >= time.Second*2 {
+		t.Errorf("Invalid default cert TTL, should be the same as cert chain: %v VS (expected) %v",
+			t0.Add(ca.defaultCertTTL),
+			certChain.NotAfter)
+	}
+}
+
+func TestCreatePluggedCertCAWithCrl(t *testing.T) {
+	rootCertFile := "../testdata/crl/root-cert.pem"
+	certChainFile := []string{"../testdata/crl/cert-chain.pem"}
+	signingCertFile := "../testdata/crl/ca-cert.pem"
+	signingKeyFile := "../testdata/crl/ca-key.pem"
+	caCrlFile := "../testdata/crl/ca-crl.pem"
+
+	defaultWorkloadCertTTL := 99999 * time.Hour
+	maxWorkloadCertTTL := time.Hour
+
+	caopts, err := NewPluggedCertIstioCAOptions(
+		SigningCAFileBundle{rootCertFile, certChainFile, signingCertFile, signingKeyFile, caCrlFile},
+		defaultWorkloadCertTTL, maxWorkloadCertTTL, rsaKeySize,
+	)
+	if err != nil {
+		t.Fatalf("Failed to create a plugged-cert CA Options: %v", err)
+	}
+
+	t0 := time.Now()
+	ca, err := NewIstioCA(caopts)
+	if err != nil {
+		t.Errorf("Got error while creating plugged-cert CA: %v", err)
+	}
+	if ca == nil {
+		t.Fatal("Failed to create a plugged-cert CA.")
+	}
+
+	signingCertBytes, signingKeyBytes, certChainBytes, rootCertBytes := ca.GetCAKeyCertBundle().GetAllPem()
+	if !comparePem(signingCertBytes, signingCertFile) {
+		t.Errorf("Failed to verify loading of signing cert pem.")
+	}
+	if !comparePem(signingKeyBytes, signingKeyFile) {
+		t.Errorf("Failed to verify loading of signing key pem.")
+	}
+	if !comparePem(certChainBytes, certChainFile[0]) {
+		t.Errorf("Failed to verify loading of cert chain pem.")
+	}
+	if !comparePem(rootCertBytes, rootCertFile) {
+		t.Errorf("Failed to verify loading of root cert pem.")
+	}
+	if !comparePem(ca.GetCAKeyCertBundle().GetCRLPem(), caCrlFile) {
+		t.Errorf("Failed to verify loading of crl pem.")
 	}
 
 	certChain, err := util.ParsePemEncodedCertificate(certChainBytes)
@@ -610,6 +667,120 @@ func TestSignCSR(t *testing.T) {
 	}
 }
 
+// TestSignCSRWithTTLClamping verifies that the full IstioCA.Sign() path correctly clamps
+// leaf certificate TTL to the signing certificate's remaining validity when using a
+// short-lived CA.
+func TestSignCSRWithTTLClamping(t *testing.T) {
+	// Create a root CA with long TTL
+	rootCAOpts := util.CertOptions{
+		IsCA:         true,
+		IsSelfSigned: true,
+		TTL:          365 * 24 * time.Hour,
+		Org:          "Root CA",
+		RSAKeySize:   2048,
+	}
+	rootCertBytes, rootKeyBytes, err := util.GenCertKeyFromOptions(rootCAOpts)
+	if err != nil {
+		t.Fatalf("failed to generate root CA: %v", err)
+	}
+	rootCert, err := util.ParsePemEncodedCertificate(rootCertBytes)
+	if err != nil {
+		t.Fatalf("failed to parse root cert: %v", err)
+	}
+	rootKey, err := util.ParsePemEncodedKey(rootKeyBytes)
+	if err != nil {
+		t.Fatalf("failed to parse root key: %v", err)
+	}
+
+	// Create a short-lived intermediate CA with 1 hour validity
+	intermediateCAOpts := util.CertOptions{
+		IsCA:         true,
+		IsSelfSigned: false,
+		TTL:          1 * time.Hour,
+		Org:          "Intermediate CA",
+		RSAKeySize:   2048,
+		SignerCert:   rootCert,
+		SignerPriv:   rootKey,
+	}
+	intermediateCert, intermediateKey, err := util.GenCertKeyFromOptions(intermediateCAOpts)
+	if err != nil {
+		t.Fatalf("failed to generate intermediate CA: %v", err)
+	}
+
+	bundle, err := util.NewVerifiedKeyCertBundleFromPem(
+		intermediateCert, intermediateKey, intermediateCert, rootCertBytes, nil)
+	if err != nil {
+		t.Fatalf("failed to create key cert bundle: %v", err)
+	}
+
+	rootCertCheckInverval := time.Duration(0)
+	caOpts := &IstioCAOptions{
+		DefaultCertTTL: 1 * time.Hour,
+		MaxCertTTL:     2 * time.Hour, // Allow requesting longer TTLs to test clamping
+		KeyCertBundle:  bundle,
+		RotatorConfig: &SelfSignedCARootCertRotatorConfig{
+			CheckInterval: rootCertCheckInverval,
+		},
+	}
+
+	ca, err := NewIstioCA(caOpts)
+	if err != nil {
+		t.Fatalf("failed to create IstioCA: %v", err)
+	}
+
+	// Generate a CSR for a leaf certificate
+	leafCertOpts := util.CertOptions{
+		Host:       "spiffe://example.com/ns/test/sa/test",
+		RSAKeySize: 2048,
+		IsCA:       false,
+	}
+	csrPEM, keyPEM, err := util.GenCSR(leafCertOpts)
+	if err != nil {
+		t.Fatalf("failed to generate CSR: %v", err)
+	}
+
+	// Request a 2-hour TTL (longer than the 1-hour CA validity)
+	// The issued cert should be clamped to the CA's NotAfter
+	caCertOpts := CertOpts{
+		SubjectIDs: []string{"spiffe://example.com/ns/test/sa/test"},
+		TTL:        2 * time.Hour,
+		ForCA:      false,
+	}
+	certPEM, err := ca.Sign(csrPEM, caCertOpts)
+	if err != nil {
+		t.Fatalf("Sign() failed: %v", err)
+	}
+
+	// Parse the issued certificate
+	leafCert, err := util.ParsePemEncodedCertificate(certPEM)
+	if err != nil {
+		t.Fatalf("failed to parse issued certificate: %v", err)
+	}
+
+	// Parse the intermediate CA certificate to get its NotAfter
+	intermediateCACert, err := util.ParsePemEncodedCertificate(intermediateCert)
+	if err != nil {
+		t.Fatalf("failed to parse intermediate CA certificate: %v", err)
+	}
+
+	// Verify that the leaf cert NotAfter was actually clamped (equals intermediate CA NotAfter)
+	if !leafCert.NotAfter.Equal(intermediateCACert.NotAfter) {
+		t.Errorf("expected leaf cert NotAfter to be clamped to intermediate CA NotAfter (%v), got %v", intermediateCACert.NotAfter, leafCert.NotAfter)
+	}
+
+	// Verify the certificate is otherwise valid
+	_, _, certChainBytes, rootCertBytes := ca.GetCAKeyCertBundle().GetAll()
+	verifyFields := util.VerifyFields{
+		ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth, x509.ExtKeyUsageServerAuth},
+		KeyUsage:    x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,
+		IsCA:        false,
+		Host:        "spiffe://example.com/ns/test/sa/test",
+	}
+	if err := util.VerifyCertificate(keyPEM, append(certPEM, certChainBytes...), rootCertBytes, &verifyFields); err != nil {
+		t.Errorf("certificate verification failed: %v", err)
+	}
+}
+
 func TestAppendRootCerts(t *testing.T) {
 	root1 := "root-cert-1"
 	expRootCerts := `root-cert-1
@@ -648,7 +819,7 @@ func TestSignWithCertChain(t *testing.T) {
 	defaultWorkloadCertTTL := 30 * time.Minute
 	maxWorkloadCertTTL := time.Hour
 
-	caopts, err := NewPluggedCertIstioCAOptions(SigningCAFileBundle{rootCertFile, certChainFile, signingCertFile, signingKeyFile},
+	caopts, err := NewPluggedCertIstioCAOptions(SigningCAFileBundle{rootCertFile, certChainFile, signingCertFile, signingKeyFile, ""},
 		defaultWorkloadCertTTL, maxWorkloadCertTTL, rsaKeySize)
 	if err != nil {
 		t.Fatalf("Failed to create a plugged-cert CA Options: %v", err)
@@ -746,7 +917,7 @@ func TestGenKeyCert(t *testing.T) {
 	rsaKeySize := 2048
 
 	for id, tc := range cases {
-		caopts, err := NewPluggedCertIstioCAOptions(SigningCAFileBundle{tc.rootCertFile, tc.certChainFile, tc.signingCertFile, tc.signingKeyFile},
+		caopts, err := NewPluggedCertIstioCAOptions(SigningCAFileBundle{tc.rootCertFile, tc.certChainFile, tc.signingCertFile, tc.signingKeyFile, ""},
 			defaultWorkloadCertTTL, maxWorkloadCertTTL, rsaKeySize)
 		if err != nil {
 			t.Fatalf("%s: failed to create a plugged-cert CA Options: %v", id, err)
@@ -832,11 +1003,12 @@ func TestBuildSecret(t *testing.T) {
 }
 
 func createCA(maxTTL time.Duration, ecSigAlg util.SupportedECSignatureAlgorithms) (*IstioCA, error) {
-	// Generate root CA key and cert.
+	// Generate root CA key and cert. Use a TTL longer than the max leaf cert TTL
+	// requested in tests (30 days) so that TTL clamping does not interfere.
 	rootCAOpts := util.CertOptions{
 		IsCA:         true,
 		IsSelfSigned: true,
-		TTL:          time.Hour,
+		TTL:          60 * 24 * time.Hour,
 		Org:          "Root CA",
 		RSAKeySize:   2048,
 		ECSigAlg:     ecSigAlg,
@@ -860,7 +1032,7 @@ func createCA(maxTTL time.Duration, ecSigAlg util.SupportedECSignatureAlgorithms
 	intermediateCAOpts := util.CertOptions{
 		IsCA:         true,
 		IsSelfSigned: false,
-		TTL:          time.Hour,
+		TTL:          60 * 24 * time.Hour,
 		Org:          "Intermediate CA",
 		RSAKeySize:   2048,
 		SignerCert:   rootCert,
@@ -874,7 +1046,7 @@ func createCA(maxTTL time.Duration, ecSigAlg util.SupportedECSignatureAlgorithms
 	}
 
 	bundle, err := util.NewVerifiedKeyCertBundleFromPem(
-		intermediateCert, intermediateKey, intermediateCert, rootCertBytes)
+		intermediateCert, intermediateKey, intermediateCert, rootCertBytes, nil)
 	if err != nil {
 		return nil, err
 	}

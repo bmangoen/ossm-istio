@@ -16,15 +16,20 @@ package core
 
 import (
 	"fmt"
+	"net/netip"
 	"reflect"
 	"testing"
+	"time"
 
+	matcher "github.com/cncf/xds/go/xds/type/matcher/v3"
 	core "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
 	listener "github.com/envoyproxy/go-control-plane/envoy/config/listener/v3"
 	hcm "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/network/http_connection_manager/v3"
 	tls "github.com/envoyproxy/go-control-plane/envoy/extensions/transport_sockets/tls/v3"
+	"google.golang.org/protobuf/types/known/durationpb"
 	"google.golang.org/protobuf/types/known/structpb"
 	"google.golang.org/protobuf/types/known/wrapperspb"
+	"k8s.io/apimachinery/pkg/types"
 
 	meshconfig "istio.io/api/mesh/v1alpha1"
 	networking "istio.io/api/networking/v1alpha3"
@@ -32,15 +37,41 @@ import (
 	"istio.io/istio/pilot/pkg/model"
 	"istio.io/istio/pilot/pkg/networking/core/listenertest"
 	"istio.io/istio/pilot/pkg/networking/plugin/authz"
+	"istio.io/istio/pilot/pkg/networking/util"
+	"istio.io/istio/pilot/pkg/serviceregistry"
+	"istio.io/istio/pilot/pkg/serviceregistry/memory"
+	"istio.io/istio/pilot/pkg/serviceregistry/provider"
 	"istio.io/istio/pilot/test/xdstest"
 	"istio.io/istio/pkg/config"
+	"istio.io/istio/pkg/config/host"
+	"istio.io/istio/pkg/config/mesh"
 	"istio.io/istio/pkg/config/protocol"
 	"istio.io/istio/pkg/config/schema/gvk"
+	"istio.io/istio/pkg/network"
+	"istio.io/istio/pkg/slices"
 	"istio.io/istio/pkg/test"
 	"istio.io/istio/pkg/test/util/assert"
 	"istio.io/istio/pkg/util/protomarshal"
+	"istio.io/istio/pkg/util/sets"
 	"istio.io/istio/pkg/wellknown"
+	workloadapi "istio.io/istio/pkg/workloadapi"
 )
+
+// mockAmbientIndex is a test implementation of AmbientIndexes that returns mock service info
+type mockAmbientIndex struct {
+	model.NoopAmbientIndexes
+	serviceInfos []*model.ServiceInfo
+}
+
+func (m *mockAmbientIndex) ServiceInfo(key string) *model.ServiceInfo {
+	for _, info := range m.serviceInfos {
+		svcKey := fmt.Sprintf("%s/%s", info.GetNamespace(), info.Service.GetHostname())
+		if key == svcKey {
+			return info
+		}
+	}
+	return nil
+}
 
 func TestVirtualListenerBuilder(t *testing.T) {
 	cg := NewConfigGenTest(t, TestOptions{Services: testServices})
@@ -981,6 +1012,686 @@ func TestAdditionalAddressesForIPv6(t *testing.T) {
 		t.Fatal("didn't find virtual outbound listener")
 	}
 	if vo.AdditionalAddresses == nil || len(vo.AdditionalAddresses) != 1 {
-		t.Fatal("expected additional ipv4 bind addresse")
+		t.Fatal("expected additional ipv4 bind addresses")
+	}
+}
+
+func TestExtProcExistForInferencePoolEnabledGateway(t *testing.T) {
+	test.SetForTest(t, &features.EnableGatewayAPIInferenceExtension, true)
+
+	cg := NewConfigGenTest(t, TestOptions{
+		Services: testServices,
+	})
+	proxy := cg.SetupProxy(&model.Proxy{Labels: map[string]string{"gateway.networking.k8s.io/gateway-name": "foo-gateway"}, ConfigNamespace: "not-default"})
+	fakeGatewayController := model.FakeController{
+		GatewaysWithInferencePools: sets.New(types.NamespacedName{Name: "foo-gateway", Namespace: "not-default"}),
+	}
+	cg.env.PushContext().GatewayAPIController = fakeGatewayController
+
+	lstnrs := cg.Listeners(proxy)
+	vo := xdstest.ExtractListener("0.0.0.0_8080", lstnrs)
+	if vo == nil {
+		t.Fatal("didn't find virtual outbound listener")
+	}
+	for _, fc := range vo.GetFilterChains() {
+		_, httpFilters := xdstest.ExtractFilterNames(t, fc)
+		if slices.Contains(httpFilters, wellknown.HTTPExternalProcessing) {
+			return
+		}
+	}
+	t.Fatal("expected ext proc filter to be added")
+}
+
+func TestWaypointInternalMultiNetworkAddresses(t *testing.T) {
+	test.SetForTest(t, &features.EnableAmbient, true)
+	test.SetForTest(t, &features.EnableAmbientMultiNetwork, true)
+
+	testCases := []struct {
+		name           string
+		addresses      []*workloadapi.NetworkAddress
+		localVIPs      []string
+		scope          model.ServiceScope
+		proxyNetwork   string
+		proxyIPs       []string
+		expectedVIPs   []string
+		unexpectedVIPs []string
+	}{
+		{
+			name: "includes VIPs from same network",
+			addresses: []*workloadapi.NetworkAddress{
+				{Network: "network-a", Address: netip.MustParseAddr("10.0.0.1").AsSlice()},
+				{Network: "network-a", Address: netip.MustParseAddr("10.0.0.2").AsSlice()},
+			},
+			scope:        model.Global,
+			proxyNetwork: "network-a",
+			expectedVIPs: []string{"10.0.0.1", "10.0.0.2"},
+		},
+		{
+			name: "dual-stack same network gets all VIPs",
+			addresses: []*workloadapi.NetworkAddress{
+				{Network: "network-a", Address: netip.MustParseAddr("10.0.0.1").AsSlice()},
+				{Network: "network-a", Address: netip.MustParseAddr("fd00::1").AsSlice()},
+				{Network: "network-a", Address: netip.MustParseAddr("10.0.0.2").AsSlice()},
+				{Network: "network-a", Address: netip.MustParseAddr("fd00::2").AsSlice()},
+			},
+			scope:        model.Global,
+			proxyNetwork: "network-a",
+			proxyIPs:     []string{"10.244.0.1", "fd00::99"},
+			expectedVIPs: []string{"10.0.0.1", "10.0.0.2", "fd00::1", "fd00::2"},
+		},
+		{
+			name: "excludes VIPs from different network",
+			addresses: []*workloadapi.NetworkAddress{
+				{Network: "network-a", Address: netip.MustParseAddr("10.0.0.1").AsSlice()},
+				{Network: "network-b", Address: netip.MustParseAddr("10.96.0.1").AsSlice()},
+			},
+			scope:          model.Global,
+			proxyNetwork:   "network-a",
+			expectedVIPs:   []string{"10.0.0.1"},
+			unexpectedVIPs: []string{"10.96.0.1"},
+		},
+		{
+			name: "ipv4-only proxy filters ipv6 VIPs",
+			addresses: []*workloadapi.NetworkAddress{
+				{Network: "network-a", Address: netip.MustParseAddr("10.0.0.1").AsSlice()},
+				{Network: "network-a", Address: netip.MustParseAddr("fd00::1").AsSlice()},
+			},
+			scope:          model.Global,
+			proxyNetwork:   "network-a",
+			expectedVIPs:   []string{"10.0.0.1"},
+			unexpectedVIPs: []string{"fd00::1"},
+		},
+		{
+			name: "falls back to local cluster VIP when no addresses match network",
+			addresses: []*workloadapi.NetworkAddress{
+				{Network: "network-b", Address: netip.MustParseAddr("10.96.0.1").AsSlice()},
+			},
+			scope:          model.Global,
+			localVIPs:      []string{"10.0.0.1"},
+			proxyNetwork:   "network-a",
+			expectedVIPs:   []string{"10.0.0.1"},
+			unexpectedVIPs: []string{"10.96.0.1"},
+		},
+		{
+			name: "always includes local cluster VIP even if missing from ServiceInfo",
+			addresses: []*workloadapi.NetworkAddress{
+				{Network: "network-a", Address: netip.MustParseAddr("10.0.0.2").AsSlice()},
+			},
+			scope:        model.Global,
+			localVIPs:    []string{"10.0.0.1"},
+			proxyNetwork: "network-a",
+			expectedVIPs: []string{"10.0.0.1", "10.0.0.2"},
+		},
+		{
+			name: "local scope only uses local cluster VIPs",
+			addresses: []*workloadapi.NetworkAddress{
+				{Network: "network-a", Address: netip.MustParseAddr("10.0.0.1").AsSlice()},
+				{Network: "network-a", Address: netip.MustParseAddr("10.0.0.2").AsSlice()},
+			},
+			scope:          model.Local,
+			localVIPs:      []string{"10.0.0.1"},
+			proxyNetwork:   "network-a",
+			expectedVIPs:   []string{"10.0.0.1"},
+			unexpectedVIPs: []string{"10.0.0.2"},
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			svc := &model.Service{
+				Hostname: host.Name("svc.default.svc.cluster.local"),
+				Attributes: model.ServiceAttributes{
+					Name:      "svc",
+					Namespace: "default",
+				},
+				Ports: model.PortList{
+					&model.Port{
+						Name:     "tcp",
+						Port:     80,
+						Protocol: protocol.TCP,
+					},
+				},
+			}
+			if len(tc.localVIPs) > 0 {
+				svc.ClusterVIPs.SetAddressesFor("cluster-1", tc.localVIPs)
+			}
+
+			cg := NewConfigGenTest(t, TestOptions{
+				ClusterID: "cluster-1",
+				ServiceRegistries: []serviceregistry.Instance{
+					serviceregistry.Simple{
+						ProviderID:          provider.Kubernetes,
+						ClusterID:           "cluster-1",
+						DiscoveryController: memory.NewServiceDiscovery(svc),
+					},
+				},
+			})
+			cg.env.AmbientIndexes = &mockAmbientIndex{
+				serviceInfos: []*model.ServiceInfo{
+					{
+						Service: &workloadapi.Service{
+							Name:      svc.Attributes.Name,
+							Namespace: svc.Attributes.Namespace,
+							Hostname:  svc.Hostname.String(),
+							Addresses: tc.addresses,
+						},
+						Scope: tc.scope,
+					},
+				},
+			}
+
+			proxy := &model.Proxy{
+				Type:            model.Waypoint,
+				ConfigNamespace: "default",
+				Metadata: &model.NodeMetadata{
+					ClusterID: "cluster-1",
+					Network:   network.ID(tc.proxyNetwork),
+				},
+				IPAddresses: tc.proxyIPs,
+			}
+			proxy = cg.SetupProxy(proxy)
+
+			lb := &ListenerBuilder{
+				push: cg.PushContext(),
+				node: proxy,
+			}
+
+			l := lb.buildWaypointInternal(nil, []*model.Service{svc})
+			if l == nil {
+				t.Fatal("expected listener from buildWaypointInternal")
+			}
+
+			ipMatcher := extractIPMatcherFromListener(t, l)
+			if ipMatcher == nil {
+				t.Fatal("could not extract IP matcher from listener")
+			}
+
+			found := map[string]bool{}
+			for _, rm := range ipMatcher.RangeMatchers {
+				for _, r := range rm.Ranges {
+					found[r.AddressPrefix] = true
+				}
+			}
+
+			for _, expected := range tc.expectedVIPs {
+				if !found[expected] {
+					t.Errorf("expected VIP %q in IP matcher, got %v", expected, found)
+				}
+			}
+
+			for _, unexpected := range tc.unexpectedVIPs {
+				if found[unexpected] {
+					t.Errorf("unexpected VIP %q in IP matcher, got %v", unexpected, found)
+				}
+			}
+		})
+	}
+}
+
+func TestWaypointInternalServiceInfoNilFallback(t *testing.T) {
+	test.SetForTest(t, &features.EnableAmbient, true)
+	test.SetForTest(t, &features.EnableAmbientMultiNetwork, true)
+
+	cg := NewConfigGenTest(t, TestOptions{})
+	push := cg.PushContext()
+
+	svc := &model.Service{
+		Hostname: host.Name("svc.default.svc.cluster.local"),
+		Attributes: model.ServiceAttributes{
+			Namespace: "default",
+		},
+		Ports: model.PortList{
+			&model.Port{
+				Name:     "tcp",
+				Port:     80,
+				Protocol: protocol.TCP,
+			},
+		},
+	}
+	svc.ClusterVIPs.SetAddressesFor("cluster-1", []string{"10.0.0.1"})
+
+	// No Kubernetes registry with ServiceInfo set — ServiceInfo returns nil, should fall back to local cluster VIPs
+	proxy := &model.Proxy{
+		Type:            model.Waypoint,
+		ConfigNamespace: "default",
+		Metadata: &model.NodeMetadata{
+			ClusterID: "cluster-1",
+			Network:   "network-a",
+		},
+	}
+	proxy = cg.SetupProxy(proxy)
+
+	lb := &ListenerBuilder{
+		push: push,
+		node: proxy,
+	}
+
+	l := lb.buildWaypointInternal(nil, []*model.Service{svc})
+	if l == nil {
+		t.Fatal("expected listener from buildWaypointInternal")
+	}
+
+	ipMatcher := extractIPMatcherFromListener(t, l)
+	if ipMatcher == nil {
+		t.Fatal("could not extract IP matcher from listener")
+	}
+
+	found := map[string]bool{}
+	for _, rm := range ipMatcher.RangeMatchers {
+		for _, r := range rm.Ranges {
+			found[r.AddressPrefix] = true
+		}
+	}
+
+	if !found["10.0.0.1"] {
+		t.Errorf("expected local cluster VIP 10.0.0.1 in IP matcher, got %v", found)
+	}
+}
+
+func TestWaypointInternalAutoAllocatedIPs(t *testing.T) {
+	test.SetForTest(t, &features.EnableAmbient, true)
+	test.SetForTest(t, &features.EnableAmbientMultiNetwork, true)
+
+	svc := &model.Service{
+		Hostname: host.Name("fake-egress.example.com"),
+		Attributes: model.ServiceAttributes{
+			Namespace: "default",
+		},
+		AutoAllocatedIPv4Address: "240.240.0.1",
+		AutoAllocatedIPv6Address: "2001:2::f001",
+		Ports: model.PortList{
+			&model.Port{
+				Name:     "http",
+				Port:     80,
+				Protocol: protocol.HTTP,
+			},
+		},
+	}
+
+	cg := NewConfigGenTest(t, TestOptions{})
+
+	proxy := &model.Proxy{
+		Type:            model.Waypoint,
+		ConfigNamespace: "default",
+		Metadata: &model.NodeMetadata{
+			ClusterID: "cluster-1",
+			Network:   "network-a",
+		},
+		IPAddresses: []string{"10.244.0.1", "fd00::1"},
+	}
+	proxy = cg.SetupProxy(proxy)
+
+	lb := &ListenerBuilder{
+		push: cg.PushContext(),
+		node: proxy,
+	}
+
+	l := lb.buildWaypointInternal(nil, []*model.Service{svc})
+	if l == nil {
+		t.Fatal("expected listener from buildWaypointInternal")
+	}
+
+	ipMatcher := extractIPMatcherFromListener(t, l)
+	if ipMatcher == nil {
+		t.Fatal("could not extract IP matcher from listener")
+	}
+
+	found := map[string]bool{}
+	for _, rm := range ipMatcher.RangeMatchers {
+		for _, r := range rm.Ranges {
+			found[r.AddressPrefix] = true
+		}
+	}
+
+	if !found["240.240.0.1"] {
+		t.Errorf("expected auto-allocated IPv4 address in IP matcher, got %v", found)
+	}
+	if !found["2001:2::f001"] {
+		t.Errorf("expected auto-allocated IPv6 address in IP matcher, got %v", found)
+	}
+}
+
+// extractIPMatcherFromListener extracts the IPMatcher from a waypoint listener's filter chain matcher.
+func extractIPMatcherFromListener(t *testing.T, l *listener.Listener) *matcher.IPMatcher {
+	t.Helper()
+
+	if l.FilterChainMatcher == nil {
+		return nil
+	}
+
+	mt, ok := l.FilterChainMatcher.MatcherType.(*matcher.Matcher_MatcherTree_)
+	if !ok || mt.MatcherTree == nil {
+		return nil
+	}
+
+	// When ambient multi-network is enabled, hostnames are checked first (ExactMapMatch) and the IP matcher
+	// is nested under OnNoMatch.
+	var ipTree *matcher.Matcher_MatcherTree
+	switch mt.MatcherTree.TreeType.(type) {
+	case *matcher.Matcher_MatcherTree_CustomMatch:
+		ipTree = mt.MatcherTree
+	case *matcher.Matcher_MatcherTree_ExactMatchMap:
+		if l.FilterChainMatcher.OnNoMatch == nil {
+			return nil
+		}
+		sub, ok := l.FilterChainMatcher.OnNoMatch.OnMatch.(*matcher.Matcher_OnMatch_Matcher)
+		if !ok || sub.Matcher == nil {
+			return nil
+		}
+		nested, ok := sub.Matcher.MatcherType.(*matcher.Matcher_MatcherTree_)
+		if !ok || nested.MatcherTree == nil {
+			return nil
+		}
+		if _, ok := nested.MatcherTree.TreeType.(*matcher.Matcher_MatcherTree_CustomMatch); !ok {
+			return nil
+		}
+		ipTree = nested.MatcherTree
+	default:
+		return nil
+	}
+
+	typedCfg, ok := ipTree.TreeType.(*matcher.Matcher_MatcherTree_CustomMatch)
+	if !ok || typedCfg.CustomMatch == nil {
+		return nil
+	}
+
+	ipMatcher := &matcher.IPMatcher{}
+	if err := typedCfg.CustomMatch.TypedConfig.UnmarshalTo(ipMatcher); err != nil {
+		return nil
+	}
+
+	return ipMatcher
+}
+
+// TestWaypointInternalHeadlessServiceNoEmptyRanges verifies that a service
+// with no addresses (the shape headless services take on IPv6 clusters,
+// where constants.UnspecifiedIP gets filtered out by FilterAddressesByIPFamily)
+// does not produce an IPMatcher_IPRangeMatcher with an empty Ranges slice.
+// An empty Ranges violates the proto's repeated.min_items=1 rule and is
+// rejected by envoy. See https://github.com/istio/istio/issues/60310.
+func TestWaypointInternalHeadlessServiceNoEmptyRanges(t *testing.T) {
+	test.SetForTest(t, &features.EnableAmbient, true)
+
+	cg := NewConfigGenTest(t, TestOptions{})
+
+	// Headless service: no ClusterVIPs, no AutoAllocated address, no
+	// DefaultAddress. svcAddresses in buildWaypointInternal will be empty.
+	svc := &model.Service{
+		Hostname: host.Name("headless.default.svc.cluster.local"),
+		Attributes: model.ServiceAttributes{
+			Namespace: "default",
+		},
+		Ports: model.PortList{
+			&model.Port{
+				Name:     "http",
+				Port:     80,
+				Protocol: protocol.HTTP,
+			},
+		},
+	}
+
+	proxy := &model.Proxy{
+		Type:            model.Waypoint,
+		ConfigNamespace: "default",
+		Metadata: &model.NodeMetadata{
+			ClusterID: "cluster-1",
+			Network:   "network-a",
+		},
+	}
+	proxy = cg.SetupProxy(proxy)
+
+	lb := &ListenerBuilder{
+		push: cg.PushContext(),
+		node: proxy,
+	}
+
+	l := lb.buildWaypointInternal(nil, []*model.Service{svc})
+	if l == nil {
+		t.Fatal("expected listener from buildWaypointInternal")
+	}
+
+	// If an IPMatcher exists, none of its RangeMatchers may have empty Ranges.
+	if ipMatcher := extractIPMatcherFromListener(t, l); ipMatcher != nil {
+		for i, rm := range ipMatcher.RangeMatchers {
+			if len(rm.Ranges) == 0 {
+				t.Fatalf("IPMatcher.RangeMatchers[%d].Ranges is empty; envoy rejects this (proto min_items=1). "+
+					"Headless services must elide the IPRangeMatcher entry entirely.", i)
+			}
+		}
+	}
+}
+
+func TestPreserveHeader(t *testing.T) {
+	cg := NewConfigGenTest(t, TestOptions{
+		MeshConfig: &meshconfig.MeshConfig{
+			DefaultConfig: &meshconfig.ProxyConfig{
+				ProxyHeaders: &meshconfig.ProxyConfig_ProxyHeaders{
+					PreserveHttp1HeaderCase: wrapperspb.Bool(true),
+				},
+			},
+		},
+	})
+
+	push := cg.PushContext()
+	cases := []struct {
+		name       string
+		opts       *httpListenerOpts
+		isExpected func(*hcm.HttpConnectionManager) error
+	}{
+		{
+			name: "when preserve header case is enabled, http 1.0 settings should be preserved",
+			opts: &httpListenerOpts{
+				connectionManager: &hcm.HttpConnectionManager{
+					HttpProtocolOptions: &core.Http1ProtocolOptions{
+						AcceptHttp_10: true,
+					},
+				},
+			},
+			isExpected: func(httpConnManager *hcm.HttpConnectionManager) error {
+				if httpConnManager.HttpProtocolOptions == nil || !httpConnManager.HttpProtocolOptions.AcceptHttp_10 {
+					return fmt.Errorf("http 1.0 settings not preserved")
+				}
+				return nil
+			},
+		},
+	}
+
+	for _, tt := range cases {
+		t.Run(tt.name, func(t *testing.T) {
+			sidecarProxy := cg.SetupProxy(nil)
+			lb := &ListenerBuilder{
+				push:               push,
+				node:               sidecarProxy,
+				authzCustomBuilder: &authz.Builder{},
+				authzBuilder:       &authz.Builder{},
+			}
+			assert.NoError(t, tt.isExpected(lb.buildHTTPConnectionManager(tt.opts)))
+		})
+	}
+}
+
+func TestVirtualOutboundListenerAllowAnyDynamicDNS(t *testing.T) {
+	meshCfg := mesh.DefaultMeshConfig()
+	meshCfg.OutboundTrafficPolicy = &meshconfig.MeshConfig_OutboundTrafficPolicy{
+		Mode: meshconfig.MeshConfig_OutboundTrafficPolicy_ALLOW_ANY_DYNAMIC_DNS,
+	}
+	listeners := buildListeners(t, TestOptions{
+		Services:   testServices,
+		MeshConfig: meshCfg,
+	}, nil)
+
+	vo := xdstest.ExtractListener(model.VirtualOutboundListenerName, listeners)
+	if vo == nil {
+		t.Fatal("didn't find virtual outbound listener")
+	}
+
+	listenertest.VerifyListener(t, vo, listenertest.ListenerTest{
+		Filters: []string{wellknown.HTTPInspector},
+		FilterChains: []listenertest.FilterChainTest{
+			{Name: model.VirtualOutboundBlackholeFilterChainName},
+			{
+				Name:           model.VirtualOutboundCatchAllTCPFilterChainName + "-http",
+				NetworkFilters: []string{wellknown.HTTPConnectionManager},
+				HTTPFilters:    []string{"envoy.filters.http.dynamic_forward_proxy"},
+				ValidateHCM: func(t test.Failer, h *hcm.HttpConnectionManager) {
+					rc := h.GetRouteConfig()
+					if rc == nil || len(rc.VirtualHosts) == 0 || len(rc.VirtualHosts[0].Routes) == 0 {
+						t.Fatalf("expected catch-all route in HCM route config")
+					}
+					cluster := rc.VirtualHosts[0].Routes[0].GetRoute().GetCluster()
+					assert.Equal(t, cluster, util.AllowAnyDynamicDNSCluster)
+				},
+			},
+			{
+				Name:           model.VirtualOutboundCatchAllTCPFilterChainName,
+				NetworkFilters: []string{wellknown.TCPProxy},
+			},
+		},
+		TotalMatch: true,
+	})
+}
+
+func TestDFPHTTPFilterInjectedInOutboundHCM(t *testing.T) {
+	meshCfg := mesh.DefaultMeshConfig()
+	meshCfg.OutboundTrafficPolicy = &meshconfig.MeshConfig_OutboundTrafficPolicy{
+		Mode: meshconfig.MeshConfig_OutboundTrafficPolicy_ALLOW_ANY_DYNAMIC_DNS,
+	}
+	listeners := buildListeners(t, TestOptions{
+		Services:   testServices,
+		MeshConfig: meshCfg,
+	}, nil)
+
+	for _, l := range listeners {
+		if l.Name == model.VirtualOutboundListenerName || l.Name == model.VirtualInboundListenerName {
+			continue
+		}
+		for _, fc := range l.FilterChains {
+			for _, f := range fc.Filters {
+				if f.Name != wellknown.HTTPConnectionManager {
+					continue
+				}
+				hcmCfg := &hcm.HttpConnectionManager{}
+				if err := f.GetTypedConfig().UnmarshalTo(hcmCfg); err != nil {
+					t.Fatalf("failed to unmarshal HCM: %v", err)
+				}
+				foundDFP := false
+				for _, hf := range hcmCfg.HttpFilters {
+					if hf.Name == "envoy.filters.http.dynamic_forward_proxy" {
+						foundDFP = true
+						break
+					}
+				}
+				if !foundDFP {
+					t.Errorf("listener %s chain %s: expected DFP HTTP filter in outbound HCM", l.Name, fc.Name)
+				}
+			}
+		}
+	}
+}
+
+func TestBuildHTTPConnectionManagerWithConnectionSettings(t *testing.T) {
+	tests := []struct {
+		name          string
+		cs            *meshconfig.ProxyConfig_ConnectionSettings
+		nodeType      model.NodeType
+		pathNormalize *meshconfig.MeshConfig_ProxyPathNormalization
+		verify        func(t *testing.T, cm *hcm.HttpConnectionManager)
+	}{
+		{
+			name: "EDGE profile on gateway applies all defaults",
+			cs: &meshconfig.ProxyConfig_ConnectionSettings{
+				Profile: meshconfig.ProxyConfig_ConnectionSettings_EDGE,
+			},
+			nodeType: model.Router,
+			verify: func(t *testing.T, cm *hcm.HttpConnectionManager) {
+				assert.Equal(t, int64(300), cm.StreamIdleTimeout.GetSeconds())
+				assert.Equal(t, int64(300), cm.RequestTimeout.GetSeconds())
+				assert.Equal(t, int64(3600), cm.CommonHttpProtocolOptions.IdleTimeout.GetSeconds())
+				assert.Equal(t, true, cm.MergeSlashes)
+				assert.Equal(t, hcm.HttpConnectionManager_UNESCAPE_AND_REDIRECT, cm.PathWithEscapedSlashesAction)
+				assert.Equal(t, uint32(100), cm.Http2ProtocolOptions.MaxConcurrentStreams.GetValue())
+				assert.Equal(t, core.HttpProtocolOptions_REJECT_REQUEST, cm.CommonHttpProtocolOptions.HeadersWithUnderscoresAction)
+			},
+		},
+		{
+			name: "EDGE profile on sidecar does not apply defaults",
+			cs: &meshconfig.ProxyConfig_ConnectionSettings{
+				Profile: meshconfig.ProxyConfig_ConnectionSettings_EDGE,
+			},
+			nodeType: model.SidecarProxy,
+			verify: func(t *testing.T, cm *hcm.HttpConnectionManager) {
+				// StreamIdleTimeout should be the default 0s, not the EDGE 300s
+				assert.Equal(t, time.Duration(0), cm.StreamIdleTimeout.AsDuration())
+				assert.Equal(t, (*core.Http2ProtocolOptions)(nil), cm.Http2ProtocolOptions)
+			},
+		},
+		{
+			name: "explicit values on sidecar are applied",
+			cs: &meshconfig.ProxyConfig_ConnectionSettings{
+				Profile:               meshconfig.ProxyConfig_ConnectionSettings_SIDECAR,
+				HttpStreamIdleTimeout: durationpb.New(600 * time.Second),
+				HttpMergeSlashes:      &wrapperspb.BoolValue{Value: true},
+			},
+			nodeType: model.SidecarProxy,
+			verify: func(t *testing.T, cm *hcm.HttpConnectionManager) {
+				assert.Equal(t, int64(600), cm.StreamIdleTimeout.GetSeconds())
+				assert.Equal(t, true, cm.MergeSlashes)
+			},
+		},
+		{
+			name: "explicit overrides on gateway take precedence over EDGE defaults",
+			cs: &meshconfig.ProxyConfig_ConnectionSettings{
+				Profile:               meshconfig.ProxyConfig_ConnectionSettings_EDGE,
+				HttpStreamIdleTimeout: durationpb.New(120 * time.Second),
+				HttpMergeSlashes:      &wrapperspb.BoolValue{Value: false},
+			},
+			nodeType: model.Router,
+			verify: func(t *testing.T, cm *hcm.HttpConnectionManager) {
+				// Explicit override
+				assert.Equal(t, int64(120), cm.StreamIdleTimeout.GetSeconds())
+				assert.Equal(t, false, cm.MergeSlashes)
+				// EDGE defaults still applied for unset fields
+				assert.Equal(t, int64(3600), cm.CommonHttpProtocolOptions.IdleTimeout.GetSeconds())
+				assert.Equal(t, uint32(100), cm.Http2ProtocolOptions.MaxConcurrentStreams.GetValue())
+			},
+		},
+		{
+			name: "ConnectionSettings MergeSlashes=false overrides MeshConfig MERGE_SLASHES",
+			cs: &meshconfig.ProxyConfig_ConnectionSettings{
+				HttpMergeSlashes: &wrapperspb.BoolValue{Value: false},
+			},
+			nodeType: model.SidecarProxy,
+			pathNormalize: &meshconfig.MeshConfig_ProxyPathNormalization{
+				Normalization: meshconfig.MeshConfig_ProxyPathNormalization_MERGE_SLASHES,
+			},
+			verify: func(t *testing.T, cm *hcm.HttpConnectionManager) {
+				// MeshConfig sets MergeSlashes=true, but ConnectionSettings overrides to false
+				assert.Equal(t, false, cm.MergeSlashes)
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			mc := mesh.DefaultMeshConfig()
+			mc.DefaultConfig.ConnectionSettings = tt.cs
+			if tt.pathNormalize != nil {
+				mc.PathNormalization = tt.pathNormalize
+			}
+			cg := NewConfigGenTest(t, TestOptions{MeshConfig: mc})
+			proxy := cg.SetupProxy(nil)
+			proxy.Type = tt.nodeType
+			proxy.Metadata.ProxyConfig = nil // Force fallback to mesh default
+			push := cg.PushContext()
+			lb := &ListenerBuilder{
+				push:               push,
+				node:               proxy,
+				connectionSettings: resolveConnectionSettings(proxy, push),
+				authzCustomBuilder: &authz.Builder{},
+				authzBuilder:       &authz.Builder{},
+			}
+			cm := lb.buildHTTPConnectionManager(&httpListenerOpts{})
+			tt.verify(t, cm)
+		})
 	}
 }

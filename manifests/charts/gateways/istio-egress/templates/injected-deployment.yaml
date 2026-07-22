@@ -8,7 +8,7 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: {{ $gateway.name | default "istio-egressgateway" }}
-  namespace: {{ .Release.Namespace }}
+  namespace: {{ .Release.Namespace | quote }}
   labels:
 {{ $gateway.labels | toYaml | indent 4 }}
     release: {{ .Release.Name }}
@@ -98,9 +98,9 @@ spec:
         {{- end }}
           resources:
 {{- if $gateway.resources }}
-{{ toYaml $gateway.resources | indent 12 }}
+{{ include "istio-egress.resources" $gateway.resources | trim | indent 12 }}
 {{- else }}
-{{ toYaml .Values.global.defaultResources | indent 12 }}
+{{ include "istio-egress.resources" .Values.global.defaultResources | trim | indent 12 }}
 {{- end }}
           env:
           {{- if not $gateway.runAsRoot }}

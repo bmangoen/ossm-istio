@@ -26,9 +26,12 @@ import (
 	cluster "github.com/envoyproxy/go-control-plane/envoy/config/cluster/v3"
 	core "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
 	endpoint "github.com/envoyproxy/go-control-plane/envoy/config/endpoint/v3"
+	overridehost "github.com/envoyproxy/go-control-plane/envoy/extensions/load_balancing_policies/override_host/v3"
 	http "github.com/envoyproxy/go-control-plane/envoy/extensions/upstreams/http/v3"
+	xdstype "github.com/envoyproxy/go-control-plane/envoy/type/v3"
 	"github.com/google/go-cmp/cmp"
 	. "github.com/onsi/gomega"
+	. "github.com/onsi/gomega/gstruct"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/testing/protocmp"
 	"google.golang.org/protobuf/types/known/durationpb"
@@ -45,10 +48,12 @@ import (
 	v3 "istio.io/istio/pilot/pkg/xds/v3"
 	"istio.io/istio/pilot/test/xdstest"
 	"istio.io/istio/pkg/config"
+	"istio.io/istio/pkg/config/constants"
 	"istio.io/istio/pkg/config/host"
 	"istio.io/istio/pkg/config/protocol"
 	"istio.io/istio/pkg/config/schema/gvk"
 	"istio.io/istio/pkg/config/schema/kind"
+	"istio.io/istio/pkg/ptr"
 	"istio.io/istio/pkg/security"
 	"istio.io/istio/pkg/test"
 	"istio.io/istio/pkg/test/util/assert"
@@ -299,6 +304,170 @@ func TestConnectionPoolSettings(t *testing.T) {
 	}
 }
 
+func TestDefaultTrafficPolicy(t *testing.T) {
+	meshConnPool := &networking.ConnectionPoolSettings{
+		Tcp: &networking.ConnectionPoolSettings_TCPSettings{MaxConnections: 33},
+	}
+	meshOutlier := &networking.OutlierDetection{
+		Consecutive_5XxErrors: &wrappers.UInt32Value{Value: 7},
+	}
+	drConnPool := &networking.ConnectionPoolSettings{
+		Tcp: &networking.ConnectionPoolSettings_TCPSettings{MaxConnections: 99},
+	}
+
+	cases := map[string]struct {
+		defaultTrafficPolicy *meshconfig.MeshConfig_DefaultTrafficPolicy
+		destRule             *networking.DestinationRule
+		wantMaxConnections   uint32
+		wantOutlier          bool
+		// passthrough cluster connection pool is seeded from the baseline connectionPool only
+		wantPassthroughMaxConnections uint32
+	}{
+		"baseline applied with no destination rule": {
+			defaultTrafficPolicy: &meshconfig.MeshConfig_DefaultTrafficPolicy{
+				ConnectionPool:   meshConnPool,
+				OutlierDetection: meshOutlier,
+			},
+			destRule:                      &networking.DestinationRule{Host: "*.example.org"},
+			wantMaxConnections:            33,
+			wantOutlier:                   true,
+			wantPassthroughMaxConnections: 33,
+		},
+		"destination rule overrides connectionPool, inherits outlier": {
+			defaultTrafficPolicy: &meshconfig.MeshConfig_DefaultTrafficPolicy{
+				ConnectionPool:   meshConnPool,
+				OutlierDetection: meshOutlier,
+			},
+			destRule: &networking.DestinationRule{
+				Host:          "*.example.org",
+				TrafficPolicy: &networking.TrafficPolicy{ConnectionPool: drConnPool},
+			},
+			wantMaxConnections:            99,
+			wantOutlier:                   true,
+			wantPassthroughMaxConnections: 33,
+		},
+	}
+	for name, tt := range cases {
+		t.Run(name, func(t *testing.T) {
+			g := NewWithT(t)
+			mesh := testMesh()
+			mesh.DefaultTrafficPolicy = tt.defaultTrafficPolicy
+			clusters := xdstest.ExtractClusters(buildTestClusters(clusterTest{
+				t:               t,
+				serviceHostname: "*.example.org",
+				nodeType:        model.SidecarProxy,
+				mesh:            mesh,
+				destRule:        tt.destRule,
+			}))
+
+			outbound, ok := clusters["outbound|8080||*.example.org"]
+			g.Expect(ok).To(BeTrue())
+			g.Expect(outbound.CircuitBreakers.Thresholds[0].MaxConnections.GetValue()).To(Equal(tt.wantMaxConnections))
+			if tt.wantOutlier {
+				g.Expect(outbound.OutlierDetection).NotTo(BeNil())
+				g.Expect(outbound.OutlierDetection.Consecutive_5Xx.GetValue()).To(Equal(uint32(7)))
+			} else {
+				g.Expect(outbound.OutlierDetection).To(BeNil())
+			}
+
+			passthrough, ok := clusters[util.PassthroughCluster]
+			g.Expect(ok).To(BeTrue())
+			g.Expect(passthrough.CircuitBreakers.Thresholds[0].MaxConnections.GetValue()).
+				To(Equal(tt.wantPassthroughMaxConnections))
+		})
+	}
+}
+
+func TestBuildClustersForInferencePoolServices(t *testing.T) {
+	cases := []struct {
+		testName             string
+		clusterName          string
+		proxyType            model.NodeType
+		InferencePoolService bool
+	}{
+		// Add testcase for inbound clusters as well?
+		{
+			testName:             "InferencePool service should have override_host load_balancing policy",
+			clusterName:          "outbound|8080||*.example.org",
+			proxyType:            model.Router,
+			InferencePoolService: true,
+		},
+		{
+			testName:             "Regular service should NOT have override_host load_balancing policy",
+			clusterName:          "outbound|8080||*.example.org",
+			proxyType:            model.Router,
+			InferencePoolService: false,
+		},
+		// TODO(liorlieberman) change this once we make it work for sidecars as well
+		{
+			testName:             "Sidecar proxy should not have config",
+			clusterName:          "outbound|8080||*.example.org",
+			proxyType:            model.SidecarProxy,
+			InferencePoolService: true,
+		},
+		{
+			testName:             "InferencePool service creates single cluster for multiple ports",
+			clusterName:          "outbound|8080||*.example.org",
+			proxyType:            model.Router,
+			InferencePoolService: true,
+		},
+		{
+			testName:             "Regular service creates one cluster per port",
+			clusterName:          "outbound|8080||*.example.org",
+			proxyType:            model.Router,
+			InferencePoolService: false,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.testName, func(t *testing.T) {
+			g := NewWithT(t)
+			clusters := buildTestClusters(clusterTest{
+				t:                    t,
+				serviceHostname:      "*.example.org",
+				nodeType:             tc.proxyType,
+				mesh:                 testMesh(),
+				istioVersion:         model.MaxIstioVersion,
+				inferencePoolCluster: tc.InferencePoolService,
+			})
+			c := xdstest.ExtractCluster("outbound|8080||*.example.org", clusters)
+			if !tc.InferencePoolService || tc.InferencePoolService && tc.proxyType != model.Router {
+				if c.GetLoadBalancingPolicy() != nil && c.GetLoadBalancingPolicy().GetPolicies() != nil {
+					g.Expect(c.GetLoadBalancingPolicy().GetPolicies()).To(Not(ContainElement(
+						MatchFields(IgnoreExtras, Fields{
+							"TypedExtensionConfig": MatchFields(IgnoreExtras, Fields{
+								"Name": Equal("envoy.load_balancing_policies.override_host"),
+							}),
+						}),
+					)))
+				}
+			} else if tc.InferencePoolService {
+				g.Expect(c.LoadBalancingPolicy).NotTo(BeNil())
+				g.Expect(c.LoadBalancingPolicy.Policies).NotTo(BeEmpty())
+				overrideHostPolicy := new(overridehost.OverrideHost)
+				if err := c.LoadBalancingPolicy.Policies[0].GetTypedExtensionConfig().GetTypedConfig().UnmarshalTo(overrideHostPolicy); err != nil {
+					t.Errorf("couldn't unmarshal overrideHost proto: %v \n", err)
+				}
+				g.Expect(overrideHostPolicy.GetOverrideHostSources()).NotTo(BeEmpty())
+				g.Expect(overrideHostPolicy.GetOverrideHostSources()[0].GetMetadata().GetKey()).To(Equal("envoy.lb"))
+				g.Expect(overrideHostPolicy.GetOverrideHostSources()[0].GetMetadata().GetPath()[0].GetKey()).To(Equal("x-gateway-destination-endpoint"))
+				g.Expect(overrideHostPolicy.GetSelectedHostKey()).NotTo(BeNil())
+				g.Expect(overrideHostPolicy.GetSelectedHostKey().GetKey()).To(Equal("envoy.lb"))
+				g.Expect(overrideHostPolicy.GetSelectedHostKey().GetPath()[0].GetKey()).To(Equal("x-gateway-destination-endpoint-served"))
+				var serviceClusters []string
+				for _, c := range clusters {
+					if strings.Contains(c.Name, "*.example.org") && strings.HasPrefix(c.Name, "outbound|") {
+						serviceClusters = append(serviceClusters, c.Name)
+					}
+				}
+				g.Expect(len(serviceClusters)).To(Equal(1),
+					"expected single cluster but got %d: %v", len(serviceClusters), serviceClusters)
+				g.Expect(serviceClusters[0]).To(ContainSubstring("|8080|"),
+					"expected cluster to use first port 8080 but got %s", serviceClusters[0])
+			}
+		})
+	}
+}
+
 func TestCommonHttpProtocolOptions(t *testing.T) {
 	cases := []struct {
 		clusterName           string
@@ -405,6 +574,8 @@ type clusterTest struct {
 	meta         *model.NodeMetadata
 	istioVersion *model.IstioVersion
 	proxyIps     []string
+
+	inferencePoolCluster bool
 }
 
 func (c clusterTest) fillDefaults() clusterTest {
@@ -443,7 +614,12 @@ func buildTestClusters(c clusterTest) []*cluster.Cluster {
 		MeshExternal: c.externalService,
 		Attributes: model.ServiceAttributes{
 			Namespace: TestServiceNamespace,
+			Labels:    map[string]string{},
 		},
+	}
+
+	if c.inferencePoolCluster {
+		service.Attributes.Labels[constants.InternalServiceSemantics] = "inferencepool"
 	}
 
 	instances := []*model.ServiceInstance{
@@ -1276,25 +1452,16 @@ func TestStatNamePattern(t *testing.T) {
 		InboundClusterStatName:  "LocalService_%SERVICE%",
 		OutboundClusterStatName: "%SERVICE%_%SERVICE_PORT_NAME%_%SERVICE_PORT%",
 	}
-	enableDelimitedStatsTagValues := []bool{true, false}
 
-	for _, enableDelimitedStatsTagValue := range enableDelimitedStatsTagValues {
-		test.SetForTest(t, &features.EnableDelimitedStatsTagRegex, enableDelimitedStatsTagValue)
-		clusters := buildTestClusters(clusterTest{
-			t: t, serviceHostname: "*.example.org", serviceResolution: model.DNSLB, nodeType: model.SidecarProxy,
-			locality: &core.Locality{}, mesh: statConfigMesh,
-			destRule: &networking.DestinationRule{
-				Host: "*.example.org",
-			},
-		})
-		if enableDelimitedStatsTagValue {
-			g.Expect(xdstest.ExtractCluster("outbound|8080||*.example.org", clusters).AltStatName).To(Equal("*.example.org_default_8080;"))
-			g.Expect(xdstest.ExtractCluster("inbound|10001||", clusters).AltStatName).To(Equal("LocalService_*.example.org;"))
-		} else {
-			g.Expect(xdstest.ExtractCluster("outbound|8080||*.example.org", clusters).AltStatName).To(Equal("*.example.org_default_8080"))
-			g.Expect(xdstest.ExtractCluster("inbound|10001||", clusters).AltStatName).To(Equal("LocalService_*.example.org"))
-		}
-	}
+	clusters := buildTestClusters(clusterTest{
+		t: t, serviceHostname: "*.example.org", serviceResolution: model.DNSLB, nodeType: model.SidecarProxy,
+		locality: &core.Locality{}, mesh: statConfigMesh,
+		destRule: &networking.DestinationRule{
+			Host: "*.example.org",
+		},
+	})
+	g.Expect(xdstest.ExtractCluster("outbound|8080||*.example.org", clusters).AltStatName).To(Equal("*.example.org_default_8080;"))
+	g.Expect(xdstest.ExtractCluster("inbound|10001||", clusters).AltStatName).To(Equal("LocalService_*.example.org;"))
 }
 
 func TestDuplicateClusters(t *testing.T) {
@@ -1904,7 +2071,7 @@ func TestBuildInboundClustersPortLevelCircuitBreakerThresholds(t *testing.T) {
 				MaxRequests:        &wrappers.UInt32Value{Value: math.MaxUint32},
 				MaxConnections:     &wrappers.UInt32Value{Value: 100},
 				MaxPendingRequests: &wrappers.UInt32Value{Value: math.MaxUint32},
-				TrackRemaining:     true,
+				TrackRemaining:     false,
 			},
 		},
 		{
@@ -1937,7 +2104,7 @@ func TestBuildInboundClustersPortLevelCircuitBreakerThresholds(t *testing.T) {
 				MaxRequests:        &wrappers.UInt32Value{Value: math.MaxUint32},
 				MaxConnections:     &wrappers.UInt32Value{Value: 1000},
 				MaxPendingRequests: &wrappers.UInt32Value{Value: math.MaxUint32},
-				TrackRemaining:     true,
+				TrackRemaining:     false,
 			},
 		},
 	}
@@ -2396,6 +2563,11 @@ func TestApplyLoadBalancer(t *testing.T) {
 		discoveryType                      cluster.Cluster_DiscoveryType
 		port                               *model.Port
 		sendUnhealthyEndpoints             bool
+		defaultSendUnhealthyEndpoints      bool
+		presetPanicThreshold               *float64
+		expectedPanicThreshold             *float64
+		proxyLabels                        map[string]string
+		outlierDetection                   bool
 		expectedLbPolicy                   cluster.Cluster_LbPolicy
 		expectedLocalityWeightedConfig     bool
 		expectClusterLoadAssignmenttoBeNil bool
@@ -2452,6 +2624,42 @@ func TestApplyLoadBalancer(t *testing.T) {
 			expectedLbPolicy:               defaultLBAlgorithm(),
 			expectedLocalityWeightedConfig: false,
 		},
+		{
+			name: "Failover priority with nil wrapped endpoints should not panic",
+			lbSettings: &networking.LoadBalancerSettings{
+				LocalityLbSetting: &networking.LocalityLoadBalancerSetting{
+					Enabled: &wrappers.BoolValue{Value: true},
+					FailoverPriority: []string{
+						"topology.kubernetes.io/region",
+						"topology.kubernetes.io/zone",
+					},
+				},
+			},
+			discoveryType: cluster.Cluster_EDS,
+			port:          &model.Port{Protocol: protocol.HTTP},
+			proxyLabels: map[string]string{
+				"topology.kubernetes.io/region": "region1",
+				"topology.kubernetes.io/zone":   "zone1",
+			},
+			outlierDetection:               true,
+			expectedLbPolicy:               defaultLBAlgorithm(),
+			expectedLocalityWeightedConfig: true,
+		},
+		{
+			name:                          "DefaultSendUnhealthyEndpoints disables panic threshold when no outlier detection",
+			discoveryType:                 cluster.Cluster_EDS,
+			defaultSendUnhealthyEndpoints: true,
+			expectedLbPolicy:              defaultLBAlgorithm(),
+			expectedPanicThreshold:        ptr.Of(float64(0)),
+		},
+		{
+			name:                          "DefaultSendUnhealthyEndpoints does not override panic threshold set by outlier detection",
+			discoveryType:                 cluster.Cluster_EDS,
+			defaultSendUnhealthyEndpoints: true,
+			presetPanicThreshold:          ptr.Of(float64(70)),
+			expectedLbPolicy:              defaultLBAlgorithm(),
+			expectedPanicThreshold:        ptr.Of(float64(70)),
+		},
 		// TODO: add more to cover all cases
 	}
 
@@ -2463,11 +2671,19 @@ func TestApplyLoadBalancer(t *testing.T) {
 
 	for _, tt := range testcases {
 		t.Run(tt.name, func(t *testing.T) {
-			test.SetAtomicBoolForTest(t, features.SendUnhealthyEndpoints, tt.sendUnhealthyEndpoints)
+			test.SetAtomicBoolForTest(t, features.GlobalSendUnhealthyEndpoints, tt.sendUnhealthyEndpoints)
+			test.SetAtomicBoolForTest(t, features.DefaultSendUnhealthyEndpoints, tt.defaultSendUnhealthyEndpoints)
 			c := &cluster.Cluster{
 				ClusterDiscoveryType: &cluster.Cluster_Type{Type: tt.discoveryType},
 				LoadAssignment:       &endpoint.ClusterLoadAssignment{},
 				CommonLbConfig:       &cluster.Cluster_CommonLbConfig{},
+			}
+			if tt.presetPanicThreshold != nil {
+				c.CommonLbConfig.HealthyPanicThreshold = &xdstype.Percent{Value: *tt.presetPanicThreshold}
+			}
+
+			if tt.outlierDetection {
+				c.OutlierDetection = &cluster.OutlierDetection{}
 			}
 
 			if tt.discoveryType == cluster.Cluster_ORIGINAL_DST {
@@ -2478,14 +2694,21 @@ func TestApplyLoadBalancer(t *testing.T) {
 				test.SetForTest(t, &features.EnableRedisFilter, true)
 			}
 
-			applyLoadBalancer(c, tt.lbSettings, tt.port, proxy.Locality, nil, &meshconfig.MeshConfig{})
+			applyLoadBalancer(nil, c, tt.lbSettings, tt.port, proxy.Locality, tt.proxyLabels, &meshconfig.MeshConfig{}, nil, proxy.Type, "", false)
 
 			if c.LbPolicy != tt.expectedLbPolicy {
 				t.Errorf("cluster LbPolicy %s != expected %s", c.LbPolicy, tt.expectedLbPolicy)
 			}
 
 			if tt.sendUnhealthyEndpoints && c.CommonLbConfig.HealthyPanicThreshold.GetValue() != 0 {
-				t.Errorf("panic threshold should be disabled when sendHealthyEndpoints is enabeld")
+				t.Errorf("panic threshold should be disabled when sendHealthyEndpoints is enabled")
+			}
+			if tt.expectedPanicThreshold != nil {
+				if c.CommonLbConfig.HealthyPanicThreshold == nil {
+					t.Errorf("expected HealthyPanicThreshold=%v, got nil", *tt.expectedPanicThreshold)
+				} else if c.CommonLbConfig.HealthyPanicThreshold.Value != *tt.expectedPanicThreshold {
+					t.Errorf("expected HealthyPanicThreshold=%v, got %v", *tt.expectedPanicThreshold, c.CommonLbConfig.HealthyPanicThreshold.Value)
+				}
 			}
 
 			if tt.expectedLocalityWeightedConfig && c.CommonLbConfig.GetLocalityWeightedLbConfig() == nil {
@@ -3111,53 +3334,55 @@ func TestTelemetryMetadata(t *testing.T) {
 	}
 }
 
-func TestVerifyCertAtClient(t *testing.T) {
-	testCases := []struct {
-		name               string
-		policy             *networking.TrafficPolicy
-		expectedCARootPath string
-	}{
-		{
-			name: "Check that certs are verfied against the OS CA certificate bundle",
-			policy: &networking.TrafficPolicy{
-				ConnectionPool: &networking.ConnectionPoolSettings{
-					Http: &networking.ConnectionPoolSettings_HTTPSettings{
-						MaxRetries: 10,
-					},
-				},
-				Tls: &networking.ClientTLSSettings{
-					CaCertificates: "",
-				},
-			},
-			expectedCARootPath: "system",
-		},
-		{
-			name: "Check that CaCertificates has priority over OS CA certificate bundle",
-			policy: &networking.TrafficPolicy{
-				ConnectionPool: &networking.ConnectionPoolSettings{
-					Http: &networking.ConnectionPoolSettings_HTTPSettings{
-						MaxRetries: 10,
-					},
-				},
-				Tls: &networking.ClientTLSSettings{
-					CaCertificates: "file-root:certPath",
-				},
-			},
-			expectedCARootPath: "file-root:certPath",
-		},
+// applyConfigDiff applies the difference between prevConfigs and configs to the store.
+func applyConfigDiff(t *testing.T, cg *ConfigGenTest, prevConfigs, configs []config.Config) {
+	t.Helper()
+	type key struct {
+		gvk       config.GroupVersionKind
+		name      string
+		namespace string
+	}
+	prevMap := make(map[key]config.Config, len(prevConfigs))
+	for _, cfg := range prevConfigs {
+		prevMap[key{cfg.GroupVersionKind, cfg.Name, cfg.Namespace}] = cfg
+	}
+	for _, cfg := range configs {
+		key := key{cfg.GroupVersionKind, cfg.Name, cfg.Namespace}
+		if prevCfg, exists := prevMap[key]; !exists {
+			cg.Store().Create(cfg)
+		} else if !prevCfg.Equals(&cfg) {
+			cg.Store().Update(cfg)
+		}
+		delete(prevMap, key)
+	}
+	for _, cfg := range prevMap {
+		cg.Store().Delete(cfg.GroupVersionKind, cfg.Name, cfg.Namespace, nil)
 	}
 
-	for _, testCase := range testCases {
-		t.Run(testCase.name, func(t *testing.T) {
-			selectTrafficPolicyComponents(testCase.policy)
-			if testCase.policy.Tls.CaCertificates != testCase.expectedCARootPath {
-				t.Errorf("%v got %v when expecting %v", testCase.name, testCase.policy.Tls.CaCertificates, testCase.expectedCARootPath)
-			}
-		})
+	// Wait for VS controller to process changes
+	hasVses := false
+	for _, cfg := range configs {
+		if cfg.GroupVersionKind == gvk.VirtualService {
+			hasVses = true
+			// ensure VS Controller is up to date
+			assert.EventuallyEqual(t, func() config.Spec {
+				c := cg.env.VirtualServiceController.Collection().GetKey(cfg.NamespacedName().String())
+				if c == nil {
+					return nil
+				}
+				return c.Spec
+			}, cfg.Spec)
+		}
+	}
+	if !hasVses {
+		assert.EventuallyEqual(t, func() int {
+			return len(cg.env.VirtualServiceController.MergedVirtualServices())
+		}, 0)
 	}
 }
 
 func TestBuildDeltaClusters(t *testing.T) {
+	proxyNamespace := "foo"
 	testService1 := &model.Service{
 		Hostname: host.Name("test.com"),
 		Ports: []*model.Port{
@@ -3357,6 +3582,95 @@ func TestBuildDeltaClusters(t *testing.T) {
 				ClientCertificate: "/defaultCert.pem",
 				PrivateKey:        "/defaultPrivateKey.pem",
 				CaCertificates:    "/defaultCaCert.pem",
+			},
+		},
+	}
+
+	sidecarWithEgressHosts := &networking.Sidecar{
+		Egress: []*networking.IstioEgressListener{
+			{
+				Hosts: []string{"bar/test.com"},
+			},
+		},
+	}
+
+	sidecarWithEgressHostsUpdated := &networking.Sidecar{
+		Egress: []*networking.IstioEgressListener{
+			{
+				Hosts: []string{"bar/testnew.com"},
+			},
+		},
+	}
+
+	fooService := &model.Service{
+		Hostname: host.Name("foo.com"),
+		Ports: []*model.Port{
+			{
+				Name:     "default",
+				Port:     8080,
+				Protocol: protocol.HTTP,
+			},
+		},
+		Resolution:   model.ClientSideLB,
+		MeshExternal: false,
+		Attributes: model.ServiceAttributes{
+			Namespace: proxyNamespace,
+		},
+	}
+
+	sidecarWithEgressHostsNamespace := &networking.Sidecar{
+		Egress: []*networking.IstioEgressListener{
+			{
+				Hosts: []string{"foo/*"},
+			},
+		},
+	}
+
+	virtualServiceOriginal := &networking.VirtualService{
+		Hosts: []string{"*.com"},
+		Http: []*networking.HTTPRoute{
+			{
+				Route: []*networking.HTTPRouteDestination{
+					{
+						Destination: &networking.Destination{
+							Host: "foo.com",
+						},
+						Weight: 100,
+					},
+				},
+			},
+		},
+	}
+
+	virtualServiceDestinationUpdated := &networking.VirtualService{
+		Hosts: []string{"*.com"},
+		Http: []*networking.HTTPRoute{
+			{
+				Route: []*networking.HTTPRouteDestination{
+					{
+						Destination: &networking.Destination{
+							Host: "test.com",
+						},
+						Weight: 100,
+					},
+				},
+			},
+		},
+	}
+
+	virtualServiceSubsetDestination := &networking.VirtualService{
+		Hosts: []string{"*.com"},
+		Http: []*networking.HTTPRoute{
+			{
+				Route: []*networking.HTTPRouteDestination{
+					{
+						Destination: &networking.Destination{
+							Host:   "test.com",
+							Subset: "subset-1",
+						},
+						Weight: 100,
+					},
+				},
 			},
 		},
 	}
@@ -3598,9 +3912,335 @@ func TestBuildDeltaClusters(t *testing.T) {
 			},
 		},
 		{
+			name: "sidecar",
+			configs: []config.Config{{
+				Meta: config.Meta{
+					GroupVersionKind: gvk.Sidecar,
+					Name:             "default",
+					Namespace:        proxyNamespace,
+				},
+				Spec: sidecarWithEgressHosts,
+			}},
+			services:             []*model.Service{testService1, testService2},
+			configUpdated:        sets.New(model.ConfigKey{Kind: kind.Sidecar, Name: "default", Namespace: proxyNamespace}),
+			watchedResourceNames: []string{"outbound|8080||test.com"},
+			usedDelta:            true,
+			removedClusters:      nil,
+			expectedClusters: []string{
+				"BlackHoleCluster", "InboundPassthroughCluster", "PassthroughCluster",
+			},
+		},
+		{
+			name: "sidecar update changing service selection",
+			prevConfigs: []config.Config{{
+				Meta: config.Meta{
+					GroupVersionKind: gvk.Sidecar,
+					Name:             "default",
+					Namespace:        proxyNamespace,
+				},
+				Spec: sidecarWithEgressHosts,
+			}},
+			configs: []config.Config{{
+				Meta: config.Meta{
+					GroupVersionKind: gvk.Sidecar,
+					Name:             "default",
+					Namespace:        proxyNamespace,
+				},
+				Spec: sidecarWithEgressHostsUpdated,
+			}},
+			services:             []*model.Service{testService1, testService2},
+			configUpdated:        sets.New(model.ConfigKey{Kind: kind.Sidecar, Name: "default", Namespace: proxyNamespace}),
+			watchedResourceNames: []string{"outbound|8080||test.com"},
+			usedDelta:            true,
+			removedClusters:      []string{"outbound|8080||test.com"},
+			expectedClusters: []string{
+				"BlackHoleCluster", "InboundPassthroughCluster", "PassthroughCluster",
+				"outbound|8080||testnew.com",
+			},
+		},
+		{
+			name:                 "peer authentication config update on service namespace",
+			services:             []*model.Service{testService1, testService2},
+			configUpdated:        sets.New(model.ConfigKey{Kind: kind.PeerAuthentication, Name: "test.com", Namespace: TestServiceNamespace}),
+			watchedResourceNames: []string{"outbound|7070||test.com"},
+			usedDelta:            true,
+			removedClusters:      nil,
+			expectedClusters: []string{
+				"BlackHoleCluster", "InboundPassthroughCluster", "PassthroughCluster",
+				"outbound|8080||test.com", "outbound|8080||testnew.com",
+			},
+		},
+		{
+			name:                 "peer authentication config update on non-service namespace",
+			services:             []*model.Service{testService1, testService2},
+			configUpdated:        sets.New(model.ConfigKey{Kind: kind.PeerAuthentication, Name: "test.com", Namespace: proxyNamespace}),
+			watchedResourceNames: []string{"outbound|7070||test.com"},
+			usedDelta:            true,
+			removedClusters:      nil,
+			expectedClusters: []string{
+				"BlackHoleCluster", "InboundPassthroughCluster", "PassthroughCluster",
+			},
+		},
+		{
+			name:                 "global peer authentication config update",
+			services:             []*model.Service{testService1, testService2},
+			configUpdated:        sets.New(model.ConfigKey{Kind: kind.PeerAuthentication, Name: "test.com", Namespace: "istio-system"}),
+			watchedResourceNames: []string{"outbound|7070||test.com"},
+			usedDelta:            false,
+			removedClusters:      nil,
+			expectedClusters: []string{
+				"BlackHoleCluster", "InboundPassthroughCluster", "PassthroughCluster",
+				"outbound|8080||test.com", "outbound|8080||testnew.com",
+			},
+		},
+		{
+			name:     "virtual service is updated targeting an unselected service",
+			services: []*model.Service{testService1, testService2, fooService},
+			prevConfigs: []config.Config{{
+				Meta: config.Meta{
+					GroupVersionKind: gvk.Sidecar,
+					Name:             "default",
+					Namespace:        proxyNamespace,
+				},
+				Spec: sidecarWithEgressHostsNamespace,
+			}, {
+				Meta: config.Meta{
+					GroupVersionKind: gvk.VirtualService,
+					Name:             "test-virtualservice",
+					Namespace:        proxyNamespace,
+				},
+				Spec: virtualServiceOriginal,
+			}},
+			// we change the virtual service from referencing a sidecar egress hosts selected service
+			// to referencing an unselected service, it should be imported and pushed.
+			configs: []config.Config{{
+				Meta: config.Meta{
+					GroupVersionKind: gvk.Sidecar,
+					Name:             "default",
+					Namespace:        proxyNamespace,
+				},
+				Spec: sidecarWithEgressHostsNamespace,
+			}, {
+				Meta: config.Meta{
+					GroupVersionKind: gvk.VirtualService,
+					Name:             "test-virtualservice",
+					Namespace:        proxyNamespace,
+				},
+				Spec: virtualServiceDestinationUpdated,
+			}},
+			configUpdated:        sets.New(model.ConfigKey{Kind: kind.VirtualService, Name: "test-virtualservice", Namespace: proxyNamespace}),
+			watchedResourceNames: []string{"outbound|8080||foo.com"},
+			usedDelta:            true,
+			// foo.com is no removed because it's always imported by the sidecar
+			removedClusters: []string{},
+			expectedClusters: []string{
+				"BlackHoleCluster", "InboundPassthroughCluster", "PassthroughCluster", "outbound|8080||test.com",
+			},
+		},
+		{
+			name:     "virtual service is updated targeting an unselected service with subsets",
+			services: []*model.Service{testService1, testService2, fooService},
+			prevConfigs: []config.Config{{
+				Meta: config.Meta{
+					GroupVersionKind: gvk.Sidecar,
+					Name:             "default",
+					Namespace:        proxyNamespace,
+				},
+				Spec: sidecarWithEgressHostsNamespace,
+			}, {
+				Meta: config.Meta{
+					GroupVersionKind: gvk.VirtualService,
+					Name:             "test-virtualservice",
+					Namespace:        proxyNamespace,
+				},
+				Spec: virtualServiceOriginal,
+			}, {
+				Meta: config.Meta{
+					GroupVersionKind: gvk.DestinationRule,
+					Name:             "test-destinationrule",
+					Namespace:        TestServiceNamespace,
+				},
+				Spec: destRuleWithNewSubsets,
+			}},
+			// we change the virtual service from referencing a sidecar egress hosts selected service
+			// to referencing an unselected service, it should be imported and pushed.
+			configs: []config.Config{{
+				Meta: config.Meta{
+					GroupVersionKind: gvk.Sidecar,
+					Name:             "default",
+					Namespace:        proxyNamespace,
+				},
+				Spec: sidecarWithEgressHostsNamespace,
+			}, {
+				Meta: config.Meta{
+					GroupVersionKind: gvk.VirtualService,
+					Name:             "test-virtualservice",
+					Namespace:        proxyNamespace,
+				},
+				Spec: virtualServiceDestinationUpdated,
+			}, {
+				Meta: config.Meta{
+					GroupVersionKind: gvk.DestinationRule,
+					Name:             "test-destinationrule",
+					Namespace:        TestServiceNamespace,
+				},
+				Spec: destRuleWithNewSubsets,
+			}},
+			configUpdated:        sets.New(model.ConfigKey{Kind: kind.VirtualService, Name: "test-virtualservice", Namespace: proxyNamespace}),
+			watchedResourceNames: []string{"outbound|8080||foo.com"},
+			usedDelta:            true,
+			// foo.com is no removed because it's always imported by the sidecar
+			removedClusters: []string{},
+			expectedClusters: []string{
+				"BlackHoleCluster", "InboundPassthroughCluster", "PassthroughCluster",
+				"outbound|8080|subset-1|test.com",
+				"outbound|8080|subset-2|test.com",
+				"outbound|8080||test.com",
+			},
+		},
+		{
+			name:     "virtual service is updated with destination changed to subset",
+			services: []*model.Service{testService1, testService2},
+			configs: []config.Config{{
+				Meta: config.Meta{
+					GroupVersionKind: gvk.Sidecar,
+					Name:             "default",
+					Namespace:        proxyNamespace,
+				},
+				Spec: sidecarWithEgressHostsNamespace,
+			}, {
+				Meta: config.Meta{
+					GroupVersionKind: gvk.VirtualService,
+					Name:             "test-virtualservice",
+					Namespace:        proxyNamespace,
+				},
+				Spec: virtualServiceDestinationUpdated,
+			}, {
+				Meta: config.Meta{
+					GroupVersionKind: gvk.DestinationRule,
+					Name:             "test-destinationrule",
+					Namespace:        TestServiceNamespace,
+				},
+				Spec: destRuleWithNewSubsets,
+			}},
+			prevConfigs: []config.Config{{
+				Meta: config.Meta{
+					GroupVersionKind: gvk.Sidecar,
+					Name:             "default",
+					Namespace:        proxyNamespace,
+				},
+				Spec: sidecarWithEgressHostsNamespace,
+			}, {
+				Meta: config.Meta{
+					GroupVersionKind: gvk.VirtualService,
+					Name:             "test-virtualservice",
+					Namespace:        proxyNamespace,
+				},
+				Spec: virtualServiceSubsetDestination,
+			}, {
+				Meta: config.Meta{
+					GroupVersionKind: gvk.DestinationRule,
+					Name:             "test-destinationrule",
+					Namespace:        TestServiceNamespace,
+				},
+				Spec: destRuleWithNewSubsets,
+			}},
+			configUpdated: sets.New(model.ConfigKey{Kind: kind.VirtualService, Name: "test-virtualservice", Namespace: proxyNamespace}),
+			// as per previous case, we already tracked all service subsets
+			watchedResourceNames: []string{"outbound|8080|subset-1|test.com", "outbound|8080|subset-2|test.com", "outbound|8080||test.com"},
+			usedDelta:            true,
+			removedClusters:      nil,
+			// nothing needs to be pushed
+			expectedClusters: []string{
+				"BlackHoleCluster", "InboundPassthroughCluster", "PassthroughCluster",
+			},
+		},
+		{
+			name:     "virtual service is removed",
+			services: []*model.Service{testService1, testService2},
+			prevConfigs: []config.Config{{
+				Meta: config.Meta{
+					GroupVersionKind: gvk.Sidecar,
+					Name:             "default",
+					Namespace:        proxyNamespace,
+				},
+				Spec: sidecarWithEgressHostsNamespace,
+			}, {
+				Meta: config.Meta{
+					GroupVersionKind: gvk.VirtualService,
+					Name:             "test-virtualservice",
+					Namespace:        proxyNamespace,
+				},
+				Spec: virtualServiceDestinationUpdated,
+			}},
+			configs: []config.Config{{
+				Meta: config.Meta{
+					GroupVersionKind: gvk.Sidecar,
+					Name:             "default",
+					Namespace:        proxyNamespace,
+				},
+				Spec: sidecarWithEgressHostsNamespace,
+			}},
+			configUpdated:        sets.New(model.ConfigKey{Kind: kind.VirtualService, Name: "test-virtualservice", Namespace: proxyNamespace}),
+			watchedResourceNames: []string{"outbound|8080||test.com"},
+			usedDelta:            true,
+			removedClusters:      []string{"outbound|8080||test.com"},
+			expectedClusters: []string{
+				"BlackHoleCluster", "InboundPassthroughCluster", "PassthroughCluster",
+			},
+		},
+		{
+			name:     "virtual service targeting service with subsets is removed",
+			services: []*model.Service{testService1, testService2},
+			prevConfigs: []config.Config{{
+				Meta: config.Meta{
+					GroupVersionKind: gvk.Sidecar,
+					Name:             "default",
+					Namespace:        proxyNamespace,
+				},
+				Spec: sidecarWithEgressHostsNamespace,
+			}, {
+				Meta: config.Meta{
+					GroupVersionKind: gvk.VirtualService,
+					Name:             "test-virtualservice",
+					Namespace:        proxyNamespace,
+				},
+				Spec: virtualServiceDestinationUpdated,
+			}, {
+				Meta: config.Meta{
+					GroupVersionKind: gvk.DestinationRule,
+					Name:             "test-destinationrule",
+					Namespace:        TestServiceNamespace,
+				},
+				Spec: destRuleWithNewSubsets,
+			}},
+			configs: []config.Config{{
+				Meta: config.Meta{
+					GroupVersionKind: gvk.Sidecar,
+					Name:             "default",
+					Namespace:        proxyNamespace,
+				},
+				Spec: sidecarWithEgressHostsNamespace,
+			}, {
+				Meta: config.Meta{
+					GroupVersionKind: gvk.DestinationRule,
+					Name:             "test-destinationrule",
+					Namespace:        TestServiceNamespace,
+				},
+				Spec: destRuleWithNewSubsets,
+			}},
+			configUpdated:        sets.New(model.ConfigKey{Kind: kind.VirtualService, Name: "test-virtualservice", Namespace: proxyNamespace}),
+			watchedResourceNames: []string{"outbound|8080|subset-1|test.com", "outbound|8080|subset-2|test.com", "outbound|8080||test.com"},
+			usedDelta:            true,
+			removedClusters:      []string{"outbound|8080|subset-1|test.com", "outbound|8080|subset-2|test.com", "outbound|8080||test.com"},
+			expectedClusters: []string{
+				"BlackHoleCluster", "InboundPassthroughCluster", "PassthroughCluster",
+			},
+		},
+		{
 			name:                 "config update that is not delta aware",
 			services:             []*model.Service{testService1, testService2},
-			configUpdated:        sets.New(model.ConfigKey{Kind: kind.VirtualService, Name: "test.com", Namespace: TestServiceNamespace}),
+			configUpdated:        sets.New(model.ConfigKey{Kind: kind.EnvoyFilter, Name: "test.com", Namespace: TestServiceNamespace}),
 			watchedResourceNames: []string{"outbound|7070||test.com"},
 			usedDelta:            false,
 			removedClusters:      nil,
@@ -3613,18 +4253,811 @@ func TestBuildDeltaClusters(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
+			configs := tc.configs
+			if tc.prevConfigs != nil {
+				configs = tc.prevConfigs
+			}
 			cg := NewConfigGenTest(t, TestOptions{
 				Services:  tc.services,
 				Instances: tc.instances,
-				Configs:   tc.configs,
+				Configs:   configs,
 			})
-			proxy := cg.SetupProxy(&model.Proxy{IPAddresses: []string{"127.0.0.1"}})
+			proxy := cg.SetupProxy(&model.Proxy{
+				IPAddresses:     []string{"127.0.0.1"},
+				ConfigNamespace: proxyNamespace,
+			})
 			if tc.prevConfigs != nil {
-				proxy.PrevSidecarScope = &model.SidecarScope{}
-				proxy.PrevSidecarScope.SetDestinationRulesForTesting(tc.prevConfigs)
+				applyConfigDiff(t, cg, tc.prevConfigs, tc.configs)
+				pc := model.NewPushContext()
+				pc.InitContext(cg.env, nil, nil)
+				cg.env.SetPushContext(pc)
+				proxy.SetSidecarScope(cg.env.PushContext())
 			}
 			clusters, removed, delta := cg.DeltaClusters(proxy, tc.configUpdated,
-				&model.WatchedResource{ResourceNames: tc.watchedResourceNames})
+				&model.WatchedResource{ResourceNames: sets.New(tc.watchedResourceNames...)})
+			if delta != tc.usedDelta {
+				t.Errorf("un expected delta, want %v got %v", tc.usedDelta, delta)
+			}
+			assert.Equal(t, removed, tc.removedClusters)
+			assert.Equal(t, xdstest.MapKeys(xdstest.ExtractClusters(clusters)), tc.expectedClusters)
+			assert.Equal(t, len(cg.env.PushContext().GetMetric(model.DuplicatedClusters.Name())), 0)
+		})
+	}
+}
+
+func TestBuildDeltaClustersForFilteredGateway(t *testing.T) {
+	test.SetForTest(t, &features.FilterGatewayClusterConfig, true)
+	test.SetForTest(t, &features.EnableHBONESend, false)
+	proxyNamespace := "foo"
+	gatewayName := proxyNamespace + "/test-gateway"
+
+	testService1 := &model.Service{
+		Hostname: host.Name("test.com"),
+		Ports: []*model.Port{
+			{
+				Name:     "default",
+				Port:     8080,
+				Protocol: protocol.HTTP,
+			},
+		},
+		Resolution:   model.ClientSideLB,
+		MeshExternal: false,
+		Attributes: model.ServiceAttributes{
+			Namespace: TestServiceNamespace,
+		},
+	}
+
+	testService2 := &model.Service{
+		Hostname: host.Name("testnew.com"),
+		Ports: []*model.Port{
+			{
+				Name:     "default",
+				Port:     8080,
+				Protocol: protocol.HTTP,
+			},
+		},
+		Resolution:   model.ClientSideLB,
+		MeshExternal: false,
+		Attributes: model.ServiceAttributes{
+			Namespace: TestServiceNamespace,
+		},
+	}
+
+	gatewayConfig := config.Config{
+		Meta: config.Meta{
+			GroupVersionKind: gvk.Gateway,
+			Name:             "test-gateway",
+			Namespace:        proxyNamespace,
+		},
+		Spec: &networking.Gateway{
+			Selector: map[string]string{"istio": "ingressgateway"},
+			Servers: []*networking.Server{{
+				Hosts: []string{"*.com"},
+				Port:  &networking.Port{Name: "http", Number: 80, Protocol: "HTTP"},
+			}},
+		},
+	}
+
+	// virtualServiceForGateway creates a VirtualService bound to the test gateway
+	// that routes to the specified destination hosts.
+	virtualServiceForGateway := func(name string, hosts ...string) config.Config {
+		routes := make([]*networking.HTTPRouteDestination, 0, len(hosts))
+		for _, h := range hosts {
+			routes = append(routes, &networking.HTTPRouteDestination{
+				Destination: &networking.Destination{Host: h},
+				Weight:      int32(100 / len(hosts)),
+			})
+		}
+		return config.Config{
+			Meta: config.Meta{
+				GroupVersionKind: gvk.VirtualService,
+				Name:             name,
+				Namespace:        TestServiceNamespace,
+			},
+			Spec: &networking.VirtualService{
+				Hosts:    []string{"*.com"},
+				Gateways: []string{gatewayName},
+				Http: []*networking.HTTPRoute{{
+					Route: routes,
+				}},
+			},
+		}
+	}
+
+	// Base VS that references both services through the gateway.
+	vsForBothServices := virtualServiceForGateway("test-vs", "test.com", "testnew.com")
+	// VS referencing only test.com.
+	vsForTestService1 := virtualServiceForGateway("test-vs", "test.com")
+
+	destRuleWithNewSubsets := &networking.DestinationRule{
+		Host: "test.com",
+		TrafficPolicy: &networking.TrafficPolicy{
+			Tls: &networking.ClientTLSSettings{
+				Mode:              networking.ClientTLSSettings_MUTUAL,
+				ClientCertificate: "/defaultCert.pem",
+				PrivateKey:        "/defaultPrivateKey.pem",
+				CaCertificates:    "/defaultCaCert.pem",
+			},
+		},
+		Subsets: []*networking.Subset{
+			{
+				Name:   "subset-1",
+				Labels: map[string]string{"foo": "bar"},
+				TrafficPolicy: &networking.TrafficPolicy{
+					PortLevelSettings: []*networking.TrafficPolicy_PortTrafficPolicy{
+						{
+							Port: &networking.PortSelector{
+								Number: 8080,
+							},
+						},
+					},
+				},
+			},
+			{
+				Name:   "subset-2",
+				Labels: map[string]string{"foo": "bar"},
+				TrafficPolicy: &networking.TrafficPolicy{
+					PortLevelSettings: []*networking.TrafficPolicy_PortTrafficPolicy{
+						{
+							Port: &networking.PortSelector{
+								Number: 8080,
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	destRuleWithRemovedSubsets := &networking.DestinationRule{
+		Host: "test.com",
+		TrafficPolicy: &networking.TrafficPolicy{
+			Tls: &networking.ClientTLSSettings{
+				Mode:              networking.ClientTLSSettings_MUTUAL,
+				ClientCertificate: "/defaultCert.pem",
+				PrivateKey:        "/defaultPrivateKey.pem",
+				CaCertificates:    "/defaultCaCert.pem",
+			},
+		},
+		Subsets: []*networking.Subset{
+			{
+				Name:   "subset-2",
+				Labels: map[string]string{"foo": "bar"},
+				TrafficPolicy: &networking.TrafficPolicy{
+					PortLevelSettings: []*networking.TrafficPolicy_PortTrafficPolicy{
+						{
+							Port: &networking.PortSelector{
+								Number: 8080,
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	destRuleWithMatchingWildcardHosts := &networking.DestinationRule{
+		Host: "*.com",
+		TrafficPolicy: &networking.TrafficPolicy{
+			Tls: &networking.ClientTLSSettings{
+				Mode:              networking.ClientTLSSettings_MUTUAL,
+				ClientCertificate: "/defaultCert.pem",
+				PrivateKey:        "/defaultPrivateKey.pem",
+				CaCertificates:    "/defaultCaCert.pem",
+			},
+		},
+		Subsets: []*networking.Subset{
+			{
+				Name:   "subset-1",
+				Labels: map[string]string{"foo": "bar"},
+				TrafficPolicy: &networking.TrafficPolicy{
+					PortLevelSettings: []*networking.TrafficPolicy_PortTrafficPolicy{
+						{
+							Port: &networking.PortSelector{
+								Number: 8080,
+							},
+						},
+					},
+				},
+			},
+			{
+				Name:   "subset-2",
+				Labels: map[string]string{"foo": "bar"},
+				TrafficPolicy: &networking.TrafficPolicy{
+					PortLevelSettings: []*networking.TrafficPolicy_PortTrafficPolicy{
+						{
+							Port: &networking.PortSelector{
+								Number: 8080,
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	destRuleWithNonMatchingWildcardHosts := &networking.DestinationRule{
+		Host: "*.org",
+		TrafficPolicy: &networking.TrafficPolicy{
+			Tls: &networking.ClientTLSSettings{
+				Mode:              networking.ClientTLSSettings_MUTUAL,
+				ClientCertificate: "/defaultCert.pem",
+				PrivateKey:        "/defaultPrivateKey.pem",
+				CaCertificates:    "/defaultCaCert.pem",
+			},
+		},
+		Subsets: []*networking.Subset{
+			{
+				Name:   "subset-1",
+				Labels: map[string]string{"foo": "bar"},
+				TrafficPolicy: &networking.TrafficPolicy{
+					PortLevelSettings: []*networking.TrafficPolicy_PortTrafficPolicy{
+						{
+							Port: &networking.PortSelector{
+								Number: 8080,
+							},
+						},
+					},
+				},
+			},
+			{
+				Name:   "subset-2",
+				Labels: map[string]string{"foo": "bar"},
+				TrafficPolicy: &networking.TrafficPolicy{
+					PortLevelSettings: []*networking.TrafficPolicy_PortTrafficPolicy{
+						{
+							Port: &networking.PortSelector{
+								Number: 8080,
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	destRuleWithNoSubsets := &networking.DestinationRule{
+		Host: "test.com",
+		TrafficPolicy: &networking.TrafficPolicy{
+			Tls: &networking.ClientTLSSettings{
+				Mode:              networking.ClientTLSSettings_MUTUAL,
+				ClientCertificate: "/defaultCert.pem",
+				PrivateKey:        "/defaultPrivateKey.pem",
+				CaCertificates:    "/defaultCaCert.pem",
+			},
+		},
+	}
+
+	destRuleWithUpatedHost := &networking.DestinationRule{
+		Host: "testnew.com",
+		TrafficPolicy: &networking.TrafficPolicy{
+			Tls: &networking.ClientTLSSettings{
+				Mode:              networking.ClientTLSSettings_MUTUAL,
+				ClientCertificate: "/defaultCert.pem",
+				PrivateKey:        "/defaultPrivateKey.pem",
+				CaCertificates:    "/defaultCaCert.pem",
+			},
+		},
+	}
+
+	virtualServiceOriginal := &networking.VirtualService{
+		Hosts:    []string{"*.com"},
+		Gateways: []string{gatewayName},
+		Http: []*networking.HTTPRoute{
+			{
+				Route: []*networking.HTTPRouteDestination{
+					{
+						Destination: &networking.Destination{
+							Host: "test.com",
+						},
+						Weight: 100,
+					},
+				},
+			},
+		},
+	}
+
+	virtualServiceDestinationUpdated := &networking.VirtualService{
+		Hosts:    []string{"*.com"},
+		Gateways: []string{gatewayName},
+		Http: []*networking.HTTPRoute{
+			{
+				Route: []*networking.HTTPRouteDestination{
+					{
+						Destination: &networking.Destination{
+							Host: "testnew.com",
+						},
+						Weight: 100,
+					},
+				},
+			},
+		},
+	}
+
+	virtualServiceSubsetDestination := &networking.VirtualService{
+		Hosts:    []string{"*.com"},
+		Gateways: []string{gatewayName},
+		Http: []*networking.HTTPRoute{
+			{
+				Route: []*networking.HTTPRouteDestination{
+					{
+						Destination: &networking.Destination{
+							Host:   "test.com",
+							Subset: "subset-1",
+						},
+						Weight: 100,
+					},
+				},
+			},
+		},
+	}
+
+	testCases := []struct {
+		name                 string
+		services             []*model.Service
+		instances            []*model.ServiceInstance
+		configs              []config.Config
+		prevConfigs          []config.Config
+		configUpdated        sets.Set[model.ConfigKey]
+		watchedResourceNames []string
+		usedDelta            bool
+		removedClusters      []string
+		expectedClusters     []string
+	}{
+		{
+			name:     "service is added",
+			services: []*model.Service{testService1, testService2},
+			configs:  []config.Config{gatewayConfig, vsForBothServices},
+			configUpdated: sets.New(
+				model.ConfigKey{Kind: kind.ServiceEntry, Name: "testnew.com", Namespace: TestServiceNamespace}),
+			watchedResourceNames: []string{"outbound|8080||test.com"},
+			usedDelta:            true,
+			removedClusters:      nil,
+			expectedClusters:     []string{"BlackHoleCluster", "outbound|8080||testnew.com"},
+		},
+		{
+			name: "service and destination rule are added",
+			configs: []config.Config{gatewayConfig, vsForBothServices, {
+				Meta: config.Meta{
+					GroupVersionKind: gvk.DestinationRule,
+					Name:             "test-desinationrule",
+					Namespace:        TestServiceNamespace,
+				},
+				Spec: destRuleWithUpatedHost,
+			}},
+			services: []*model.Service{testService1, testService2},
+			configUpdated: sets.New(model.ConfigKey{Kind: kind.ServiceEntry, Name: "testnew.com", Namespace: TestServiceNamespace},
+				model.ConfigKey{Kind: kind.DestinationRule, Name: "test-desinationrule", Namespace: TestServiceNamespace}),
+			watchedResourceNames: []string{"outbound|8080||test.com"},
+			usedDelta:            true,
+			removedClusters:      nil,
+			expectedClusters:     []string{"BlackHoleCluster", "outbound|8080||testnew.com"},
+		},
+		{
+			name:     "service is removed",
+			services: []*model.Service{},
+			configs:  []config.Config{gatewayConfig, vsForTestService1},
+			configUpdated: sets.New(
+				model.ConfigKey{Kind: kind.ServiceEntry, Name: "test.com", Namespace: TestServiceNamespace}),
+			watchedResourceNames: []string{"outbound|8080||test.com"},
+			usedDelta:            true,
+			removedClusters:      []string{"outbound|8080||test.com"},
+			expectedClusters:     []string{"BlackHoleCluster"},
+		},
+		{
+			name:     "service port is removed",
+			services: []*model.Service{testService1},
+			configs:  []config.Config{gatewayConfig, vsForTestService1},
+			configUpdated: sets.New(
+				model.ConfigKey{Kind: kind.ServiceEntry, Name: "test.com", Namespace: TestServiceNamespace}),
+			watchedResourceNames: []string{"outbound|7070||test.com"},
+			usedDelta:            true,
+			removedClusters:      []string{"outbound|7070||test.com"},
+			expectedClusters:     []string{"BlackHoleCluster", "outbound|8080||test.com"},
+		},
+		{
+			name:     "destination rule with no subsets is updated",
+			services: []*model.Service{testService1},
+			configs: []config.Config{gatewayConfig, vsForTestService1, {
+				Meta: config.Meta{
+					GroupVersionKind: gvk.DestinationRule,
+					Name:             "test-desinationrule",
+					Namespace:        TestServiceNamespace,
+				},
+				Spec: destRuleWithNoSubsets,
+			}},
+			configUpdated:        sets.New(model.ConfigKey{Kind: kind.DestinationRule, Name: "test-desinationrule", Namespace: TestServiceNamespace}),
+			watchedResourceNames: []string{"outbound|8080||test.com"},
+			usedDelta:            true,
+			removedClusters:      nil,
+			expectedClusters: []string{
+				"BlackHoleCluster", "outbound|8080||test.com",
+			},
+		},
+		{
+			name:     "destination rule is updated with new subset",
+			services: []*model.Service{testService1},
+			configs: []config.Config{gatewayConfig, vsForTestService1, {
+				Meta: config.Meta{
+					GroupVersionKind: gvk.DestinationRule,
+					Name:             "test-desinationrule",
+					Namespace:        TestServiceNamespace,
+				},
+				Spec: destRuleWithNewSubsets,
+			}},
+			configUpdated:        sets.New(model.ConfigKey{Kind: kind.DestinationRule, Name: "test-desinationrule", Namespace: TestServiceNamespace}),
+			watchedResourceNames: []string{"outbound|8080||test.com", "outbound|8080|subset-1|test.com"},
+			usedDelta:            true,
+			removedClusters:      []string{},
+			expectedClusters: []string{
+				"BlackHoleCluster",
+				"outbound|8080|subset-1|test.com", "outbound|8080|subset-2|test.com", "outbound|8080||test.com",
+			},
+		},
+		{
+			name:     "destination rule is updated with subset removal",
+			services: []*model.Service{testService1},
+			configs: []config.Config{gatewayConfig, vsForTestService1, {
+				Meta: config.Meta{
+					GroupVersionKind: gvk.DestinationRule,
+					Name:             "test-desinationrule",
+					Namespace:        TestServiceNamespace,
+				},
+				Spec: destRuleWithRemovedSubsets,
+			}},
+			configUpdated:        sets.New(model.ConfigKey{Kind: kind.DestinationRule, Name: "test-desinationrule", Namespace: TestServiceNamespace}),
+			watchedResourceNames: []string{"outbound|8080|subset-1|test.com", "outbound|8080|subset-2|test.com", "outbound|8080||test.com"},
+			usedDelta:            true,
+			removedClusters:      []string{"outbound|8080|subset-1|test.com"},
+			expectedClusters: []string{
+				"BlackHoleCluster",
+				"outbound|8080|subset-2|test.com", "outbound|8080||test.com",
+			},
+		},
+		{
+			name:     "destination rule is removed",
+			services: []*model.Service{testService1},
+			prevConfigs: []config.Config{gatewayConfig, vsForTestService1, {
+				Meta: config.Meta{
+					GroupVersionKind: gvk.DestinationRule,
+					Name:             "test-desinationrule",
+					Namespace:        TestServiceNamespace,
+				},
+				Spec: destRuleWithRemovedSubsets,
+			}},
+			configs:              []config.Config{gatewayConfig, vsForTestService1},
+			configUpdated:        sets.New(model.ConfigKey{Kind: kind.DestinationRule, Name: "test-desinationrule", Namespace: TestServiceNamespace}),
+			watchedResourceNames: []string{"outbound|8080|subset-2|test.com", "outbound|8080||test.com"},
+			usedDelta:            true,
+			removedClusters:      []string{"outbound|8080|subset-2|test.com"},
+			expectedClusters:     []string{"BlackHoleCluster", "outbound|8080||test.com"},
+		},
+		{
+			name:     "destination rule with wildcard matching hosts",
+			services: []*model.Service{testService1},
+			configs: []config.Config{gatewayConfig, vsForTestService1, {
+				Meta: config.Meta{
+					GroupVersionKind: gvk.DestinationRule,
+					Name:             "test-desinationrule",
+					Namespace:        TestServiceNamespace,
+				},
+				Spec: destRuleWithMatchingWildcardHosts,
+			}},
+			configUpdated:        sets.New(model.ConfigKey{Kind: kind.DestinationRule, Name: "test-desinationrule", Namespace: TestServiceNamespace}),
+			watchedResourceNames: []string{"outbound|8080||test.com"},
+			usedDelta:            true,
+			removedClusters:      nil,
+			expectedClusters: []string{
+				"BlackHoleCluster",
+				"outbound|8080|subset-1|test.com", "outbound|8080|subset-2|test.com", "outbound|8080||test.com",
+			},
+		},
+		{
+			name:     "destination rule with wildcard non matching hosts",
+			services: []*model.Service{testService1},
+			configs: []config.Config{gatewayConfig, vsForTestService1, {
+				Meta: config.Meta{
+					GroupVersionKind: gvk.DestinationRule,
+					Name:             "test-desinationrule",
+					Namespace:        TestServiceNamespace,
+				},
+				Spec: destRuleWithNonMatchingWildcardHosts,
+			}},
+			prevConfigs: []config.Config{gatewayConfig, vsForTestService1, {
+				Meta: config.Meta{
+					GroupVersionKind: gvk.DestinationRule,
+					Name:             "test-desinationrule",
+					Namespace:        TestServiceNamespace,
+				},
+				Spec: destRuleWithNewSubsets,
+			}},
+			configUpdated:        sets.New(model.ConfigKey{Kind: kind.DestinationRule, Name: "test-desinationrule", Namespace: TestServiceNamespace}),
+			watchedResourceNames: []string{"outbound|8080||test.com"},
+			usedDelta:            true,
+			removedClusters:      nil,
+			expectedClusters: []string{
+				"BlackHoleCluster", "outbound|8080||test.com",
+			},
+		},
+		{
+			name:     "destination rule with host updated",
+			services: []*model.Service{testService1, testService2},
+			configs: []config.Config{gatewayConfig, vsForBothServices, {
+				Meta: config.Meta{
+					GroupVersionKind: gvk.DestinationRule,
+					Name:             "test-desinationrule",
+					Namespace:        TestServiceNamespace,
+				},
+				Spec: destRuleWithUpatedHost,
+			}},
+			prevConfigs: []config.Config{gatewayConfig, vsForBothServices, {
+				Meta: config.Meta{
+					GroupVersionKind: gvk.DestinationRule,
+					Name:             "test-desinationrule",
+					Namespace:        TestServiceNamespace,
+				},
+				Spec: destRuleWithNoSubsets,
+			}},
+			configUpdated:        sets.New(model.ConfigKey{Kind: kind.DestinationRule, Name: "test-desinationrule", Namespace: TestServiceNamespace}),
+			watchedResourceNames: []string{"outbound|8080||test.com"},
+			usedDelta:            true,
+			removedClusters:      nil,
+			expectedClusters: []string{
+				"BlackHoleCluster", "outbound|8080||test.com", "outbound|8080||testnew.com",
+			},
+		},
+		{
+			name:     "service is added and destination rule is updated",
+			services: []*model.Service{testService1, testService2},
+			configs: []config.Config{gatewayConfig, vsForBothServices, {
+				Meta: config.Meta{
+					GroupVersionKind: gvk.DestinationRule,
+					Name:             "test-desinationrule",
+					Namespace:        TestServiceNamespace,
+				},
+				Spec: destRuleWithNewSubsets,
+			}},
+			configUpdated: sets.New(
+				model.ConfigKey{Kind: kind.ServiceEntry, Name: "testnew.com", Namespace: TestServiceNamespace},
+				model.ConfigKey{Kind: kind.DestinationRule, Name: "test-desinationrule", Namespace: TestServiceNamespace}),
+			watchedResourceNames: []string{"outbound|8080||test.com"},
+			usedDelta:            true,
+			removedClusters:      nil,
+			expectedClusters: []string{
+				"BlackHoleCluster",
+				"outbound|8080|subset-1|test.com", "outbound|8080|subset-2|test.com", "outbound|8080||test.com",
+				"outbound|8080||testnew.com",
+			},
+		},
+		{
+			name:     "peer authentication config update on service namespace",
+			services: []*model.Service{testService1, testService2},
+			configs:  []config.Config{gatewayConfig, vsForBothServices},
+			configUpdated: sets.New(
+				model.ConfigKey{Kind: kind.PeerAuthentication, Name: "test.com", Namespace: TestServiceNamespace}),
+			watchedResourceNames: []string{"outbound|7070||test.com"},
+			usedDelta:            true,
+			removedClusters:      nil,
+			expectedClusters: []string{
+				"BlackHoleCluster",
+				"outbound|8080||test.com", "outbound|8080||testnew.com",
+			},
+		},
+		{
+			name:     "peer authentication config update on non-service namespace",
+			services: []*model.Service{testService1, testService2},
+			configs:  []config.Config{gatewayConfig, vsForBothServices},
+			configUpdated: sets.New(
+				model.ConfigKey{Kind: kind.PeerAuthentication, Name: "test.com", Namespace: proxyNamespace}),
+			watchedResourceNames: []string{"outbound|7070||test.com"},
+			usedDelta:            true,
+			removedClusters:      nil,
+			expectedClusters: []string{
+				"BlackHoleCluster",
+			},
+		},
+		{
+			name:     "global peer authentication config update",
+			services: []*model.Service{testService1, testService2},
+			configs:  []config.Config{gatewayConfig, vsForBothServices},
+			configUpdated: sets.New(
+				model.ConfigKey{Kind: kind.PeerAuthentication, Name: "test.com", Namespace: "istio-system"}),
+			watchedResourceNames: []string{"outbound|7070||test.com"},
+			usedDelta:            false,
+			removedClusters:      nil,
+			expectedClusters: []string{
+				"BlackHoleCluster",
+				"outbound|8080||test.com", "outbound|8080||testnew.com",
+			},
+		},
+		{
+			// VS changes destination from test.com to testnew.com.
+			// Gateway-filtered delta should detect the new service and push it.
+			name:     "virtual service is updated targeting a new destination",
+			services: []*model.Service{testService1, testService2},
+			prevConfigs: []config.Config{gatewayConfig, {
+				Meta: config.Meta{
+					GroupVersionKind: gvk.VirtualService,
+					Name:             "test-virtualservice",
+					Namespace:        TestServiceNamespace,
+				},
+				Spec: virtualServiceOriginal,
+			}},
+			configs: []config.Config{gatewayConfig, {
+				Meta: config.Meta{
+					GroupVersionKind: gvk.VirtualService,
+					Name:             "test-virtualservice",
+					Namespace:        TestServiceNamespace,
+				},
+				Spec: virtualServiceDestinationUpdated,
+			}},
+			configUpdated: sets.New(
+				model.ConfigKey{Kind: kind.VirtualService, Name: "test-virtualservice", Namespace: TestServiceNamespace}),
+			watchedResourceNames: []string{"outbound|8080||test.com"},
+			usedDelta:            true,
+			removedClusters:      []string{"outbound|8080||test.com"},
+			expectedClusters: []string{
+				"BlackHoleCluster", "outbound|8080||testnew.com",
+			},
+		},
+		{
+			// VS changes destination from test.com to subset-1 of test.com (with DR defining subsets).
+			name:     "virtual service is updated targeting a service with subsets",
+			services: []*model.Service{testService1, testService2},
+			prevConfigs: []config.Config{gatewayConfig, {
+				Meta: config.Meta{
+					GroupVersionKind: gvk.VirtualService,
+					Name:             "test-virtualservice",
+					Namespace:        TestServiceNamespace,
+				},
+				Spec: virtualServiceOriginal,
+			}, {
+				Meta: config.Meta{
+					GroupVersionKind: gvk.DestinationRule,
+					Name:             "test-destinationrule",
+					Namespace:        TestServiceNamespace,
+				},
+				Spec: destRuleWithNewSubsets,
+			}},
+			configs: []config.Config{gatewayConfig, {
+				Meta: config.Meta{
+					GroupVersionKind: gvk.VirtualService,
+					Name:             "test-virtualservice",
+					Namespace:        TestServiceNamespace,
+				},
+				Spec: virtualServiceSubsetDestination,
+			}, {
+				Meta: config.Meta{
+					GroupVersionKind: gvk.DestinationRule,
+					Name:             "test-destinationrule",
+					Namespace:        TestServiceNamespace,
+				},
+				Spec: destRuleWithNewSubsets,
+			}},
+			configUpdated: sets.New(
+				model.ConfigKey{Kind: kind.VirtualService, Name: "test-virtualservice", Namespace: TestServiceNamespace}),
+			// Already watched test.com clusters from before.
+			watchedResourceNames: []string{"outbound|8080|subset-1|test.com", "outbound|8080|subset-2|test.com", "outbound|8080||test.com"},
+			usedDelta:            true,
+			removedClusters:      nil,
+			// No new clusters needed since we already had all test.com clusters.
+			expectedClusters: []string{
+				"BlackHoleCluster",
+			},
+		},
+		{
+			name:     "virtual service is removed",
+			services: []*model.Service{testService1, testService2},
+			prevConfigs: []config.Config{gatewayConfig, {
+				Meta: config.Meta{
+					GroupVersionKind: gvk.VirtualService,
+					Name:             "test-virtualservice",
+					Namespace:        TestServiceNamespace,
+				},
+				Spec: virtualServiceOriginal,
+			}},
+			configs: []config.Config{gatewayConfig},
+			configUpdated: sets.New(
+				model.ConfigKey{Kind: kind.VirtualService, Name: "test-virtualservice", Namespace: TestServiceNamespace}),
+			watchedResourceNames: []string{"outbound|8080||test.com"},
+			usedDelta:            true,
+			removedClusters:      []string{"outbound|8080||test.com"},
+			expectedClusters: []string{
+				"BlackHoleCluster",
+			},
+		},
+		{
+			name:     "virtual service targeting service with subsets is removed",
+			services: []*model.Service{testService1, testService2},
+			prevConfigs: []config.Config{gatewayConfig, {
+				Meta: config.Meta{
+					GroupVersionKind: gvk.VirtualService,
+					Name:             "test-virtualservice",
+					Namespace:        TestServiceNamespace,
+				},
+				Spec: virtualServiceOriginal,
+			}, {
+				Meta: config.Meta{
+					GroupVersionKind: gvk.DestinationRule,
+					Name:             "test-destinationrule",
+					Namespace:        TestServiceNamespace,
+				},
+				Spec: destRuleWithNewSubsets,
+			}},
+			configs: []config.Config{gatewayConfig, {
+				Meta: config.Meta{
+					GroupVersionKind: gvk.DestinationRule,
+					Name:             "test-destinationrule",
+					Namespace:        TestServiceNamespace,
+				},
+				Spec: destRuleWithNewSubsets,
+			}},
+			configUpdated: sets.New(
+				model.ConfigKey{Kind: kind.VirtualService, Name: "test-virtualservice", Namespace: TestServiceNamespace}),
+			watchedResourceNames: []string{"outbound|8080|subset-1|test.com", "outbound|8080|subset-2|test.com", "outbound|8080||test.com"},
+			usedDelta:            true,
+			removedClusters:      []string{"outbound|8080|subset-1|test.com", "outbound|8080|subset-2|test.com", "outbound|8080||test.com"},
+			expectedClusters: []string{
+				"BlackHoleCluster",
+			},
+		},
+		{
+			// A Gateway config change is not in deltaConfigTypes, so delta should not be used.
+			name:     "gateway config change falls back to non-delta",
+			services: []*model.Service{testService1},
+			configs:  []config.Config{gatewayConfig, vsForTestService1},
+			configUpdated: sets.New(
+				model.ConfigKey{Kind: kind.Gateway, Name: "test-gateway", Namespace: proxyNamespace}),
+			watchedResourceNames: []string{"outbound|8080||test.com"},
+			usedDelta:            false,
+			removedClusters:      nil,
+			expectedClusters: []string{
+				"BlackHoleCluster", "outbound|8080||test.com",
+			},
+		},
+		{
+			name:     "config update that is not delta aware",
+			services: []*model.Service{testService1, testService2},
+			configs:  []config.Config{gatewayConfig, vsForBothServices},
+			configUpdated: sets.New(
+				model.ConfigKey{Kind: kind.EnvoyFilter, Name: "test.com", Namespace: TestServiceNamespace}),
+			watchedResourceNames: []string{"outbound|7070||test.com"},
+			usedDelta:            false,
+			removedClusters:      nil,
+			expectedClusters: []string{
+				"BlackHoleCluster",
+				"outbound|8080||test.com", "outbound|8080||testnew.com",
+			},
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			configs := tc.configs
+			if tc.prevConfigs != nil {
+				configs = tc.prevConfigs
+			}
+			cg := NewConfigGenTest(t, TestOptions{
+				Services:  tc.services,
+				Instances: tc.instances,
+				Configs:   configs,
+			})
+			proxy := cg.SetupProxy(&model.Proxy{
+				IPAddresses:     []string{"127.0.0.1"},
+				ConfigNamespace: proxyNamespace,
+				Type:            model.Router,
+				Labels:          map[string]string{"istio": "ingressgateway"},
+			})
+			if tc.prevConfigs != nil {
+				applyConfigDiff(t, cg, tc.prevConfigs, tc.configs)
+				pc := model.NewPushContext()
+				pc.InitContext(cg.env, nil, nil)
+				cg.env.SetPushContext(pc)
+				proxy.SetSidecarScope(cg.env.PushContext())
+				proxy.SetGatewaysForProxy(cg.env.PushContext())
+			}
+			clusters, removed, delta := cg.DeltaClusters(proxy, tc.configUpdated,
+				&model.WatchedResource{ResourceNames: sets.New(tc.watchedResourceNames...)})
 			if delta != tc.usedDelta {
 				t.Errorf("un expected delta, want %v got %v", tc.usedDelta, delta)
 			}

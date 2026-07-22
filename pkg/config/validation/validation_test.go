@@ -520,13 +520,20 @@ func TestValidateTlsOptions(t *testing.T) {
 		{
 			"simple sds with client bundle",
 			&networking.ServerTLSSettings{
+				Mode:           networking.ServerTLSSettings_SIMPLE,
+				CredentialName: "sds-name",
+			},
+			"", "",
+		},
+		{
+			"simple sds with client bundle but with server cert",
+			&networking.ServerTLSSettings{
 				Mode:              networking.ServerTLSSettings_SIMPLE,
 				ServerCertificate: "Captain Jean-Luc Picard",
 				PrivateKey:        "Khan Noonien Singh",
-				CaCertificates:    "Commander William T. Riker",
 				CredentialName:    "sds-name",
 			},
-			"", "",
+			"one of credential_name, credential_names", "",
 		},
 		{
 			"simple no server cert",
@@ -543,6 +550,78 @@ func TestValidateTlsOptions(t *testing.T) {
 				Mode:              networking.ServerTLSSettings_SIMPLE,
 				ServerCertificate: "Captain Jean-Luc Picard",
 				PrivateKey:        "",
+			},
+			"private key", "",
+		},
+		{
+			"simple more than 2 certs",
+			&networking.ServerTLSSettings{
+				Mode: networking.ServerTLSSettings_SIMPLE,
+				TlsCertificates: []*networking.ServerTLSSettings_TLSCertificate{
+					{
+						ServerCertificate: "Captain Jean-Luc Picard",
+						PrivateKey:        "Khan Noonien Singh",
+					},
+					{
+						ServerCertificate: "Commander William T. Riker",
+						PrivateKey:        "Commander William T. Riker",
+					},
+					{
+						ServerCertificate: "Lieutenant Commander Data",
+						PrivateKey:        "Lieutenant Commander Data",
+					},
+				},
+			},
+			"", "SIMPLE TLS can support up to 2 server certificates",
+		},
+		{
+			"simple with both server cert and tls certs",
+			&networking.ServerTLSSettings{
+				Mode:              networking.ServerTLSSettings_SIMPLE,
+				ServerCertificate: "Captain Jean-Luc Picard",
+				PrivateKey:        "Khan Noonien Singh",
+				TlsCertificates: []*networking.ServerTLSSettings_TLSCertificate{
+					{
+						ServerCertificate: "Captain Jean-Luc Picard",
+						PrivateKey:        "Khan Noonien Singh",
+					},
+					{
+						ServerCertificate: "Lieutenant Commander Data",
+						PrivateKey:        "Lieutenant Commander Data",
+					},
+				},
+			},
+			"one of credential_name, credential_names", "",
+		},
+		{
+			"simple 2 certs with missing certificate",
+			&networking.ServerTLSSettings{
+				Mode: networking.ServerTLSSettings_SIMPLE,
+				TlsCertificates: []*networking.ServerTLSSettings_TLSCertificate{
+					{
+						PrivateKey: "Commander William T. Riker",
+					},
+					{
+						ServerCertificate: "Commander William T. Riker",
+						PrivateKey:        "Commander William T. Riker",
+					},
+				},
+			},
+			"server certificate", "",
+		},
+		{
+			"simple 2 certs with missing private key",
+			&networking.ServerTLSSettings{
+				Mode: networking.ServerTLSSettings_SIMPLE,
+				TlsCertificates: []*networking.ServerTLSSettings_TLSCertificate{
+					{
+						ServerCertificate: "Captain Jean-Luc Picard",
+					},
+					{
+						ServerCertificate: "Commander William T. Riker",
+						PrivateKey:        "Commander William T. Riker",
+					},
+				},
 			},
 			"private key", "",
 		},
@@ -579,13 +658,37 @@ func TestValidateTlsOptions(t *testing.T) {
 		{
 			"mutual sds",
 			&networking.ServerTLSSettings{
+				Mode:           networking.ServerTLSSettings_MUTUAL,
+				CaCertificates: "Commander William T. Riker",
+				CredentialName: "sds-name",
+			},
+			"", "",
+		},
+		{
+			"mutual sds with credential name and server cert",
+			&networking.ServerTLSSettings{
 				Mode:              networking.ServerTLSSettings_MUTUAL,
 				ServerCertificate: "Captain Jean-Luc Picard",
 				PrivateKey:        "Khan Noonien Singh",
 				CaCertificates:    "Commander William T. Riker",
 				CredentialName:    "sds-name",
 			},
-			"", "",
+			"one of credential_name, credential_names", "",
+		},
+		{
+			"mutual sds with credential name and tls certs",
+			&networking.ServerTLSSettings{
+				Mode:           networking.ServerTLSSettings_MUTUAL,
+				CaCertificates: "Commander William T. Riker",
+				TlsCertificates: []*networking.ServerTLSSettings_TLSCertificate{
+					{
+						ServerCertificate: "Captain Jean-Luc Picard",
+						PrivateKey:        "Khan Noonien Singh",
+					},
+				},
+				CredentialName: "sds-name",
+			},
+			"one of credential_name, credential_names", "",
 		},
 		{
 			"mutual no server cert",
@@ -596,6 +699,45 @@ func TestValidateTlsOptions(t *testing.T) {
 				CaCertificates:    "Commander William T. Riker",
 			},
 			"server certificate", "",
+		},
+		{
+			"credential names and certificates",
+			&networking.ServerTLSSettings{
+				Mode:              networking.ServerTLSSettings_MUTUAL,
+				ServerCertificate: "/etc/istio/certs/server/cert",
+				PrivateKey:        "/etc/istio/certs/server/key",
+				CredentialNames:   []string{"server-certs"},
+			},
+			"one of credential_name, credential_names", "",
+		},
+		{
+			"credential names and tls certificates",
+			&networking.ServerTLSSettings{
+				Mode: networking.ServerTLSSettings_MUTUAL,
+				TlsCertificates: []*networking.ServerTLSSettings_TLSCertificate{
+					{
+						ServerCertificate: "/etc/istio/certs/server/cert",
+						PrivateKey:        "/etc/istio/certs/server/key",
+						CaCertificates:    "/etc/istio/certs/server/cacert2",
+					},
+				},
+				CredentialNames: []string{"server-certs"},
+			},
+			"one of credential_name, credential_names", "",
+		},
+		{
+			"only tls certificates",
+			&networking.ServerTLSSettings{
+				Mode: networking.ServerTLSSettings_MUTUAL,
+				TlsCertificates: []*networking.ServerTLSSettings_TLSCertificate{
+					{
+						ServerCertificate: "/etc/istio/certs/server/cert",
+						PrivateKey:        "/etc/istio/certs/server/key",
+					},
+				},
+				CaCertificates: "/etc/istio/certs/server/cacert2",
+			},
+			"", "",
 		},
 		{
 			"mutual sds no server cert",
@@ -647,6 +789,99 @@ func TestValidateTlsOptions(t *testing.T) {
 				ServerCertificate: "",
 				PrivateKey:        "",
 				CaCertificates:    "",
+			},
+			"client CA bundle", "",
+		},
+		{
+			"mutual more than 2 certs",
+			&networking.ServerTLSSettings{
+				Mode:           networking.ServerTLSSettings_MUTUAL,
+				CaCertificates: "Commander William T. Riker",
+				TlsCertificates: []*networking.ServerTLSSettings_TLSCertificate{
+					{
+						ServerCertificate: "Captain Jean-Luc Picard",
+						PrivateKey:        "Khan Noonien Singh",
+					},
+					{
+						ServerCertificate: "Commander William T. Riker",
+						PrivateKey:        "Commander William T. Riker",
+					},
+					{
+						ServerCertificate: "Lieutenant Commander Data",
+						PrivateKey:        "Lieutenant Commander Data",
+					},
+				},
+			},
+			"", "MUTUAL TLS can support up to 2 server certificates",
+		},
+		{
+			"mutual with both server cert and tls certs",
+			&networking.ServerTLSSettings{
+				Mode:              networking.ServerTLSSettings_MUTUAL,
+				ServerCertificate: "Captain Jean-Luc Picard",
+				PrivateKey:        "Khan Noonien Singh",
+				CaCertificates:    "Commander William T. Riker",
+				TlsCertificates: []*networking.ServerTLSSettings_TLSCertificate{
+					{
+						ServerCertificate: "Captain Jean-Luc Picard",
+						PrivateKey:        "Khan Noonien Singh",
+					},
+					{
+						ServerCertificate: "Lieutenant Commander Data",
+						PrivateKey:        "Lieutenant Commander Data",
+					},
+				},
+			},
+			"one of credential_name, credential_names", "",
+		},
+		{
+			"mutual 2 certs with missing certificate",
+			&networking.ServerTLSSettings{
+				Mode:           networking.ServerTLSSettings_MUTUAL,
+				CaCertificates: "Lieutenant Commander Data",
+				TlsCertificates: []*networking.ServerTLSSettings_TLSCertificate{
+					{
+						PrivateKey: "Commander William T. Riker",
+					},
+					{
+						ServerCertificate: "Commander William T. Riker",
+						PrivateKey:        "Commander William T. Riker",
+					},
+				},
+			},
+			"server certificate", "",
+		},
+		{
+			"mutual 2 certs with missing private key",
+			&networking.ServerTLSSettings{
+				Mode:           networking.ServerTLSSettings_MUTUAL,
+				CaCertificates: "Lieutenant Commander Data",
+				TlsCertificates: []*networking.ServerTLSSettings_TLSCertificate{
+					{
+						ServerCertificate: "Captain Jean-Luc Picard",
+					},
+					{
+						ServerCertificate: "Commander William T. Riker",
+						PrivateKey:        "Commander William T. Riker",
+					},
+				},
+			},
+			"private key", "",
+		},
+		{
+			"mutual 2 certs with missing CA certificate",
+			&networking.ServerTLSSettings{
+				Mode: networking.ServerTLSSettings_MUTUAL,
+				TlsCertificates: []*networking.ServerTLSSettings_TLSCertificate{
+					{
+						ServerCertificate: "Captain Jean-Luc Picard",
+						PrivateKey:        "Khan Noonien Singh",
+					},
+					{
+						ServerCertificate: "Commander William T. Riker",
+						PrivateKey:        "Commander William T. Riker",
+					},
+				},
 			},
 			"client CA bundle", "",
 		},
@@ -805,6 +1040,34 @@ func TestValidateTlsOptions(t *testing.T) {
 			},
 			"", "",
 		},
+		{
+			"mutual no server cert",
+			&networking.ServerTLSSettings{
+				Mode:              networking.ServerTLSSettings_MUTUAL,
+				ServerCertificate: "",
+				PrivateKey:        "Khan Noonien Singh",
+				CaCertificates:    "Commander William T. Riker",
+			},
+			"MUTUAL TLS requires a server certificate", "",
+		},
+		{
+			"mutual no private key",
+			&networking.ServerTLSSettings{
+				Mode:              networking.ServerTLSSettings_MUTUAL,
+				ServerCertificate: "Khan Noonien Singh",
+				PrivateKey:        "",
+				CaCertificates:    "Commander William T. Riker",
+			},
+			"MUTUAL TLS requires a private key", "",
+		},
+		{
+			"with CredentialNames",
+			&networking.ServerTLSSettings{
+				Mode:            networking.ServerTLSSettings_MUTUAL,
+				CredentialNames: []string{"credential1", "credential2"},
+			},
+			"", "",
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -815,6 +1078,26 @@ func TestValidateTlsOptions(t *testing.T) {
 	}
 }
 
+func TestStrictValidateHTTPHeaderName(t *testing.T) {
+	testCases := []struct {
+		name  string
+		valid bool
+	}{
+		{name: "header1", valid: true},
+		{name: "X-Requested-With", valid: true},
+		{name: ":authority", valid: false},
+		{name: "", valid: false},
+		{name: "foo_bar", valid: true},
+	}
+
+	for _, tc := range testCases {
+		if got := ValidateStrictHTTPHeaderName(tc.name); (got == nil) != tc.valid {
+			t.Errorf("ValidateStrictHTTPHeaderName(%q) => got valid=%v, want valid=%v",
+				tc.name, got == nil, tc.valid)
+		}
+	}
+}
+
 func TestValidateHTTPHeaderName(t *testing.T) {
 	testCases := []struct {
 		name  string
@@ -822,12 +1105,16 @@ func TestValidateHTTPHeaderName(t *testing.T) {
 	}{
 		{name: "header1", valid: true},
 		{name: "X-Requested-With", valid: true},
+		{name: ":authority", valid: true},
+		{name: "funky!$#_", valid: true},
 		{name: "", valid: false},
+		{name: "::", valid: false},
+		{name: "illegal\"char", valid: false},
 	}
 
 	for _, tc := range testCases {
-		if got := ValidateHTTPHeaderName(tc.name); (got == nil) != tc.valid {
-			t.Errorf("ValidateHTTPHeaderName(%q) => got valid=%v, want valid=%v",
+		if got := ValidateHTTPHeaderNameOrJwtClaimRoute(tc.name); (got == nil) != tc.valid {
+			t.Errorf("ValidateStrictHTTPHeaderName(%q) => got valid=%v, want valid=%v",
 				tc.name, got == nil, tc.valid)
 		}
 	}
@@ -1122,6 +1409,10 @@ func TestValidateHTTPRetry(t *testing.T) {
 			Attempts:      10,
 			PerTryTimeout: &durationpb.Duration{Nanos: 999},
 		}, valid: false},
+		{name: "invalid backoff", in: &networking.HTTPRetry{
+			Attempts: 10,
+			Backoff:  &durationpb.Duration{Nanos: 999},
+		}, valid: false},
 		{name: "invalid policy retryOn", in: &networking.HTTPRetry{
 			Attempts:      10,
 			PerTryTimeout: &durationpb.Duration{Seconds: 2},
@@ -1386,11 +1677,34 @@ func TestValidateHTTPRedirect(t *testing.T) {
 			},
 			valid: true,
 		},
+		{
+			name: "prefix_rewrite alone",
+			redirect: &networking.HTTPRedirect{
+				PrefixRewrite: "/bar",
+			},
+			valid: true,
+		},
+		{
+			name: "prefix_rewrite with authority",
+			redirect: &networking.HTTPRedirect{
+				Authority:     "foo.example.com",
+				PrefixRewrite: "/",
+			},
+			valid: true,
+		},
+		{
+			name: "uri and prefix_rewrite mutually exclusive",
+			redirect: &networking.HTTPRedirect{
+				Uri:           "/old",
+				PrefixRewrite: "/new",
+			},
+			valid: false,
+		},
 	}
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			if err := validateHTTPRedirect(tc.redirect); (err == nil) != tc.valid {
+			if err := validateHTTPRedirect(tc.redirect, nil); (err == nil) != tc.valid {
 				t.Fatalf("got valid=%v but wanted valid=%v: %v", err == nil, tc.valid, err)
 			}
 		})
@@ -1604,6 +1918,40 @@ func TestValidateHTTPRoute(t *testing.T) {
 			Redirect: &networking.HTTPRedirect{
 				Uri:       "/lerp",
 				Authority: "foo.biz",
+			},
+		}, valid: true},
+		{name: "prefix_rewrite redirect with prefix URI match", route: &networking.HTTPRoute{
+			Match: []*networking.HTTPMatchRequest{{
+				Uri: &networking.StringMatch{MatchType: &networking.StringMatch_Prefix{Prefix: "/foo"}},
+			}},
+			Redirect: &networking.HTTPRedirect{
+				PrefixRewrite: "/bar",
+			},
+		}, valid: true},
+		{name: "prefix_rewrite redirect with exact URI match is invalid", route: &networking.HTTPRoute{
+			Match: []*networking.HTTPMatchRequest{{
+				Uri: &networking.StringMatch{MatchType: &networking.StringMatch_Exact{Exact: "/foo"}},
+			}},
+			Redirect: &networking.HTTPRedirect{
+				PrefixRewrite: "/bar",
+			},
+		}, valid: false},
+		{name: "prefix_rewrite redirect with regex URI match is invalid", route: &networking.HTTPRoute{
+			Match: []*networking.HTTPMatchRequest{{
+				Uri: &networking.StringMatch{MatchType: &networking.StringMatch_Regex{Regex: "/foo.*"}},
+			}},
+			Redirect: &networking.HTTPRedirect{
+				PrefixRewrite: "/bar",
+			},
+		}, valid: false},
+		{name: "prefix_rewrite redirect with no URI match (wildcard) is valid", route: &networking.HTTPRoute{
+			Match: []*networking.HTTPMatchRequest{{
+				Headers: map[string]*networking.StringMatch{
+					"x-foo": {MatchType: &networking.StringMatch_Exact{Exact: "bar"}},
+				},
+			}},
+			Redirect: &networking.HTTPRedirect{
+				PrefixRewrite: "/bar",
 			},
 		}, valid: true},
 		{name: "conflicting redirect and route", route: &networking.HTTPRoute{
@@ -3030,7 +3378,7 @@ func TestValidateTrafficPolicy(t *testing.T) {
 		},
 	}
 	for _, c := range cases {
-		if got := validateTrafficPolicy(c.in).Err; (got == nil) != c.valid {
+		if got := validateTrafficPolicy("", c.in).Err; (got == nil) != c.valid {
 			t.Errorf("ValidateTrafficPolicy failed on %v: got valid=%v but wanted valid=%v: %v",
 				c.name, got == nil, c.valid, got)
 		}
@@ -3097,6 +3445,17 @@ func TestValidateConnectionPool(t *testing.T) {
 			},
 			valid: true,
 		},
+		{
+			name: "valid connection pool, http2 keepalive", in: &networking.ConnectionPoolSettings{
+				Http: &networking.ConnectionPoolSettings_HTTPSettings{
+					Http2KeepAlive: &networking.ConnectionPoolSettings_HTTPSettings_ConnectionKeepalive{
+						Interval: &durationpb.Duration{Seconds: 15},
+						Timeout:  &durationpb.Duration{Seconds: 5},
+					},
+				},
+			},
+			valid: true,
+		},
 
 		{name: "invalid connection pool, empty", in: &networking.ConnectionPoolSettings{}, valid: false},
 
@@ -3152,8 +3511,46 @@ func TestValidateConnectionPool(t *testing.T) {
 		},
 
 		{
+			name: "valid connection pool, tcp timeout disabled", in: &networking.ConnectionPoolSettings{
+				Tcp: &networking.ConnectionPoolSettings_TCPSettings{IdleTimeout: &durationpb.Duration{Seconds: 0}},
+			},
+			valid: true,
+		},
+
+		{
 			name: "invalid connection pool, bad max concurrent streams", in: &networking.ConnectionPoolSettings{
 				Http: &networking.ConnectionPoolSettings_HTTPSettings{MaxConcurrentStreams: -1},
+			},
+			valid: false,
+		},
+		{
+			name: "invalid connection pool, http2 keepalive without interval", in: &networking.ConnectionPoolSettings{
+				Http: &networking.ConnectionPoolSettings_HTTPSettings{
+					Http2KeepAlive: &networking.ConnectionPoolSettings_HTTPSettings_ConnectionKeepalive{
+						Timeout: &durationpb.Duration{Seconds: 5},
+					},
+				},
+			},
+			valid: false,
+		},
+		{
+			name: "invalid connection pool, http2 keepalive without timeout", in: &networking.ConnectionPoolSettings{
+				Http: &networking.ConnectionPoolSettings_HTTPSettings{
+					Http2KeepAlive: &networking.ConnectionPoolSettings_HTTPSettings_ConnectionKeepalive{
+						Interval: &durationpb.Duration{Seconds: 15},
+					},
+				},
+			},
+			valid: false,
+		},
+		{
+			name: "invalid connection pool, bad http2 keepalive interval", in: &networking.ConnectionPoolSettings{
+				Http: &networking.ConnectionPoolSettings_HTTPSettings{
+					Http2KeepAlive: &networking.ConnectionPoolSettings_HTTPSettings_ConnectionKeepalive{
+						Interval: &durationpb.Duration{Seconds: 15, Nanos: 5},
+						Timeout:  &durationpb.Duration{Seconds: 5},
+					},
+				},
 			},
 			valid: false,
 		},
@@ -3227,6 +3624,89 @@ func TestValidateLoadBalancer(t *testing.T) {
 				},
 			},
 			valid: false,
+		},
+
+		{
+			name: "valid load balancer with consistentHash load balancing and unique cookie attributes", in: &networking.LoadBalancerSettings{
+				LbPolicy: &networking.LoadBalancerSettings_ConsistentHash{
+					ConsistentHash: &networking.LoadBalancerSettings_ConsistentHashLB{
+						HashKey: &networking.LoadBalancerSettings_ConsistentHashLB_HttpCookie{
+							HttpCookie: &networking.LoadBalancerSettings_ConsistentHashLB_HTTPCookie{
+								Name: "test-cookie",
+								Ttl:  &duration,
+								Attributes: []*networking.LoadBalancerSettings_ConsistentHashLB_HTTPCookie_Attribute{
+									{Name: "SameSite", Value: "Strict"},
+									{Name: "Secure", Value: "true"},
+									{Name: "HttpOnly", Value: "true"},
+								},
+							},
+						},
+					},
+				},
+			},
+			valid: true,
+		},
+
+		{
+			name: "invalid load balancer with consistentHash load balancing and duplicate cookie attribute names", in: &networking.LoadBalancerSettings{
+				LbPolicy: &networking.LoadBalancerSettings_ConsistentHash{
+					ConsistentHash: &networking.LoadBalancerSettings_ConsistentHashLB{
+						HashKey: &networking.LoadBalancerSettings_ConsistentHashLB_HttpCookie{
+							HttpCookie: &networking.LoadBalancerSettings_ConsistentHashLB_HTTPCookie{
+								Name: "test-cookie",
+								Ttl:  &duration,
+								Attributes: []*networking.LoadBalancerSettings_ConsistentHashLB_HTTPCookie_Attribute{
+									{Name: "SameSite", Value: "Strict"},
+									{Name: "SameSite", Value: "Lax"}, // Duplicate name
+									{Name: "Secure", Value: "true"},
+								},
+							},
+						},
+					},
+				},
+			},
+			valid: false,
+		},
+
+		{
+			name: "invalid load balancer with consistentHash load balancing and empty cookie attribute name", in: &networking.LoadBalancerSettings{
+				LbPolicy: &networking.LoadBalancerSettings_ConsistentHash{
+					ConsistentHash: &networking.LoadBalancerSettings_ConsistentHashLB{
+						HashKey: &networking.LoadBalancerSettings_ConsistentHashLB_HttpCookie{
+							HttpCookie: &networking.LoadBalancerSettings_ConsistentHashLB_HTTPCookie{
+								Name: "test-cookie",
+								Ttl:  &duration,
+								Attributes: []*networking.LoadBalancerSettings_ConsistentHashLB_HTTPCookie_Attribute{
+									{Name: "SameSite", Value: "Strict"},
+									{Name: "", Value: "some-value"}, // Empty name
+									{Name: "Secure", Value: "true"},
+								},
+							},
+						},
+					},
+				},
+			},
+			valid: false,
+		},
+
+		{
+			name: "invalid: localityLbSetting and zoneAwareLbSetting both set",
+			in: &networking.LoadBalancerSettings{
+				LocalityLbSetting:  &networking.LocalityLoadBalancerSetting{},
+				ZoneAwareLbSetting: &networking.ZoneAwareLoadBalancerSetting{},
+			},
+			valid: false,
+		},
+		{
+			name: "valid: zoneAwareLbSetting only",
+			in: &networking.LoadBalancerSettings{
+				ZoneAwareLbSetting: &networking.ZoneAwareLoadBalancerSetting{
+					Failover: []*networking.ZoneAwareLoadBalancerSetting_Failover{
+						{From: "us-east", To: "eu-west"},
+					},
+				},
+			},
+			valid: true,
 		},
 	}
 
@@ -3317,6 +3797,7 @@ func TestValidateServiceEntries(t *testing.T) {
 		in      *networking.ServiceEntry
 		valid   bool
 		warning bool
+		labels  map[string]string
 	}{
 		{
 			name: "discovery type DNS", in: &networking.ServiceEntry{
@@ -3377,7 +3858,6 @@ func TestValidateServiceEntries(t *testing.T) {
 			valid:   true,
 			warning: false,
 		},
-
 		{
 			name: "discovery type DNS, multi hosts set with IP address and https port",
 			in: &networking.ServiceEntry{
@@ -3393,7 +3873,6 @@ func TestValidateServiceEntries(t *testing.T) {
 			valid:   true,
 			warning: true,
 		},
-
 		{
 			name: "discovery type DNS, IP address set",
 			in: &networking.ServiceEntry{
@@ -3412,7 +3891,6 @@ func TestValidateServiceEntries(t *testing.T) {
 			valid:   true,
 			warning: false,
 		},
-
 		{
 			name: "discovery type DNS, IP in endpoints", in: &networking.ServiceEntry{
 				Hosts: []string{"*.google.com"},
@@ -3428,7 +3906,17 @@ func TestValidateServiceEntries(t *testing.T) {
 			},
 			valid: true,
 		},
-
+		{
+			name: "discovery type DYNAMIC_DNS", in: &networking.ServiceEntry{
+				Hosts: []string{"*.google.com"},
+				Ports: []*networking.ServicePort{
+					{Number: 80, Protocol: "http", Name: "http-valid1"},
+					{Number: 8080, Protocol: "http", Name: "http-valid2"},
+				},
+				Resolution: networking.ServiceEntry_DYNAMIC_DNS,
+			},
+			valid: true,
+		},
 		{
 			name: "empty hosts", in: &networking.ServiceEntry{
 				Ports: []*networking.ServicePort{
@@ -3824,7 +4312,7 @@ func TestValidateServiceEntries(t *testing.T) {
 				Resolution: networking.ServiceEntry_DNS,
 			},
 			valid:   true,
-			warning: true,
+			warning: false,
 		},
 		{
 			name: "bad selector key", in: &networking.ServiceEntry{
@@ -4007,15 +4495,166 @@ func TestValidateServiceEntries(t *testing.T) {
 			valid:   true,
 			warning: true,
 		},
+		{
+			name: "discovery type DYNAMIC_DNS, unsupported TCP protocol", in: &networking.ServiceEntry{
+				Hosts:     []string{"*.google.com"},
+				Addresses: []string{},
+				Ports: []*networking.ServicePort{
+					{Number: 80, Protocol: "http", Name: "http-valid1"},
+					{Number: 81, Protocol: "TCP", Name: "tcp-valid1"},
+				},
+				Resolution: networking.ServiceEntry_DYNAMIC_DNS,
+			},
+			valid: false,
+		},
+		{
+			name: "discovery type DYNAMIC_DNS, GRPC protocol", in: &networking.ServiceEntry{
+				Hosts:     []string{"*.svc.cluster.local"},
+				Addresses: []string{},
+				Ports: []*networking.ServicePort{
+					{Number: 9090, Protocol: "GRPC", Name: "grpc"},
+				},
+				Resolution: networking.ServiceEntry_DYNAMIC_DNS,
+			},
+			valid: true,
+		},
+		{
+			name: "discovery type DYNAMIC_DNS, FQDN host", in: &networking.ServiceEntry{
+				Hosts:     []string{"google.com"},
+				Addresses: []string{},
+				Ports: []*networking.ServicePort{
+					{Number: 80, Protocol: "http", Name: "http-valid"},
+				},
+				Resolution: networking.ServiceEntry_DYNAMIC_DNS,
+			},
+			valid: false,
+		},
+		{
+			name: "discovery type DYNAMIC_DNS, endpoints set", in: &networking.ServiceEntry{
+				Hosts:     []string{"*.google.com"},
+				Addresses: []string{},
+				Ports: []*networking.ServicePort{
+					{Number: 80, Protocol: "http", Name: "http-valid1"},
+				},
+				Endpoints: []*networking.WorkloadEntry{
+					{Address: "in.google.com", Ports: map[string]uint32{"http-valid1": 9080}},
+				},
+				Resolution: networking.ServiceEntry_DYNAMIC_DNS,
+			},
+			valid: false,
+		},
+		{
+			name: "discovery type DYNAMIC_DNS, IP address set",
+			in: &networking.ServiceEntry{
+				Hosts:     []string{"*.google.com"},
+				Addresses: []string{"10.10.10.10"},
+				Ports: []*networking.ServicePort{
+					{Number: 80, Protocol: "http", Name: "http-valid1"},
+					{Number: 8080, Protocol: "http", Name: "http-valid2"},
+				},
+				Resolution: networking.ServiceEntry_DYNAMIC_DNS,
+			},
+			valid: false,
+		},
+		{
+			name: "discovery type DYNAMIC_DNS, empty hosts",
+			in: &networking.ServiceEntry{
+				Hosts:     []string{},
+				Addresses: []string{},
+				Ports: []*networking.ServicePort{
+					{Number: 80, Protocol: "http", Name: "http-valid1"},
+				},
+				Resolution: networking.ServiceEntry_DYNAMIC_DNS,
+			},
+			valid: false,
+		},
+		{
+			name: "discovery type DYNAMIC_DNS, multiple wildcarded hosts",
+			in: &networking.ServiceEntry{
+				Hosts:     []string{"*.google.com", "*.amazon.com"},
+				Addresses: []string{},
+				Ports: []*networking.ServicePort{
+					{Number: 80, Protocol: "http", Name: "http-valid1"},
+				},
+				Resolution: networking.ServiceEntry_DYNAMIC_DNS,
+			},
+			valid: true,
+		},
+		{
+			name: "discovery type DYNAMIC_DNS, internal mesh location",
+			in: &networking.ServiceEntry{
+				Hosts:     []string{"*.google.com"},
+				Addresses: []string{},
+				Ports: []*networking.ServicePort{
+					{Number: 80, Protocol: "http", Name: "http-valid1"},
+				},
+				Resolution: networking.ServiceEntry_DYNAMIC_DNS,
+				Location:   networking.ServiceEntry_MESH_INTERNAL,
+			},
+			valid: true,
+		},
+		{
+			name: "discovery type DYNAMIC_DNS, MESH_INTERNAL with waypoint (invalid)",
+			in: &networking.ServiceEntry{
+				Hosts:     []string{"*.google.com"},
+				Addresses: []string{},
+				Ports: []*networking.ServicePort{
+					{Number: 80, Protocol: "http", Name: "http-valid1"},
+				},
+				Resolution: networking.ServiceEntry_DYNAMIC_DNS,
+				Location:   networking.ServiceEntry_MESH_INTERNAL,
+			},
+			valid:  false,
+			labels: map[string]string{"istio.io/use-waypoint": "my-waypoint"},
+		},
+		{
+			name: "discovery type DYNAMIC_DNS, nil port",
+			in: &networking.ServiceEntry{
+				Hosts:    []string{"*.google.com"},
+				Location: networking.ServiceEntry_MESH_EXTERNAL,
+				Ports: []*networking.ServicePort{
+					nil,
+				},
+				Resolution: networking.ServiceEntry_DYNAMIC_DNS,
+			},
+			valid: false,
+		},
+		{
+			name: "nil port in ports array",
+			in: &networking.ServiceEntry{
+				Hosts: []string{"google.com"},
+				Ports: []*networking.ServicePort{
+					nil,
+				},
+				Resolution: networking.ServiceEntry_NONE,
+			},
+			valid: false,
+		},
+		{
+			name: "discovery type DNS with addresses, nil port",
+			in: &networking.ServiceEntry{
+				Hosts:     []string{"google.com"},
+				Addresses: []string{"1.2.3.4"},
+				Ports: []*networking.ServicePort{
+					nil,
+				},
+				Resolution: networking.ServiceEntry_DNS,
+			},
+			valid: false,
+		},
 	}
 
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
+			meta := config.Meta{
+				Name:      someName,
+				Namespace: someNamespace,
+			}
+			if c.labels != nil {
+				meta.Labels = c.labels
+			}
 			warning, err := ValidateServiceEntry(config.Config{
-				Meta: config.Meta{
-					Name:      someName,
-					Namespace: someNamespace,
-				},
+				Meta: meta,
 				Spec: c.in,
 			})
 			if (err == nil) != c.valid {
@@ -4087,6 +4726,58 @@ func TestValidateAuthorizationPolicy(t *testing.T) {
 				},
 			},
 			valid: true,
+		},
+		{
+			name: "good serviceAccounts",
+			in: &security_beta.AuthorizationPolicy{
+				Selector: &api.WorkloadSelector{
+					MatchLabels: map[string]string{
+						"app":     "httpbin",
+						"version": "v1",
+					},
+				},
+				Rules: []*security_beta.Rule{
+					{
+						From: []*security_beta.Rule_From{
+							{
+								Source: &security_beta.Source{
+									ServiceAccounts: []string{"ns1/sa1", "ns2/sa2"},
+								},
+							},
+							{
+								Source: &security_beta.Source{
+									Principals: []string{"sa2"},
+								},
+							},
+						},
+					},
+				},
+			},
+			valid: true,
+		},
+		{
+			name: "serviceAccounts and namespaces",
+			in: &security_beta.AuthorizationPolicy{
+				Selector: &api.WorkloadSelector{
+					MatchLabels: map[string]string{
+						"app":     "httpbin",
+						"version": "v1",
+					},
+				},
+				Rules: []*security_beta.Rule{
+					{
+						From: []*security_beta.Rule_From{
+							{
+								Source: &security_beta.Source{
+									ServiceAccounts: []string{"ns1/sa1", "ns2/sa2"},
+									Namespaces:      []string{"ns"},
+								},
+							},
+						},
+					},
+				},
+			},
+			valid: false,
 		},
 		{
 			name: "custom-good",
@@ -4751,6 +5442,23 @@ func TestValidateAuthorizationPolicy(t *testing.T) {
 			valid: false,
 		},
 		{
+			name: "ServiceAccounts-empty",
+			in: &security_beta.AuthorizationPolicy{
+				Rules: []*security_beta.Rule{
+					{
+						From: []*security_beta.Rule_From{
+							{
+								Source: &security_beta.Source{
+									ServiceAccounts: []string{"ns/sa", ""},
+								},
+							},
+						},
+					},
+				},
+			},
+			valid: false,
+		},
+		{
 			name: "NotNamespaces-empty",
 			in: &security_beta.AuthorizationPolicy{
 				Rules: []*security_beta.Rule{
@@ -5328,6 +6036,27 @@ func TestValidateSidecar(t *testing.T) {
 				},
 			},
 		}, true, false},
+		{"import all except a namespace", &networking.Sidecar{
+			Egress: []*networking.IstioEgressListener{
+				{
+					Hosts: []string{"*/*", "~ns1/*"},
+				},
+			},
+		}, true, false},
+		{"import all except an exact host", &networking.Sidecar{
+			Egress: []*networking.IstioEgressListener{
+				{
+					Hosts: []string{"*/*", "~/foo.com"},
+				},
+			},
+		}, true, false},
+		{"exclude with invalid namespace", &networking.Sidecar{
+			Egress: []*networking.IstioEgressListener{
+				{
+					Hosts: []string{"*/*", "~Invalid_NS/*"},
+				},
+			},
+		}, false, false},
 		{"bad egress host 1", &networking.Sidecar{
 			Egress: []*networking.IstioEgressListener{
 				{
@@ -5866,6 +6595,16 @@ func TestValidateSidecar(t *testing.T) {
 				},
 			},
 		}, false, false},
+		{"ALLOW_ANY_DYNAMIC_DNS rejected in sidecar", &networking.Sidecar{
+			OutboundTrafficPolicy: &networking.OutboundTrafficPolicy{
+				Mode: networking.OutboundTrafficPolicy_Mode(3),
+			},
+			Egress: []*networking.IstioEgressListener{
+				{
+					Hosts: []string{"*/*"},
+				},
+			},
+		}, false, false},
 		{"sidecar egress only one wildcarded", &networking.Sidecar{
 			Egress: []*networking.IstioEgressListener{
 				{
@@ -6101,6 +6840,88 @@ func TestValidateSidecar(t *testing.T) {
 				},
 			},
 		}, false, false},
+		{"ingress tls credentialNames is not supported in IPv4", &networking.Sidecar{
+			Ingress: []*networking.IstioIngressListener{
+				{
+					Port: &networking.SidecarPort{
+						Protocol: "tcp",
+						Number:   90,
+						Name:     "foo",
+					},
+					DefaultEndpoint: "127.0.0.1:9999",
+					Tls: &networking.ServerTLSSettings{
+						Mode:            networking.ServerTLSSettings_SIMPLE,
+						CredentialNames: []string{"secret-name"},
+					},
+				},
+			},
+		}, false, false},
+		{"ingress tls credentialNames is not supported in IPv6", &networking.Sidecar{
+			Ingress: []*networking.IstioIngressListener{
+				{
+					Port: &networking.SidecarPort{
+						Protocol: "tcp",
+						Number:   90,
+						Name:     "foo",
+					},
+					DefaultEndpoint: "[::1]:9999",
+					Tls: &networking.ServerTLSSettings{
+						Mode:            networking.ServerTLSSettings_SIMPLE,
+						CredentialNames: []string{"secret-name"},
+					},
+				},
+			},
+		}, false, false},
+		{"ingress tls tlsCertificates is not supported in IPv4", &networking.Sidecar{
+			Ingress: []*networking.IstioIngressListener{
+				{
+					Port: &networking.SidecarPort{
+						Protocol: "tcp",
+						Number:   90,
+						Name:     "foo",
+					},
+					DefaultEndpoint: "127.0.0.1:9999",
+					Tls: &networking.ServerTLSSettings{
+						Mode: networking.ServerTLSSettings_SIMPLE,
+						TlsCertificates: []*networking.ServerTLSSettings_TLSCertificate{
+							{
+								ServerCertificate: "/etc/istio/ingress-certs/tls.crt",
+								PrivateKey:        "/etc/istio/ingress-certs/tls.key",
+							},
+							{
+								ServerCertificate: "/etc/istio/ingress-certs/tls2.crt",
+								PrivateKey:        "/etc/istio/ingress-certs/tls2.key",
+							},
+						},
+					},
+				},
+			},
+		}, false, false},
+		{"ingress tls tlsCertificates is not supported in IPv6", &networking.Sidecar{
+			Ingress: []*networking.IstioIngressListener{
+				{
+					Port: &networking.SidecarPort{
+						Protocol: "tcp",
+						Number:   90,
+						Name:     "foo",
+					},
+					DefaultEndpoint: "[::1]:9999",
+					Tls: &networking.ServerTLSSettings{
+						Mode: networking.ServerTLSSettings_SIMPLE,
+						TlsCertificates: []*networking.ServerTLSSettings_TLSCertificate{
+							{
+								ServerCertificate: "/etc/istio/ingress-certs/tls.crt",
+								PrivateKey:        "/etc/istio/ingress-certs/tls.key",
+							},
+							{
+								ServerCertificate: "/etc/istio/ingress-certs/tls2.crt",
+								PrivateKey:        "/etc/istio/ingress-certs/tls2.key",
+							},
+						},
+					},
+				},
+			},
+		}, false, false},
 		// We're using the same validation code as DestinationRule, so we're really trusting the TrafficPolicy
 		// validation code's testing. Here we just want to exercise the edge cases around Sidecar specifically.
 		{"valid inbound connection pool", &networking.Sidecar{
@@ -6269,7 +7090,7 @@ func TestValidateRequestAuthentication(t *testing.T) {
 			valid: false,
 		},
 		{
-			name:       "empty issuer",
+			name:       "empty issuer and jwksUri",
 			configName: "foo",
 			in: &security_beta.RequestAuthentication{
 				JwtRules: []*security_beta.JWTRule{
@@ -6279,6 +7100,19 @@ func TestValidateRequestAuthentication(t *testing.T) {
 				},
 			},
 			valid: false,
+		},
+		{
+			name:       "empty issuer and set jwksUri",
+			configName: "foo",
+			in: &security_beta.RequestAuthentication{
+				JwtRules: []*security_beta.JWTRule{
+					{
+						Issuer:  "",
+						JwksUri: "https://foo.com/cert",
+					},
+				},
+			},
+			valid: true,
 		},
 		{
 			name:       "bad JwksUri - no protocol",
@@ -6560,6 +7394,21 @@ func TestValidateRequestAuthentication(t *testing.T) {
 				},
 			},
 			valid: false,
+		},
+		{
+			// JWKS bearing private RSA components warns but is still accepted.
+			name:       "jwks with private RSA key warns",
+			configName: constants.DefaultAuthenticationPolicyName,
+			in: &security_beta.RequestAuthentication{
+				JwtRules: []*security_beta.JWTRule{
+					{
+						Issuer: "foo.com",
+						Jwks:   `{"keys":[{"kty":"RSA","e":"AQAB","kid":"private","n":"xAE7eB6qugXyCAG3yhh7pkDkT65pHymX-P7KfIupjf59vsdo91bSP9C8H07pSAGQO1MV_xFj9VswgsCg4R6otmg5PV2He95lZdHtOcU5DXIg_pbhLdKXbi66GlVeK6ABZOUW3WYtnNHD-91gVuoeJT_DwtGGcp4ignkgXfkiEm4sw-4sfb4qdt5oLbyVpmW6x9cfa7vs2WTfURiCrBoUqgBo_-4WTiULmmHSGZHOjzwa8WtrtOQGsAFjIbno85jp6MnGGGZPYZbDAa_b3y5u-YpW7ypZrvD8BgtKVjgtQgZhLAGezMt0ua3DRrWnKqTZ0BJ_EyxOGuHJrLsn00fnMQ","d":"jJVKLOMXjlSnICzfP_eWshwR_DQp1U_GBLn-bL2qf90U5GMRDg5fT7Df3M2zL3DhMzdLDIeBmh-ujMTPjU0PWyVN5JX9LBhAOgsX3DKAdR2KMlEsBM4HE6VV1JhqQozqAcSPwhBHJM_pBM21S94EZf_RbA0PvyLcjeLP4WqAOY-J4OXVR3rzKwAH02NjLBR-Tnoiv-WlPZbE9SmYJL0G3xRFVELYwf4l7t-PSrZxk6V_xrTLpsScA-WICTaXmRGyDOSBuiBfHfDQyiTfQEUjcc6aQ7slLAwfmU2AeYJqHk1zwZpDJpgEf9G3eYi09Q2MLpzSjMxWVqV5L7TtcoGv5Q"}]}`, // nolint: lll
+					},
+				},
+			},
+			valid:   true,
+			warning: true,
 		},
 		{
 			name:       "null outputClaimToHeader",
@@ -7477,6 +8326,342 @@ func TestValidateWasmPlugin(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			warn, err := ValidateWasmPlugin(config.Config{
+				Meta: config.Meta{
+					Name:      someName,
+					Namespace: someNamespace,
+				},
+				Spec: tt.in,
+			})
+			checkValidationMessage(t, warn, err, tt.warning, tt.out)
+		})
+	}
+}
+
+func TestValidateTrafficExtension(t *testing.T) {
+	tests := []struct {
+		name    string
+		in      proto.Message
+		out     string
+		warning string
+	}{
+		{
+			"invalid message",
+			&networking.Server{},
+			"cannot cast",
+			"",
+		},
+		{
+			"neither wasm nor lua set",
+			&extensions.TrafficExtension{},
+			"exactly one of wasm or lua must be set",
+			"",
+		},
+		{
+			"valid lua config",
+			&extensions.TrafficExtension{
+				FilterConfig: &extensions.TrafficExtension_Lua{Lua: &extensions.LuaConfig{
+					InlineCode: "function envoy_on_request(request_handle)\n  request_handle:headers():add('x-foo', 'bar')\nend",
+				}},
+			},
+			"",
+			"",
+		},
+		{
+			"lua code empty",
+			&extensions.TrafficExtension{
+				FilterConfig: &extensions.TrafficExtension_Lua{Lua: &extensions.LuaConfig{
+					InlineCode: "",
+				}},
+			},
+			"lua.inlineCode cannot be empty",
+			"",
+		},
+		{
+			"lua code too large",
+			&extensions.TrafficExtension{
+				FilterConfig: &extensions.TrafficExtension_Lua{Lua: &extensions.LuaConfig{
+					InlineCode: string(make([]byte, 65537)),
+				}},
+			},
+			"lua.inlineCode exceeds maximum size of 64KB",
+			"",
+		},
+		{
+			"valid wasm config",
+			&extensions.TrafficExtension{
+				FilterConfig: &extensions.TrafficExtension_Wasm{Wasm: &extensions.WasmConfig{
+					Url: "http://test.com/test",
+				}},
+			},
+			"",
+			"",
+		},
+		{
+			"wasm url empty",
+			&extensions.TrafficExtension{
+				FilterConfig: &extensions.TrafficExtension_Wasm{Wasm: &extensions.WasmConfig{
+					Url: "",
+				}},
+			},
+			"url field needs to be set",
+			"",
+		},
+		{
+			"wasm wrong scheme",
+			&extensions.TrafficExtension{
+				FilterConfig: &extensions.TrafficExtension_Wasm{Wasm: &extensions.WasmConfig{
+					Url: "ftp://test.com/test",
+				}},
+			},
+			"unsupported scheme",
+			"",
+		},
+		{
+			"wasm valid http",
+			&extensions.TrafficExtension{
+				FilterConfig: &extensions.TrafficExtension_Wasm{Wasm: &extensions.WasmConfig{
+					Url: "http://test.com/test",
+				}},
+			},
+			"",
+			"",
+		},
+		{
+			"wasm valid http w/ sha",
+			&extensions.TrafficExtension{
+				FilterConfig: &extensions.TrafficExtension_Wasm{Wasm: &extensions.WasmConfig{
+					Url:    "http://test.com/test",
+					Sha256: "01ba4719c80b6fe911b091a7c05124b64eeece964e09c058ef8f9805daca546b",
+				}},
+			},
+			"",
+			"",
+		},
+		{
+			"wasm short sha",
+			&extensions.TrafficExtension{
+				FilterConfig: &extensions.TrafficExtension_Wasm{Wasm: &extensions.WasmConfig{
+					Url:    "http://test.com/test",
+					Sha256: "01ba47",
+				}},
+			},
+			"sha256 field must be 64 characters long",
+			"",
+		},
+		{
+			"wasm invalid sha characters",
+			&extensions.TrafficExtension{
+				FilterConfig: &extensions.TrafficExtension_Wasm{Wasm: &extensions.WasmConfig{
+					Url:    "http://test.com/test",
+					Sha256: "01Ba4719c80b6fe911b091a7c05124b64eeece964e09c058ef8f9805daca546b",
+				}},
+			},
+			"sha256 field must match [a-f0-9]{64} pattern",
+			"",
+		},
+		{
+			"wasm valid oci",
+			&extensions.TrafficExtension{
+				FilterConfig: &extensions.TrafficExtension_Wasm{Wasm: &extensions.WasmConfig{
+					Url: "oci://test.com/test",
+				}},
+			},
+			"",
+			"",
+		},
+		{
+			"wasm valid oci no scheme",
+			&extensions.TrafficExtension{
+				FilterConfig: &extensions.TrafficExtension_Wasm{Wasm: &extensions.WasmConfig{
+					Url: "test.com/test",
+				}},
+			},
+			"",
+			"",
+		},
+		{
+			"wasm invalid vm config - invalid env name",
+			&extensions.TrafficExtension{
+				FilterConfig: &extensions.TrafficExtension_Wasm{Wasm: &extensions.WasmConfig{
+					Url: "test.com/test",
+					VmConfig: &extensions.VmConfig{
+						Env: []*extensions.EnvVar{
+							{
+								Name:      "",
+								ValueFrom: extensions.EnvValueSource_HOST,
+							},
+						},
+					},
+				}},
+			},
+			"spec.vmConfig.env invalid",
+			"",
+		},
+		{
+			"wasm invalid vm config - duplicate env",
+			&extensions.TrafficExtension{
+				FilterConfig: &extensions.TrafficExtension_Wasm{Wasm: &extensions.WasmConfig{
+					Url: "test.com/test",
+					VmConfig: &extensions.VmConfig{
+						Env: []*extensions.EnvVar{
+							{
+								Name:  "ENV1",
+								Value: "VAL1",
+							},
+							{
+								Name:  "ENV1",
+								Value: "VAL1",
+							},
+						},
+					},
+				}},
+			},
+			"duplicate env",
+			"",
+		},
+		{
+			"valid lua with selector",
+			&extensions.TrafficExtension{
+				Selector: &api.WorkloadSelector{
+					MatchLabels: map[string]string{"app": "test"},
+				},
+				FilterConfig: &extensions.TrafficExtension_Lua{Lua: &extensions.LuaConfig{
+					InlineCode: "function envoy_on_request() end",
+				}},
+			},
+			"",
+			"",
+		},
+		{
+			"valid lua with targetRefs",
+			&extensions.TrafficExtension{
+				TargetRefs: []*api.PolicyTargetReference{
+					{
+						Group: gvk.KubernetesGateway.Group,
+						Kind:  gvk.KubernetesGateway.Kind,
+						Name:  "gateway",
+					},
+				},
+				FilterConfig: &extensions.TrafficExtension_Lua{Lua: &extensions.LuaConfig{
+					InlineCode: "function envoy_on_request() end",
+				}},
+			},
+			"",
+			"",
+		},
+		{
+			"both selector and targetRefs",
+			&extensions.TrafficExtension{
+				Selector: &api.WorkloadSelector{
+					MatchLabels: map[string]string{"app": "test"},
+				},
+				TargetRefs: []*api.PolicyTargetReference{
+					{
+						Group: gvk.KubernetesGateway.Group,
+						Kind:  gvk.KubernetesGateway.Kind,
+						Name:  "gateway",
+					},
+				},
+				FilterConfig: &extensions.TrafficExtension_Lua{Lua: &extensions.LuaConfig{
+					InlineCode: "function envoy_on_request() end",
+				}},
+			},
+			"only one of targetRefs or workloadSelector can be set",
+			"",
+		},
+		{
+			"invalid match - nil traffic selector",
+			&extensions.TrafficExtension{
+				Match: []*extensions.TrafficSelector{nil},
+				FilterConfig: &extensions.TrafficExtension_Lua{Lua: &extensions.LuaConfig{
+					InlineCode: "function envoy_on_request() end",
+				}},
+			},
+			"spec.Match[0] is nil",
+			"",
+		},
+		{
+			"invalid match - nil port selector",
+			&extensions.TrafficExtension{
+				Match: []*extensions.TrafficSelector{
+					{
+						Ports: []*api.PortSelector{nil},
+					},
+				},
+				FilterConfig: &extensions.TrafficExtension_Lua{Lua: &extensions.LuaConfig{
+					InlineCode: "function envoy_on_request() end",
+				}},
+			},
+			"spec.Match[0].Ports[0] is nil",
+			"",
+		},
+		{
+			"invalid match - port out of range (too low)",
+			&extensions.TrafficExtension{
+				Match: []*extensions.TrafficSelector{
+					{
+						Ports: []*api.PortSelector{
+							{Number: 0},
+						},
+					},
+				},
+				FilterConfig: &extensions.TrafficExtension_Lua{Lua: &extensions.LuaConfig{
+					InlineCode: "function envoy_on_request() end",
+				}},
+			},
+			"spec.Match[0].Ports[0] is out of range: 0",
+			"",
+		},
+		{
+			"invalid match - port out of range (too high)",
+			&extensions.TrafficExtension{
+				Match: []*extensions.TrafficSelector{
+					{
+						Ports: []*api.PortSelector{
+							{Number: 65536},
+						},
+					},
+				},
+				FilterConfig: &extensions.TrafficExtension_Lua{Lua: &extensions.LuaConfig{
+					InlineCode: "function envoy_on_request() end",
+				}},
+			},
+			"spec.Match[0].Ports[0] is out of range: 65536",
+			"",
+		},
+		{
+			"valid match with port",
+			&extensions.TrafficExtension{
+				Match: []*extensions.TrafficSelector{
+					{
+						Mode: api.WorkloadMode_CLIENT,
+						Ports: []*api.PortSelector{
+							{Number: 8080},
+						},
+					},
+				},
+				FilterConfig: &extensions.TrafficExtension_Lua{Lua: &extensions.LuaConfig{
+					InlineCode: "function envoy_on_request() end",
+				}},
+			},
+			"",
+			"",
+		},
+		{
+			"wasm plugin name too long",
+			&extensions.TrafficExtension{
+				FilterConfig: &extensions.TrafficExtension_Wasm{Wasm: &extensions.WasmConfig{
+					Url:        "test.com/test",
+					PluginName: string(make([]byte, 257)),
+				}},
+			},
+			"pluginName field must be less than 256 characters long",
+			"",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			warn, err := ValidateTrafficExtension(config.Config{
 				Meta: config.Meta{
 					Name:      someName,
 					Namespace: someNamespace,

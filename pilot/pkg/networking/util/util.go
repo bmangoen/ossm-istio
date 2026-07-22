@@ -23,6 +23,7 @@ import (
 	"strconv"
 	"strings"
 
+	cluster "github.com/envoyproxy/go-control-plane/envoy/config/cluster/v3"
 	core "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
 	endpoint "github.com/envoyproxy/go-control-plane/envoy/config/endpoint/v3"
 	listener "github.com/envoyproxy/go-control-plane/envoy/config/listener/v3"
@@ -43,14 +44,15 @@ import (
 	"istio.io/istio/pilot/pkg/model"
 	istionetworking "istio.io/istio/pilot/pkg/networking"
 	"istio.io/istio/pilot/pkg/serviceregistry/util/label"
+	networkutil "istio.io/istio/pilot/pkg/util/network"
 	"istio.io/istio/pilot/pkg/util/protoconv"
 	"istio.io/istio/pkg/config"
 	"istio.io/istio/pkg/config/constants"
+	"istio.io/istio/pkg/config/schema/gvk"
 	kubelabels "istio.io/istio/pkg/kube/labels"
 	"istio.io/istio/pkg/log"
 	pm "istio.io/istio/pkg/model"
 	"istio.io/istio/pkg/proto/merge"
-	"istio.io/istio/pkg/util/strcase"
 	"istio.io/istio/pkg/wellknown"
 )
 
@@ -66,15 +68,33 @@ const (
 	// PassthroughCluster
 	Passthrough = "allow_any"
 
+	// AllowAnyDynamicDNSCluster is the DFP cluster used for ALLOW_ANY_DYNAMIC_DNS outbound traffic policy mode.
+	AllowAnyDynamicDNSCluster = "AllowAnyDynamicDNSCluster"
+	// AllowAnyDynamicDNS is the name of the virtual host and route name for ALLOW_ANY_DYNAMIC_DNS mode.
+	AllowAnyDynamicDNS = "allow_any_dynamic_dns"
+	// AllowAnyDFPDNSCacheName is the shared DNS cache name used by the DFP cluster and filters for ALLOW_ANY_DYNAMIC_DNS.
+	AllowAnyDFPDNSCacheName = "allow_any_dfp_dns_cache"
+
 	// PassthroughFilterChain to catch traffic that doesn't match other filter chains.
 	PassthroughFilterChain = "PassthroughFilterChain"
 
 	// Inbound pass through cluster need to the bind the loopback ip address for the security and loop avoidance.
 	InboundPassthroughCluster = "InboundPassthroughCluster"
 
+	// SelfDiscoveryCluster is the self-discovery static cluster injected into the Envoy bootstrap when
+	// ISTIO_META_ENABLE_SELF_DISCOVERY is set. It mirrors the proxy's own service endpoints within
+	// its region and is referenced as cluster_manager.local_cluster_name so Envoy can compute the
+	// per-zone host distribution used by zone-aware load balancing. This value must stay in sync with
+	// the "local_cluster" name hardcoded in the envoy bootstrap template.
+	SelfDiscoveryCluster = "local_cluster"
+
 	// IstioMetadataKey is the key under which metadata is added to a route or cluster
 	// regarding the virtual service or destination rule used for each
 	IstioMetadataKey = "istio"
+
+	// IstioPeerMetadataKey is the key under which metadata for controlling peer metadata
+	// discovery is added to clusters and endpoints
+	IstioPeerMetadataKey = "istio.peer_metadata"
 
 	// EnvoyTransportSocketMetadataKey is the key under which metadata is added to an endpoint
 	// which determines the endpoint level transport socket configuration.
@@ -91,6 +111,34 @@ const (
 	// to indicate whether Istio rewrite the ALPN headers
 	AlpnOverrideMetadataKey = "alpn_override"
 )
+
+// SelectDNSLookupFamily derives the DNS lookup family for DNS-resolving constructs (STRICT_DNS /
+// LOGICAL_DNS clusters and dynamic forward proxy DNS caches) from the proxy's own IP addresses.
+// Centralizing this keeps the behavior consistent across the default cluster builder and all the
+// DFP builders. When the proxy IPs are unknown the historical V4_ONLY default is used.
+func SelectDNSLookupFamily(proxyIPAddresses []string) cluster.Cluster_DnsLookupFamily {
+	switch {
+	case len(proxyIPAddresses) == 0:
+		return cluster.Cluster_V4_ONLY
+	case networkutil.AllIPv4(proxyIPAddresses):
+		// IPv4 only.
+		return cluster.Cluster_V4_ONLY
+	case networkutil.AllIPv6(proxyIPAddresses):
+		// IPv6 only. Istio sees only IPv6 addresses, but there may be a link-local interface
+		// serving IPv4. Allow both families so we do not break resolution to IPv4-only destinations.
+		if features.EnableAdditionalIpv4OutboundListenerForIpv6Only {
+			return cluster.Cluster_ALL
+		}
+		return cluster.Cluster_V6_ONLY
+	default:
+		// Dual stack: use Cluster_ALL to enable Happy Eyeballs when dual stack is enabled,
+		// otherwise keep the original V4_ONLY behavior.
+		if features.EnableDualStack {
+			return cluster.Cluster_ALL
+		}
+		return cluster.Cluster_V4_ONLY
+	}
+}
 
 // ALPNH2Only advertises that Proxy is going to use HTTP/2 when talking to the cluster.
 var ALPNH2Only = pm.ALPNH2Only
@@ -356,17 +404,21 @@ func BuildConfigInfoMetadata(config config.Meta) *core.Metadata {
 func AddConfigInfoMetadata(metadata *core.Metadata, config config.Meta) *core.Metadata {
 	if metadata == nil {
 		metadata = &core.Metadata{
-			FilterMetadata: map[string]*structpb.Struct{},
+			FilterMetadata: make(map[string]*structpb.Struct, 1),
 		}
 	}
+
 	s := "/apis/" + config.GroupVersionKind.Group + "/" + config.GroupVersionKind.Version + "/namespaces/" + config.Namespace + "/" +
-		strcase.CamelCaseToKebabCase(config.GroupVersionKind.Kind) + "/" + config.Name
-	if _, ok := metadata.FilterMetadata[IstioMetadataKey]; !ok {
-		metadata.FilterMetadata[IstioMetadataKey] = &structpb.Struct{
-			Fields: map[string]*structpb.Value{},
+		gvk.KebabKind(config.GroupVersionKind.Kind) + "/" + config.Name
+
+	istioMeta, ok := metadata.FilterMetadata[IstioMetadataKey]
+	if !ok {
+		istioMeta = &structpb.Struct{
+			Fields: make(map[string]*structpb.Value, 1),
 		}
+		metadata.FilterMetadata[IstioMetadataKey] = istioMeta
 	}
-	metadata.FilterMetadata[IstioMetadataKey].Fields["config"] = &structpb.Value{
+	istioMeta.Fields["config"] = &structpb.Value{
 		Kind: &structpb.Value_StringValue{
 			StringValue: s,
 		},
@@ -456,10 +508,6 @@ func MergeAnyWithAny(dst *anypb.Any, src *anypb.Any) (*anypb.Any, error) {
 // AppendLbEndpointMetadata adds metadata values to a lb endpoint using the passed in metadata as base.
 func AppendLbEndpointMetadata(istioMetadata *model.EndpointMetadata, envoyMetadata *core.Metadata,
 ) {
-	if !features.EndpointTelemetryLabel || !features.EnableTelemetryLabel {
-		return
-	}
-
 	if envoyMetadata.FilterMetadata == nil {
 		envoyMetadata.FilterMetadata = map[string]*structpb.Struct{}
 	}
@@ -477,7 +525,7 @@ func AppendLbEndpointMetadata(istioMetadata *model.EndpointMetadata, envoyMetada
 	// server does not have sidecar injected, and request fails to reach server and thus metadata exchange does not happen.
 	// Due to performance concern, telemetry metadata is compressed into a semicolon separated string:
 	// workload-name;namespace;canonical-service-name;canonical-service-revision;cluster-id.
-	if features.EndpointTelemetryLabel {
+	if features.EnableTelemetryLabel && features.EndpointTelemetryLabel {
 		// allow defaulting for non-injected cases
 		canonicalName, canonicalRevision := kubelabels.CanonicalService(istioMetadata.Labels, istioMetadata.WorkloadName)
 
@@ -510,7 +558,18 @@ func addIstioEndpointLabel(metadata *core.Metadata, key string, val *structpb.Va
 	metadata.FilterMetadata[IstioMetadataKey].Fields[key] = val
 }
 
-// IsAllowAnyOutbound checks if allow_any is enabled for outbound traffic
+// IsAllowAnyDynamicDNSOutbound checks if ALLOW_ANY_DYNAMIC_DNS mode is enabled for outbound traffic.
+// This mode is scoped to sidecar proxies only — gateways are not eligible.
+func IsAllowAnyDynamicDNSOutbound(node *model.Proxy) bool {
+	return node.Type == model.SidecarProxy &&
+		node.SidecarScope != nil &&
+		node.SidecarScope.OutboundTrafficPolicy != nil &&
+		meshconfig.MeshConfig_OutboundTrafficPolicy_Mode(node.SidecarScope.OutboundTrafficPolicy.Mode) ==
+			meshconfig.MeshConfig_OutboundTrafficPolicy_ALLOW_ANY_DYNAMIC_DNS
+}
+
+// IsAllowAnyOutbound checks if outbound traffic to unknown destinations should be allowed
+// (either via ALLOW_ANY passthrough or ALLOW_ANY_DYNAMIC_DNS via DFP).
 func IsAllowAnyOutbound(node *model.Proxy) bool {
 	return node.SidecarScope != nil &&
 		node.SidecarScope.OutboundTrafficPolicy != nil &&
@@ -728,6 +787,24 @@ func BuildTunnelMetadataStruct(address string, port int, waypoint string) *struc
 	return st
 }
 
+func AppendDoubleHBONEMetadata(service string, port int, envoyMetadata *core.Metadata) {
+	if envoyMetadata.FilterMetadata == nil {
+		envoyMetadata.FilterMetadata = map[string]*structpb.Struct{}
+	}
+	target := buildDoubleHBONEMetadataStruct(service, port)
+	addIstioEndpointLabel(envoyMetadata, "double_hbone", structpb.NewStructValue(target))
+}
+
+func buildDoubleHBONEMetadataStruct(service string, port int) *structpb.Struct {
+	m := map[string]interface{}{
+		// the actual service domain name and port that we want to connect to, these are used
+		// in the HTTP2 CONNECT request :authority
+		"hbone_target_address": DomainName(service, port),
+	}
+	st, _ := structpb.NewStruct(m)
+	return st
+}
+
 func BuildStatefulSessionFilter(svc *model.Service) *hcm.HttpFilter {
 	filterConfig := MaybeBuildStatefulSessionFilterConfig(svc)
 	if filterConfig == nil {
@@ -826,35 +903,9 @@ func MergeSubsetTrafficPolicy(original, subsetPolicy *networking.TrafficPolicy, 
 
 	// merge DR with subset traffic policy
 	// Override with subset values.
-	mergedPolicy := ShallowCopyTrafficPolicy(original)
+	mergedPolicy := model.ShallowCopyTrafficPolicy(original)
 
-	return mergeTrafficPolicy(mergedPolicy, subsetPolicy, hasPortLevel)
-}
-
-// Note that port-level settings will override the destination-level settings.
-// Traffic settings specified at the destination-level will not be inherited when overridden by port-level settings,
-// i.e. default values will be applied to fields omitted in port-level traffic policies.
-func mergeTrafficPolicy(mergedPolicy, subsetPolicy *networking.TrafficPolicy, hasPortLevel bool) *networking.TrafficPolicy {
-	if subsetPolicy.ConnectionPool != nil || hasPortLevel {
-		mergedPolicy.ConnectionPool = subsetPolicy.ConnectionPool
-	}
-	if subsetPolicy.OutlierDetection != nil || hasPortLevel {
-		mergedPolicy.OutlierDetection = subsetPolicy.OutlierDetection
-	}
-	if subsetPolicy.LoadBalancer != nil || hasPortLevel {
-		mergedPolicy.LoadBalancer = subsetPolicy.LoadBalancer
-	}
-	if subsetPolicy.Tls != nil || hasPortLevel {
-		mergedPolicy.Tls = subsetPolicy.Tls
-	}
-
-	if subsetPolicy.Tunnel != nil {
-		mergedPolicy.Tunnel = subsetPolicy.Tunnel
-	}
-	if subsetPolicy.ProxyProtocol != nil {
-		mergedPolicy.ProxyProtocol = subsetPolicy.ProxyProtocol
-	}
-	return mergedPolicy
+	return model.MergeTrafficPolicy(mergedPolicy, subsetPolicy, hasPortLevel)
 }
 
 func shadowCopyPortTrafficPolicy(portTrafficPolicy *networking.TrafficPolicy_PortTrafficPolicy) *networking.TrafficPolicy {
@@ -869,28 +920,7 @@ func shadowCopyPortTrafficPolicy(portTrafficPolicy *networking.TrafficPolicy_Por
 	return ret
 }
 
-// ShallowCopyTrafficPolicy shallow copy a traffic policy, portLevelSettings are ignored.
-func ShallowCopyTrafficPolicy(original *networking.TrafficPolicy) *networking.TrafficPolicy {
-	if original == nil {
-		return nil
-	}
-	ret := &networking.TrafficPolicy{}
-	ret.ConnectionPool = original.ConnectionPool
-	ret.LoadBalancer = original.LoadBalancer
-	ret.OutlierDetection = original.OutlierDetection
-	ret.Tls = original.Tls
-	ret.Tunnel = original.Tunnel
-	ret.ProxyProtocol = original.ProxyProtocol
-	return ret
-}
-
-func VersionGreaterOrEqual124(proxy *model.Proxy) bool {
-	return proxy.VersionGreaterAndEqual(&model.IstioVersion{Major: 1, Minor: 24, Patch: -1})
-}
-
 func DelimitedStatsPrefix(statPrefix string) string {
-	if features.EnableDelimitedStatsTagRegex {
-		statPrefix += constants.StatPrefixDelimiter
-	}
+	statPrefix += constants.StatPrefixDelimiter
 	return statPrefix
 }

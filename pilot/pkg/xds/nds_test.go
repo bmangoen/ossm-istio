@@ -31,6 +31,7 @@ import (
 	"istio.io/istio/pkg/config/constants"
 	dnsProto "istio.io/istio/pkg/dns/proto"
 	"istio.io/istio/pkg/test"
+	"istio.io/istio/pkg/util/sets"
 )
 
 func TestNDS(t *testing.T) {
@@ -126,13 +127,13 @@ func TestGenerate(t *testing.T) {
 		{
 			name:      "partial push with headless endpoint update",
 			proxy:     &model.Proxy{Type: model.SidecarProxy},
-			request:   &model.PushRequest{Reason: model.NewReasonStats(model.HeadlessEndpointUpdate)},
+			request:   &model.PushRequest{Reason: model.NewReasonStats(model.HeadlessEndpointUpdate), Forced: true},
 			nameTable: emptyNameTable,
 		},
 		{
-			name:      "full push",
+			name:      "forced push",
 			proxy:     &model.Proxy{Type: model.SidecarProxy},
-			request:   &model.PushRequest{Full: true},
+			request:   &model.PushRequest{Forced: true},
 			nameTable: emptyNameTable,
 		},
 		{
@@ -152,7 +153,7 @@ func TestGenerate(t *testing.T) {
 
 			gen := s.Discovery.Generators[v3.NameTableType]
 			tt.request.Start = time.Now()
-			nametable, _, _ := gen.Generate(s.SetupProxy(tt.proxy), &model.WatchedResource{ResourceNames: tt.resources}, tt.request)
+			nametable, _, _ := gen.Generate(s.SetupProxy(tt.proxy), &model.WatchedResource{ResourceNames: sets.New(tt.resources...)}, tt.request)
 			if len(tt.nameTable) == 0 {
 				if len(nametable) != 0 {
 					t.Errorf("unexpected nametable. want: %v, got: %v", tt.nameTable, nametable)

@@ -15,15 +15,26 @@
 package core
 
 import (
+	"net"
+	"strconv"
 	"time"
 
 	mysql "github.com/envoyproxy/go-control-plane/contrib/envoy/extensions/filters/network/mysql_proxy/v3"
+	cluster "github.com/envoyproxy/go-control-plane/envoy/config/cluster/v3"
+	core "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
 	listener "github.com/envoyproxy/go-control-plane/envoy/config/listener/v3"
+	dfp "github.com/envoyproxy/go-control-plane/envoy/extensions/common/dynamic_forward_proxy/v3"
+	httpdfp "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/dynamic_forward_proxy/v3"
+	hcm "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/network/http_connection_manager/v3"
 	mongo "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/network/mongo_proxy/v3"
 	redis "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/network/redis_proxy/v3"
+	snidfp "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/network/sni_dynamic_forward_proxy/v3"
 	tcp "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/network/tcp_proxy/v3"
+	cares "github.com/envoyproxy/go-control-plane/envoy/extensions/network/dns_resolver/cares/v3"
 	hashpolicy "github.com/envoyproxy/go-control-plane/envoy/type/v3"
+	anypb "google.golang.org/protobuf/types/known/anypb"
 	"google.golang.org/protobuf/types/known/durationpb"
+	wrappers "google.golang.org/protobuf/types/known/wrapperspb"
 
 	extensions "istio.io/api/extensions/v1alpha1"
 	networking "istio.io/api/networking/v1alpha3"
@@ -35,11 +46,13 @@ import (
 	"istio.io/istio/pilot/pkg/networking/core/tunnelingconfig"
 	"istio.io/istio/pilot/pkg/networking/plugin/authz"
 	"istio.io/istio/pilot/pkg/networking/telemetry"
+	"istio.io/istio/pilot/pkg/networking/util"
 	"istio.io/istio/pilot/pkg/util/protoconv"
 	xdsfilters "istio.io/istio/pilot/pkg/xds/filters"
 	"istio.io/istio/pkg/config"
 	"istio.io/istio/pkg/config/host"
 	"istio.io/istio/pkg/config/protocol"
+	"istio.io/istio/pkg/log"
 	"istio.io/istio/pkg/wellknown"
 )
 
@@ -74,11 +87,94 @@ func setAccessLogAndBuildTCPFilter(push *model.PushContext, node *model.Proxy,
 	return tcpFilter
 }
 
+func buildSNIDFPFilter(port int, svc *model.Service, lookupFamily cluster.Cluster_DnsLookupFamily) *listener.Filter {
+	sniDfp := &snidfp.FilterConfig{
+		DnsCacheConfig: &dfp.DnsCacheConfig{
+			Name:            model.BuildDNSCacheName(svc.Hostname),
+			DnsLookupFamily: lookupFamily,
+		},
+		PortSpecifier: &snidfp.FilterConfig_PortValue{
+			PortValue: uint32(port),
+		},
+	}
+
+	return &listener.Filter{
+		Name:       wellknown.SNIDynamicForwardProxy,
+		ConfigType: &listener.Filter_TypedConfig{TypedConfig: protoconv.MessageToAny(sniDfp)},
+	}
+}
+
+// buildAllowAnyDynamicDNSDNSCacheConfig builds the shared DnsCacheConfig for ALLOW_ANY_DYNAMIC_DNS mode.
+// When DNS_CAPTURE is enabled, the resolver is pointed at the Istio DNS proxy (DNS_PROXY_ADDR).
+// Otherwise no explicit resolver is set and Envoy uses its default DNS resolution.
+func buildAllowAnyDynamicDNSDNSCacheConfig(meta *model.NodeMetadata) *dfp.DnsCacheConfig {
+	cfg := &dfp.DnsCacheConfig{
+		Name: util.AllowAnyDFPDNSCacheName,
+		// Envoy defaults MaxHosts to 1024 when unset. Set it explicitly so the cap is
+		// visible in the generated config and tunable via PILOT_ALLOW_ANY_DYNAMIC_DNS_MAX_HOSTS.
+		MaxHosts: wrappers.UInt32(uint32(features.AllowAnyDynamicDNSMaxHosts)),
+	}
+	if meta != nil {
+		cfg.DnsLookupFamily = util.SelectDNSLookupFamily(meta.InstanceIPs)
+	} else {
+		cfg.DnsLookupFamily = cluster.Cluster_V4_ONLY
+	}
+	if meta == nil || !bool(meta.DNSCapture) {
+		return cfg
+	}
+	addr := meta.DNSProxyAddr
+	host, portStr, err := net.SplitHostPort(addr)
+	if err != nil {
+		log.Warnf("failed to parse DNSProxyAddr %q, falling back to 127.0.0.1:15053: %v", addr, err)
+		host, portStr = "127.0.0.1", "15053"
+	}
+	if host == "localhost" {
+		host = "127.0.0.1"
+	}
+	port, err := strconv.ParseUint(portStr, 10, 32)
+	if err != nil {
+		port = 15053
+	}
+	caresConfig, err := anypb.New(&cares.CaresDnsResolverConfig{
+		Resolvers: []*core.Address{{
+			Address: &core.Address_SocketAddress{
+				SocketAddress: &core.SocketAddress{
+					Address:       host,
+					PortSpecifier: &core.SocketAddress_PortValue{PortValue: uint32(port)},
+				},
+			},
+		}},
+	})
+	if err == nil {
+		cfg.TypedDnsResolverConfig = &core.TypedExtensionConfig{
+			Name:        "envoy.network.dns_resolver.cares",
+			TypedConfig: caresConfig,
+		}
+	}
+	return cfg
+}
+
+// buildAllowAnyDynamicDNSHTTPForwardProxyFilter builds an HTTP dynamic forward proxy filter for
+// ALLOW_ANY_DYNAMIC_DNS mode. It resolves hostnames from the Host/:authority header using the
+// shared DNS cache (Istio DNS proxy).
+func buildAllowAnyDynamicDNSHTTPForwardProxyFilter(meta *model.NodeMetadata) *hcm.HttpFilter {
+	return &hcm.HttpFilter{
+		Name: "envoy.filters.http.dynamic_forward_proxy",
+		ConfigType: &hcm.HttpFilter_TypedConfig{
+			TypedConfig: protoconv.MessageToAny(&httpdfp.FilterConfig{
+				ImplementationSpecifier: &httpdfp.FilterConfig_DnsCacheConfig{
+					DnsCacheConfig: buildAllowAnyDynamicDNSDNSCacheConfig(meta),
+				},
+			}),
+		},
+	}
+}
+
 // buildOutboundNetworkFiltersWithSingleDestination takes a single cluster name
 // and builds a stack of network filters.
 func (lb *ListenerBuilder) buildOutboundNetworkFiltersWithSingleDestination(
 	statPrefix, clusterName, subsetName string, port *model.Port, destinationRule *networking.DestinationRule, applyTunnelingConfig tunnelingconfig.ApplyFunc,
-	includeMx bool,
+	includeMx bool, service *model.Service,
 ) []*listener.Filter {
 	idleTimeout := destinationRule.GetTrafficPolicy().GetConnectionPool().GetTcp().GetIdleTimeout()
 	if idleTimeout == nil {
@@ -97,6 +193,10 @@ func (lb *ListenerBuilder) buildOutboundNetworkFiltersWithSingleDestination(
 	tcpFilter := setAccessLogAndBuildTCPFilter(lb.push, lb.node, tcpProxy, class, nil)
 	networkFilterStack := buildNetworkFiltersStack(port.Protocol, tcpFilter, statPrefix, clusterName)
 
+	// Only pass service for DYNAMIC_DNS wildcard services that need SNI DFP filtering
+	if service != nil && service.Hostname.IsWildCarded() && service.Resolution == model.DynamicDNS {
+		return lb.buildCompleteNetworkFilters(class, port.Port, networkFilterStack, includeMx, service)
+	}
 	return lb.buildCompleteNetworkFilters(class, port.Port, networkFilterStack, includeMx, nil)
 }
 
@@ -116,11 +216,10 @@ func (lb *ListenerBuilder) buildCompleteNetworkFilters(
 	}
 
 	var filters []*listener.Filter
-	wasm := lb.push.WasmPluginsByListenerInfo(lb.node, model.WasmPluginListenerInfo{
-		Port:    port,
-		Class:   class,
-		Service: policySvc,
-	}, model.WasmPluginTypeNetwork)
+	trafficExtensions := lb.push.TrafficExtensionsByListenerInfo(
+		lb.node, model.ListenerInfo{Port: port, Class: class}.WithService(policySvc),
+		model.FilterChainTypeNetwork,
+	)
 
 	// Metadata exchange goes first, so RBAC failures, etc can access the state. See https://github.com/istio/istio/issues/41066
 	if features.MetadataExchange && includeMx {
@@ -130,16 +229,25 @@ func (lb *ListenerBuilder) buildCompleteNetworkFilters(
 	filters = append(filters, authzCustomBuilder.BuildTCP()...)
 
 	// Authn
-	filters = extension.PopAppendNetwork(filters, wasm, extensions.PluginPhase_AUTHN)
+	filters = extension.PopAppendNetworkTrafficExtension(filters, trafficExtensions, extensions.TrafficExtension_AUTHN)
 
 	// Authz
-	filters = extension.PopAppendNetwork(filters, wasm, extensions.PluginPhase_AUTHZ)
+	filters = extension.PopAppendNetworkTrafficExtension(filters, trafficExtensions, extensions.TrafficExtension_AUTHZ)
 	filters = append(filters, authzBuilder.BuildTCP()...)
 
 	// Stats
-	filters = extension.PopAppendNetwork(filters, wasm, extensions.PluginPhase_STATS)
-	filters = extension.PopAppendNetwork(filters, wasm, extensions.PluginPhase_UNSPECIFIED_PHASE)
+	filters = extension.PopAppendNetworkTrafficExtension(filters, trafficExtensions, extensions.TrafficExtension_STATS)
+	filters = extension.PopAppendNetworkTrafficExtension(filters, trafficExtensions, extensions.TrafficExtension_UNSPECIFIED)
 	filters = append(filters, buildMetricsNetworkFilters(lb.push, lb.node, class, policySvc)...)
+
+	// Add SNI DFP filter for sidecar outbound with DYNAMIC_DNS wildcard ServiceEntries (TLS traffic)
+	if class == istionetworking.ListenerClassSidecarOutbound &&
+		policySvc != nil &&
+		policySvc.Hostname.IsWildCarded() &&
+		policySvc.Resolution == model.DynamicDNS {
+		sniDFPFilter := buildSNIDFPFilter(port, policySvc, util.SelectDNSLookupFamily(lb.node.IPAddresses))
+		filters = append(filters, sniDFPFilter)
+	}
 
 	// Terminal filters
 	filters = append(filters, networkFilterStack...)
@@ -274,7 +382,7 @@ func (lb *ListenerBuilder) buildOutboundNetworkFilters(
 		}
 
 		return lb.buildOutboundNetworkFiltersWithSingleDestination(
-			statPrefix, clusterName, routes[0].Destination.Subset, port, destinationRule, tunnelingconfig.Apply, includeMx)
+			statPrefix, clusterName, routes[0].Destination.Subset, port, destinationRule, tunnelingconfig.Apply, includeMx, nil)
 	}
 	return lb.buildOutboundNetworkFiltersWithWeightedClusters(routes, port, configMeta, destinationRule, includeMx)
 }

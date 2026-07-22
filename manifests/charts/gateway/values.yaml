@@ -42,6 +42,10 @@ _internal_defaults_do_not_set:
   service:
     # Type of service. Set to "None" to disable the service entirely
     type: LoadBalancer
+    # Set to a specific ClusterIP, or "" for automatic assignment
+    clusterIP: ""
+    # Additional labels to add to the service selector
+    selectorLabels: {}
     ports:
     - name: status-port
       port: 15021
@@ -59,11 +63,14 @@ _internal_defaults_do_not_set:
     loadBalancerIP: ""
     loadBalancerSourceRanges: []
     externalTrafficPolicy: ""
+    healthCheckNodePort: 
     externalIPs: []
     ipFamilyPolicy: ""
     ipFamilies: []
     ## Whether to automatically allocate NodePorts (only for LoadBalancers).
     # allocateLoadBalancerNodePorts: false
+    ## Set LoadBalancer class (only for LoadBalancers).
+    # loadBalancerClass: ""
 
   resources:
     requests:
@@ -84,19 +91,33 @@ _internal_defaults_do_not_set:
   # Pod environment variables
   env: {}
 
+  # Use envVarFrom to define full environment variable entries with complex sources,
+  # such as valueFrom.secretKeyRef, valueFrom.configMapKeyRef. Each item must include a `name` and `valueFrom`.
+  #
+  # Example:
+  # envVarFrom:
+  #   - name: EXAMPLE_SECRET
+  #     valueFrom:
+  #       secretKeyRef:
+  #         name: example-name
+  #         key: example-key
+  envVarFrom: []
+
   # Deployment Update strategy
   strategy: {}
-  
+
   # Sets the Deployment minReadySeconds value
   minReadySeconds:
-  
+
   # Optionally configure a custom readinessProbe. By default the control plane
   # automatically injects the readinessProbe. If you wish to override that
   # behavior, you may define your own readinessProbe here.
   readinessProbe: {}
 
   # Labels to apply to all resources
-  labels: {}
+  labels:
+    # By default, don't enroll gateways into the ambient dataplane
+    "istio.io/dataplane-mode": none
 
   # Annotations to apply to all resources
   annotations: {}
@@ -112,6 +133,21 @@ _internal_defaults_do_not_set:
   # If specified, the gateway will act as a network gateway for the given network.
   networkGateway: ""
 
+  # Ports for the network gateway service. Only used when networkGateway is set.
+  networkGatewayPorts:
+    status-port:
+      port: 15021
+      targetPort: 15021
+    tls:
+      port: 15443
+      targetPort: 15443
+    tls-istiod:
+      port: 15012
+      targetPort: 15012
+    tls-webhook:
+      port: 15017
+      targetPort: 15017
+
   # Specify image pull policy if default behavior isn't desired.
   # Default behavior: latest images will be Always else IfNotPresent
   imagePullPolicy: ""
@@ -122,6 +158,9 @@ _internal_defaults_do_not_set:
   #
   # By default, the `podDisruptionBudget` is disabled (set to `{}`),
   # which means that no PodDisruptionBudget resource will be created.
+  #
+  # The PodDisruptionBudget can be only enabled if autoscaling is enabled
+  # with minReplicas > 1 or if autoscaling is disabled but replicaCount > 1.
   #
   # To enable the PodDisruptionBudget, configure it by specifying the
   # `minAvailable` or `maxUnavailable`. For example, to set the
@@ -148,6 +187,14 @@ _internal_defaults_do_not_set:
   #
   podDisruptionBudget: {}
 
+  # Configure the DNS policy for the gateway pods. See
+  # https://kubernetes.io/docs/concepts/services-networking/dns-pod-service/#pod-s-dns-policy
+  dnsPolicy: ""
+
+  # Configure DNS settings for the gateway pods. See
+  # https://kubernetes.io/docs/concepts/services-networking/dns-pod-service/#pod-dns-config
+  dnsConfig: {}
+
   # Sets the per-pod terminationGracePeriodSeconds setting.
   terminationGracePeriodSeconds: 30
 
@@ -159,8 +206,23 @@ _internal_defaults_do_not_set:
   # https://kubernetes.io/docs/concepts/storage/volumes/.
   volumeMounts: []
 
+  # Inject initContainers into the Gateway Pods.
+  initContainers: []
+
+  # Inject additional containers into the Gateway Pods.
+  additionalContainers: []
+
   # Configure this to a higher priority class in order to make sure your Istio gateway pods
   # will not be killed because of low priority class.
   # Refer to https://kubernetes.io/docs/concepts/configuration/pod-priority-preemption/#priorityclass
   # for more detail.
   priorityClassName: ""
+
+  # Configure the lifecycle hooks for the gateway. See
+  # https://kubernetes.io/docs/concepts/containers/container-lifecycle-hooks/.
+  lifecycle: {}
+
+  # When enabled, a default NetworkPolicy for gateways will be created
+  global:
+    networkPolicy:
+      enabled: false

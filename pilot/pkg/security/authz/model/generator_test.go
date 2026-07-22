@@ -15,6 +15,8 @@
 package model
 
 import (
+	"regexp"
+	"strings"
 	"testing"
 
 	rbacpb "github.com/envoyproxy/go-control-plane/envoy/config/rbac/v3"
@@ -22,6 +24,7 @@ import (
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/testing/protocmp"
 
+	"istio.io/istio/pkg/test/util/assert"
 	"istio.io/istio/pkg/util/protomarshal"
 )
 
@@ -341,6 +344,48 @@ func TestGenerator(t *testing.T) {
               regex: .*/ns/foo/.*`),
 		},
 		{
+			name:  "srcTrustDomainGenerator-exact",
+			g:     srcTrustDomainGenerator{},
+			value: "cluster.local",
+			want: yamlPrincipal(t, `
+         filter_state:
+           key: io.istio.peer_principal
+           string_match:
+            prefix: spiffe://cluster.local/`),
+		},
+		{
+			name:  "srcTrustDomainGenerator-wildcard",
+			g:     srcTrustDomainGenerator{},
+			value: "*",
+			want: yamlPrincipal(t, `
+         filter_state:
+           key: io.istio.peer_principal
+           string_match:
+            prefix: spiffe://`),
+		},
+		{
+			name:  "srcTrustDomainGenerator-prefix-wildcard",
+			g:     srcTrustDomainGenerator{},
+			value: "cluster.*",
+			want: yamlPrincipal(t, `
+         filter_state:
+           key: io.istio.peer_principal
+           string_match:
+            safeRegex:
+              regex: spiffe://cluster\.[^/]*/.*`),
+		},
+		{
+			name:  "srcTrustDomainGenerator-suffix-wildcard",
+			g:     srcTrustDomainGenerator{},
+			value: "*local",
+			want: yamlPrincipal(t, `
+         filter_state:
+           key: io.istio.peer_principal
+           string_match:
+            safeRegex:
+              regex: spiffe://[^/]*local/.*`),
+		},
+		{
 			name:  "srcPrincipalGenerator-http",
 			g:     srcPrincipalGenerator{},
 			key:   "source.principal",
@@ -455,6 +500,126 @@ func TestGenerator(t *testing.T) {
 	}
 }
 
+func TestServiceAccount(t *testing.T) {
+	cases := []struct {
+		Name     string
+		Input    string
+		Identity string
+		Match    bool
+	}{
+		{
+			Name:     "standard",
+			Input:    "my-ns/my-sa",
+			Identity: "spiffe://cluster.local/ns/my-ns/sa/my-sa",
+			Match:    true,
+		},
+		{
+			Name:     "suffix attributes",
+			Input:    "my-ns/my-sa",
+			Identity: "spiffe://cluster.local/ns/my-ns/sa/my-sa/k/v",
+			Match:    true,
+		},
+		{
+			Name:     "prefix attributes",
+			Input:    "my-ns/my-sa",
+			Identity: "spiffe://cluster.local/k/v/ns/my-ns/sa/my-sa",
+			Match:    true,
+		},
+		{
+			Name:     "middle attributes",
+			Input:    "my-ns/my-sa",
+			Identity: "spiffe://cluster.local/ns/my-ns/k/v/sa/my-sa",
+			Match:    true,
+		},
+		{
+			Name:     "all attributes",
+			Input:    "my-ns/my-sa",
+			Identity: "spiffe://cluster.local/k1/v1/ns/my-ns/k2/v2/sa/my-sa/k3/v3",
+			Match:    true,
+		},
+		{
+			Name:     "sa suffix string",
+			Input:    "my-ns/my-sa",
+			Identity: "spiffe://cluster.local/ns/my-ns/sa/my-sa-suffix",
+			Match:    false,
+		},
+		{
+			Name:     "ns suffix string",
+			Input:    "my-ns/my-sa",
+			Identity: "spiffe://cluster.local/ns/my-ns-suffix/sa/my-sa",
+			Match:    false,
+		},
+		{
+			Name:     "not spiffe",
+			Input:    "my-ns/my-sa",
+			Identity: "cluster.local/ns/my-ns/sa/my-sa",
+			Match:    false,
+		},
+		{
+			Name:     "invalid spiffe",
+			Input:    "my-ns/my-sa",
+			Identity: "spiffe://ns/my-ns/sa/my-sa",
+			Match:    false,
+		},
+		{
+			Name:     "missing sa",
+			Input:    "my-ns/my-sa",
+			Identity: "spiffe://cluster.local/ns/my-ns",
+			Match:    false,
+		},
+		{
+			Name:     "missing ns",
+			Input:    "my-ns/my-sa",
+			Identity: "spiffe://cluster.local/sa/my-sa",
+			Match:    false,
+		},
+		{
+			Name:  "weird keys",
+			Input: "my-ns/my-sa",
+			// This test case matches when it shouldn't ideally.
+			// Spiffe is a set of k/v pairs. Here we are accidentally matching
+			// on previous value + next key when we shouldn't.
+			// The chance of an identity being formatted like this is exceptionally low though
+			Identity: "spiffe://cluster.local/" + strings.Join([]string{
+				"k", "ns",
+				"my-ns", "something",
+				"bar", "sa",
+				"my-sa", "baz",
+			}, "/"),
+			Match: true,
+		},
+		{
+			Name:     "regex metachars - exact match with dots",
+			Input:    "my.ns/my.sa",
+			Identity: "spiffe://cluster.local/ns/my.ns/sa/my.sa",
+			Match:    true,
+		},
+		{
+			Name:     "regex metachars - dot should not match arbitrary char in ns",
+			Input:    "my.ns/my.sa",
+			Identity: "spiffe://cluster.local/ns/myXns/sa/my.sa",
+			Match:    false,
+		},
+		{
+			Name:     "regex metachars - dot should not match arbitrary char in sa",
+			Input:    "my.ns/my.sa",
+			Identity: "spiffe://cluster.local/ns/my.ns/sa/myXsa",
+			Match:    false,
+		},
+	}
+	for _, tt := range cases {
+		t.Run(tt.Name, func(t *testing.T) {
+			r := serviceAccountRegex("", tt.Input)
+			// Parse as regex. Envoy does a full string match, so handle that
+			rgx, err := regexp.Compile("^" + r + "$")
+			if err != nil {
+				t.Fatal(err)
+			}
+			assert.Equal(t, rgx.MatchString(tt.Identity), tt.Match)
+		})
+	}
+}
+
 func yamlPermission(t *testing.T, yaml string) *rbacpb.Permission {
 	t.Helper()
 	p := &rbacpb.Permission{}
@@ -471,4 +636,55 @@ func yamlPrincipal(t *testing.T, yaml string) *rbacpb.Principal {
 		t.Fatalf("failed to parse yaml: %s", err)
 	}
 	return p
+}
+
+func TestServiceAccountRegex(t *testing.T) {
+	assert.Equal(t, serviceAccountRegex("", "my-ns/my-sa"), `spiffe://.+/ns/my-ns/(.+/|)sa/my-sa(/.+)?`)
+	assert.Equal(t, serviceAccountRegex("my-ns", "my-sa"), `spiffe://.+/ns/my-ns/(.+/|)sa/my-sa(/.+)?`)
+	// Regex metacharacters in namespace and SA name should be escaped
+	assert.Equal(t, serviceAccountRegex("", "my.ns/my.sa"), `spiffe://.+/ns/my\.ns/(.+/|)sa/my\.sa(/.+)?`)
+	assert.Equal(t, serviceAccountRegex("ns+foo", "sa(bar)"), `spiffe://.+/ns/ns\+foo/(.+/|)sa/sa\(bar\)(/.+)?`)
+}
+
+func TestNamespaceMatcherRegex_Match(t *testing.T) {
+	testCases := []struct {
+		name    string
+		v       string
+		match   string
+		noMatch string
+	}{
+		{
+			name:    "exact-match-with-dot",
+			v:       "ns.prod",
+			match:   "spiffe://cluster.local/ns/ns.prod/sa/admin",
+			noMatch: "spiffe://cluster.local/ns/nsXprod/sa/admin",
+		},
+		{
+			name:    "wildcard-match-with-dot",
+			v:       "ns.*.prod",
+			match:   "spiffe://cluster.local/ns/ns.any.prod/sa/admin",
+			noMatch: "spiffe://cluster.local/ns/nsXanyXprod/sa/admin",
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			g := srcNamespaceGenerator{}
+			p, err := g.principal("", tc.v, false, true)
+			if err != nil {
+				t.Fatalf("failed to generate principal: %v", err)
+			}
+			regexStr := p.GetAuthenticated().GetPrincipalName().GetSafeRegex().GetRegex()
+			re, err := regexp.Compile(regexStr)
+			if err != nil {
+				t.Fatalf("failed to compile regex %q: %v", regexStr, err)
+			}
+			if !re.MatchString(tc.match) {
+				t.Errorf("expected %q to match %q", regexStr, tc.match)
+			}
+			if re.MatchString(tc.noMatch) {
+				t.Errorf("expected %q NOT to match %q", regexStr, tc.noMatch)
+			}
+		})
+	}
 }

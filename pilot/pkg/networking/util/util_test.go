@@ -19,6 +19,7 @@ import (
 	"reflect"
 	"testing"
 
+	cluster "github.com/envoyproxy/go-control-plane/envoy/config/cluster/v3"
 	core "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
 	endpoint "github.com/envoyproxy/go-control-plane/envoy/config/endpoint/v3"
 	listener "github.com/envoyproxy/go-control-plane/envoy/config/listener/v3"
@@ -834,10 +835,91 @@ func TestIsAllowAnyOutbound(t *testing.T) {
 			},
 			result: true,
 		},
+		{
+			name: "OutboundTrafficPolicyAllowAnyDynamicDNS",
+			node: &model.Proxy{
+				SidecarScope: &model.SidecarScope{
+					OutboundTrafficPolicy: &networking.OutboundTrafficPolicy{
+						Mode: networking.OutboundTrafficPolicy_Mode(meshconfig.MeshConfig_OutboundTrafficPolicy_ALLOW_ANY_DYNAMIC_DNS),
+					},
+				},
+			},
+			result: false,
+		},
 	}
 	for i := range tests {
 		t.Run(tests[i].name, func(t *testing.T) {
 			out := IsAllowAnyOutbound(tests[i].node)
+			if out != tests[i].result {
+				t.Errorf("Expected %t but got %t for test case: %v\n", tests[i].result, out, tests[i].node)
+			}
+		})
+	}
+}
+
+func TestIsAllowAnyDynamicDNSOutbound(t *testing.T) {
+	tests := []struct {
+		name   string
+		node   *model.Proxy
+		result bool
+	}{
+		{
+			name:   "NilSidecarScope",
+			node:   &model.Proxy{Type: model.SidecarProxy},
+			result: false,
+		},
+		{
+			name: "AllowAny",
+			node: &model.Proxy{
+				Type: model.SidecarProxy,
+				SidecarScope: &model.SidecarScope{
+					OutboundTrafficPolicy: &networking.OutboundTrafficPolicy{
+						Mode: networking.OutboundTrafficPolicy_ALLOW_ANY,
+					},
+				},
+			},
+			result: false,
+		},
+		{
+			name: "RegistryOnly",
+			node: &model.Proxy{
+				Type: model.SidecarProxy,
+				SidecarScope: &model.SidecarScope{
+					OutboundTrafficPolicy: &networking.OutboundTrafficPolicy{
+						Mode: networking.OutboundTrafficPolicy_REGISTRY_ONLY,
+					},
+				},
+			},
+			result: false,
+		},
+		{
+			name: "AllowAnyDynamicDNS_Sidecar",
+			node: &model.Proxy{
+				Type: model.SidecarProxy,
+				SidecarScope: &model.SidecarScope{
+					OutboundTrafficPolicy: &networking.OutboundTrafficPolicy{
+						Mode: networking.OutboundTrafficPolicy_Mode(meshconfig.MeshConfig_OutboundTrafficPolicy_ALLOW_ANY_DYNAMIC_DNS),
+					},
+				},
+			},
+			result: true,
+		},
+		{
+			name: "AllowAnyDynamicDNS_Gateway_NotEligible",
+			node: &model.Proxy{
+				Type: model.Router,
+				SidecarScope: &model.SidecarScope{
+					OutboundTrafficPolicy: &networking.OutboundTrafficPolicy{
+						Mode: networking.OutboundTrafficPolicy_Mode(meshconfig.MeshConfig_OutboundTrafficPolicy_ALLOW_ANY_DYNAMIC_DNS),
+					},
+				},
+			},
+			result: false,
+		},
+	}
+	for i := range tests {
+		t.Run(tests[i].name, func(t *testing.T) {
+			out := IsAllowAnyDynamicDNSOutbound(tests[i].node)
 			if out != tests[i].result {
 				t.Errorf("Expected %t but got %t for test case: %v\n", tests[i].result, out, tests[i].node)
 			}
@@ -1122,14 +1204,17 @@ func TestCidrRangeSliceEqual(t *testing.T) {
 }
 
 func TestEndpointMetadata(t *testing.T) {
-	test.SetForTest(t, &features.EndpointTelemetryLabel, true)
 	cases := []struct {
-		name     string
-		metadata *model.EndpointMetadata
-		want     *core.Metadata
+		name                   string
+		enableTelemetryLabel   bool
+		endpointTelemetryLabel bool
+		metadata               *model.EndpointMetadata
+		want                   *core.Metadata
 	}{
 		{
-			name: "all empty",
+			name:                   "all empty",
+			enableTelemetryLabel:   true,
+			endpointTelemetryLabel: true,
 			metadata: &model.EndpointMetadata{
 				TLSMode:      model.DisabledTLSModeLabel,
 				Network:      "",
@@ -1151,7 +1236,9 @@ func TestEndpointMetadata(t *testing.T) {
 			},
 		},
 		{
-			name: "tls mode",
+			name:                   "tls mode",
+			enableTelemetryLabel:   true,
+			endpointTelemetryLabel: true,
 			metadata: &model.EndpointMetadata{
 				TLSMode:      model.IstioMutualTLSModeLabel,
 				Network:      "",
@@ -1182,7 +1269,9 @@ func TestEndpointMetadata(t *testing.T) {
 			},
 		},
 		{
-			name: "network and tls mode",
+			name:                   "network and tls mode",
+			enableTelemetryLabel:   true,
+			endpointTelemetryLabel: true,
 			metadata: &model.EndpointMetadata{
 				TLSMode:      model.IstioMutualTLSModeLabel,
 				Network:      "network",
@@ -1213,7 +1302,9 @@ func TestEndpointMetadata(t *testing.T) {
 			},
 		},
 		{
-			name: "all label",
+			name:                   "all label",
+			enableTelemetryLabel:   true,
+			endpointTelemetryLabel: true,
 			metadata: &model.EndpointMetadata{
 				TLSMode:      model.IstioMutualTLSModeLabel,
 				Network:      "network",
@@ -1249,7 +1340,9 @@ func TestEndpointMetadata(t *testing.T) {
 			},
 		},
 		{
-			name: "miss pod label",
+			name:                   "miss pod label",
+			enableTelemetryLabel:   true,
+			endpointTelemetryLabel: true,
 			metadata: &model.EndpointMetadata{
 				TLSMode:      model.IstioMutualTLSModeLabel,
 				Network:      "network",
@@ -1281,7 +1374,9 @@ func TestEndpointMetadata(t *testing.T) {
 			},
 		},
 		{
-			name: "miss workload name",
+			name:                   "miss workload name",
+			enableTelemetryLabel:   true,
+			endpointTelemetryLabel: true,
 			metadata: &model.EndpointMetadata{
 				TLSMode:      model.IstioMutualTLSModeLabel,
 				Network:      "network",
@@ -1312,9 +1407,49 @@ func TestEndpointMetadata(t *testing.T) {
 				},
 			},
 		},
+		{
+			name:                   "all empty, telemetry label disabled",
+			enableTelemetryLabel:   false,
+			endpointTelemetryLabel: false,
+			metadata: &model.EndpointMetadata{
+				TLSMode:      model.DisabledTLSModeLabel,
+				Network:      "",
+				WorkloadName: "",
+				ClusterID:    "",
+			},
+			want: &core.Metadata{
+				FilterMetadata: map[string]*structpb.Struct{},
+			},
+		},
+		{
+			name:                   "tls mode, telemetry label disabled",
+			enableTelemetryLabel:   false,
+			endpointTelemetryLabel: false,
+			metadata: &model.EndpointMetadata{
+				TLSMode:      model.IstioMutualTLSModeLabel,
+				Network:      "",
+				WorkloadName: "",
+				ClusterID:    "",
+			},
+			want: &core.Metadata{
+				FilterMetadata: map[string]*structpb.Struct{
+					EnvoyTransportSocketMetadataKey: {
+						Fields: map[string]*structpb.Value{
+							model.TLSModeLabelShortname: {
+								Kind: &structpb.Value_StringValue{
+									StringValue: model.IstioMutualTLSModeLabel,
+								},
+							},
+						},
+					},
+				},
+			},
+		},
 	}
 	for _, tt := range cases {
 		t.Run(tt.name, func(t *testing.T) {
+			test.SetForTest(t, &features.EnableTelemetryLabel, tt.enableTelemetryLabel)
+			test.SetForTest(t, &features.EndpointTelemetryLabel, tt.endpointTelemetryLabel)
 			input := &core.Metadata{}
 			AppendLbEndpointMetadata(tt.metadata, input)
 			if !reflect.DeepEqual(input, tt.want) {
@@ -1646,6 +1781,56 @@ func TestMergeSubsetTrafficPolicy(t *testing.T) {
 			},
 		},
 		{
+			name: "top-level retryBudget is preserved when subset has a traffic policy",
+			original: &networking.TrafficPolicy{
+				ConnectionPool: &networking.ConnectionPoolSettings{
+					Http: &networking.ConnectionPoolSettings_HTTPSettings{
+						MaxRetries: 10,
+					},
+				},
+				RetryBudget: &networking.TrafficPolicy_RetryBudget{
+					MinRetryConcurrency: 5,
+				},
+			},
+			subset: &networking.TrafficPolicy{
+				ConnectionPool: &networking.ConnectionPoolSettings{
+					Http: &networking.ConnectionPoolSettings_HTTPSettings{
+						Http2MaxRequests: 1000,
+					},
+				},
+			},
+			port: nil,
+			expected: &networking.TrafficPolicy{
+				ConnectionPool: &networking.ConnectionPoolSettings{
+					Http: &networking.ConnectionPoolSettings_HTTPSettings{
+						Http2MaxRequests: 1000,
+					},
+				},
+				RetryBudget: &networking.TrafficPolicy_RetryBudget{
+					MinRetryConcurrency: 5,
+				},
+			},
+		},
+		{
+			name: "subset-level retryBudget overrides top-level retryBudget",
+			original: &networking.TrafficPolicy{
+				RetryBudget: &networking.TrafficPolicy_RetryBudget{
+					MinRetryConcurrency: 3,
+				},
+			},
+			subset: &networking.TrafficPolicy{
+				RetryBudget: &networking.TrafficPolicy_RetryBudget{
+					MinRetryConcurrency: 10,
+				},
+			},
+			port: nil,
+			expected: &networking.TrafficPolicy{
+				RetryBudget: &networking.TrafficPolicy_RetryBudget{
+					MinRetryConcurrency: 10,
+				},
+			},
+		},
+		{
 			name: "default cluster, non-matching port selector",
 			original: &networking.TrafficPolicy{
 				LoadBalancer: &networking.LoadBalancerSettings{
@@ -1807,6 +1992,77 @@ func TestMeshNetworksToEnvoyInternalAddressConfig(t *testing.T) {
 			got := MeshNetworksToEnvoyInternalAddressConfig(tt.networks)
 			if !reflect.DeepEqual(tt.expectedconfig, got) {
 				t.Errorf("unexpected internal address config, expected: %v, got :%v", tt.expectedconfig, got)
+			}
+		})
+	}
+}
+
+func BenchmarkAddConfigInfoMetadata(b *testing.B) {
+	configs := []config.Meta{
+		{
+			Name:             "my-virtual-service",
+			Namespace:        "default",
+			GroupVersionKind: gvk.VirtualService,
+		},
+		{
+			Name:             "my-destination-rule",
+			Namespace:        "istio-system",
+			GroupVersionKind: gvk.DestinationRule,
+		},
+		{
+			Name:             "my-gateway",
+			Namespace:        "production",
+			GroupVersionKind: gvk.Gateway,
+		},
+	}
+
+	b.Run("NilMetadata", func(b *testing.B) {
+		cfg := configs[0]
+		b.ReportAllocs()
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			_ = AddConfigInfoMetadata(nil, cfg)
+		}
+	})
+
+	b.Run("ExistingMetadata", func(b *testing.B) {
+		cfg := configs[0]
+		b.ReportAllocs()
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			meta := &core.Metadata{
+				FilterMetadata: map[string]*structpb.Struct{},
+			}
+			_ = AddConfigInfoMetadata(meta, cfg)
+		}
+	})
+
+	b.Run("MultipleConfigs", func(b *testing.B) {
+		b.ReportAllocs()
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			for _, cfg := range configs {
+				_ = AddConfigInfoMetadata(nil, cfg)
+			}
+		}
+	})
+}
+
+func TestSelectDNSLookupFamily(t *testing.T) {
+	tests := []struct {
+		name string
+		ips  []string
+		want cluster.Cluster_DnsLookupFamily
+	}{
+		{"no ips defaults to v4", nil, cluster.Cluster_V4_ONLY},
+		{"ipv4 only", []string{"10.0.0.1"}, cluster.Cluster_V4_ONLY},
+		{"ipv6 only", []string{"2001:db8::1"}, cluster.Cluster_V6_ONLY},
+		{"dual stack defaults to v4", []string{"10.0.0.1", "2001:db8::1"}, cluster.Cluster_V4_ONLY},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := SelectDNSLookupFamily(tc.ips); got != tc.want {
+				t.Errorf("SelectDNSLookupFamily(%v) = %v, want %v", tc.ips, got, tc.want)
 			}
 		})
 	}

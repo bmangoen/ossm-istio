@@ -56,8 +56,15 @@ const (
 	// CredentialNameSocketPath is the well-known path to the Unix Domain Socket for Credential Name.
 	CredentialNameSocketPath = "./var/run/secrets/credential-uds/socket"
 
+	// FileCredentialNameSocketPath is the well-known path to the Unix Domain Socket used for loading files.
+	// This is only used when there is a custom SDS server, otherwise WorkloadIdentityPath is used.
+	FileCredentialNameSocketPath = "./var/run/secrets/credential-uds/files-socket"
+
 	// CredentialMetaDataName is the name in node meta data.
 	CredentialMetaDataName = "credential"
+	// CredentialFileMetaDataName is the name in node metadata indicating we should use a custom SDS cluster, sds-files-grpc,
+	// for file-based certificates.
+	CredentialFileMetaDataName = "file-credential"
 
 	// SDSExternalClusterName is the name of the cluster for external SDS connections which is defined via CredentialNameSocketPath
 	SDSExternalClusterName = "sds-external"
@@ -118,6 +125,9 @@ const (
 
 	// FileRootSystemCACert is a unique resource name signaling that the system CA certificate should be used
 	FileRootSystemCACert = "file-root:system"
+
+	// CACRLFilePath is the well-known path for the plugged-in CA's CRL file
+	CACRLFilePath = "/var/run/secrets/istio/crl/ca-crl.pem"
 )
 
 // TODO: For 1.8, make sure MeshConfig is updated with those settings,
@@ -199,6 +209,10 @@ type Options struct {
 	// well-known ./etc/certs location.
 	FileMountedCerts bool
 
+	// ServeOnlyFiles indicates we should run the local SDS server, but only to serve file certificates.
+	// This is used when an external SDS server is used only for mTLS certificates.
+	ServeOnlyFiles bool
+
 	// PilotCertProvider is the provider of the Pilot certificate (PILOT_CERT_PROVIDER env)
 	// Determines the root CA file to use for connecting to CA gRPC:
 	// - istiod
@@ -255,6 +269,9 @@ type Options struct {
 	KeyFilePath string
 	// The path for an existing root certificate bundle
 	RootCertFilePath string
+
+	// Extra headers to add to the CA connection.
+	CAHeaders map[string]string
 }
 
 // Client interface defines the clients need to implement to talk to CA for CSR.
@@ -279,7 +296,7 @@ type SecretManager interface {
 	GenerateSecret(resourceName string) (*SecretItem, error)
 }
 
-// SecretItem is the cached item in in-memory secret store.
+// SecretItem is the cached item in an in-memory secret store.
 type SecretItem struct {
 	CertificateChain []byte
 	PrivateKey       []byte
@@ -420,8 +437,8 @@ func ExtractBearerToken(ctx context.Context) (string, error) {
 	}
 
 	for _, value := range authHeader {
-		if strings.HasPrefix(value, BearerTokenPrefix) {
-			return strings.TrimPrefix(value, BearerTokenPrefix), nil
+		if after, ok0 := strings.CutPrefix(value, BearerTokenPrefix); ok0 {
+			return after, nil
 		}
 	}
 
@@ -434,11 +451,11 @@ func ExtractRequestToken(req *http.Request) (string, error) {
 		return "", fmt.Errorf("no HTTP authorization header exists")
 	}
 
-	if strings.HasPrefix(value, BearerTokenPrefix) {
-		return strings.TrimPrefix(value, BearerTokenPrefix), nil
+	if after, ok := strings.CutPrefix(value, BearerTokenPrefix); ok {
+		return after, nil
 	}
-	if strings.HasPrefix(value, K8sTokenPrefix) {
-		return strings.TrimPrefix(value, K8sTokenPrefix), nil
+	if after, ok := strings.CutPrefix(value, K8sTokenPrefix); ok {
+		return after, nil
 	}
 
 	return "", fmt.Errorf("no bearer token exists in HTTP authorization header")
@@ -539,15 +556,15 @@ func (s SdsCertificateConfig) IsKeyCertificate() bool {
 // SdsCertificateConfigFromResourceName converts the provided resource name into a SdsCertificateConfig
 // If the resource name is not valid, false is returned.
 func SdsCertificateConfigFromResourceName(resource string) (SdsCertificateConfig, bool) {
-	if strings.HasPrefix(resource, "file-cert:") {
-		filesString := strings.TrimPrefix(resource, "file-cert:")
+	if after, ok := strings.CutPrefix(resource, "file-cert:"); ok {
+		filesString := after
 		split := strings.Split(filesString, ResourceSeparator)
 		if len(split) != 2 {
 			return SdsCertificateConfig{}, false
 		}
 		return SdsCertificateConfig{split[0], split[1], ""}, true
-	} else if strings.HasPrefix(resource, "file-root:") {
-		filesString := strings.TrimPrefix(resource, "file-root:")
+	} else if after, ok := strings.CutPrefix(resource, "file-root:"); ok {
+		filesString := after
 		split := strings.Split(filesString, ResourceSeparator)
 
 		if len(split) != 1 {

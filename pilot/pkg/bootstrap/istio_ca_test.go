@@ -32,6 +32,61 @@ import (
 
 const testNamespace = "istio-system"
 
+func TestCheckCABundleCompleteness(t *testing.T) {
+	g := NewWithT(t)
+
+	dir := t.TempDir()
+
+	// Create partial certificate files (missing signing key)
+	rootCertFile := path.Join(dir, "root-cert.pem")
+	certChainFile := path.Join(dir, "cert-chain.pem")
+	caCertFile := path.Join(dir, "ca-cert.pem")
+
+	// Create some files but not all
+	rootCert, err := readSampleCertFromFile("root-cert.pem")
+	g.Expect(err).Should(BeNil())
+	err = os.WriteFile(rootCertFile, rootCert, 0o600)
+	g.Expect(err).Should(BeNil())
+
+	certChain, err := readSampleCertFromFile("cert-chain.pem")
+	g.Expect(err).Should(BeNil())
+	err = os.WriteFile(certChainFile, certChain, 0o600)
+	g.Expect(err).Should(BeNil())
+
+	caCert, err := readSampleCertFromFile("ca-cert.pem")
+	g.Expect(err).Should(BeNil())
+	err = os.WriteFile(caCertFile, caCert, 0o600)
+	g.Expect(err).Should(BeNil())
+
+	// Test with incomplete bundle
+	signingCABundleComplete, bundleExists, err := checkCABundleCompleteness(
+		path.Join(dir, "ca-key.pem"),
+		path.Join(dir, "ca-cert.pem"),
+		path.Join(dir, "root-cert.pem"),
+		[]string{path.Join(dir, "cert-chain.pem")},
+	)
+	g.Expect(err).Should(BeNil())
+	g.Expect(signingCABundleComplete).Should(Equal(false))
+	g.Expect(bundleExists).Should(Equal(true))
+
+	// Add missing key file to complete the bundle
+	caKey, err := readSampleCertFromFile("ca-key.pem")
+	g.Expect(err).Should(BeNil())
+	err = os.WriteFile(path.Join(dir, "ca-key.pem"), caKey, 0o600)
+	g.Expect(err).Should(BeNil())
+
+	// Test with complete bundle
+	signingCABundleComplete, bundleExists, err = checkCABundleCompleteness(
+		path.Join(dir, "ca-key.pem"),
+		path.Join(dir, "ca-cert.pem"),
+		path.Join(dir, "root-cert.pem"),
+		[]string{path.Join(dir, "cert-chain.pem")},
+	)
+	g.Expect(err).Should(BeNil())
+	g.Expect(signingCABundleComplete).Should(Equal(true))
+	g.Expect(bundleExists).Should(Equal(true))
+}
+
 func TestRemoteCerts(t *testing.T) {
 	g := NewWithT(t)
 
@@ -60,7 +115,6 @@ func TestRemoteCerts(t *testing.T) {
 
 	expectedRoot, err := readSampleCertFromFile("root-cert.pem")
 	g.Expect(err).Should(BeNil())
-
 	g.Expect(os.ReadFile(path.Join(dir, "root-cert.pem"))).Should(Equal(expectedRoot))
 
 	// Should do nothing because certs already exist locally.
@@ -166,4 +220,120 @@ func createCASecret(t test.Failer, client kube.Client) {
 
 func readSampleCertFromFile(f string) ([]byte, error) {
 	return os.ReadFile(path.Join(env.IstioSrc, "samples/certs", f))
+}
+
+func TestPemBundleHasSubsetRelation(t *testing.T) {
+	certA, err := readSampleCertFromFile("root-cert.pem")
+	if err != nil {
+		t.Fatal(err)
+	}
+	certB, err := readSampleCertFromFile("ca-cert.pem")
+	if err != nil {
+		t.Fatal(err)
+	}
+	certC, err := readSampleCertFromFile("ca-cert-alt.pem")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	bundleAB := append(append([]byte{}, certA...), certB...)
+	bundleBA := append(append([]byte{}, certB...), certA...)
+	bundleABC := append(append(append([]byte{}, certA...), certB...), certC...)
+	bundleCBA := append(append(append([]byte{}, certC...), certB...), certA...)
+	bundleAC := append(append([]byte{}, certA...), certC...)
+
+	cases := []struct {
+		name     string
+		a        []byte
+		b        []byte
+		expected bool
+	}{
+		{
+			name:     "identical single cert",
+			a:        certA,
+			b:        certA,
+			expected: true,
+		},
+		{
+			name:     "identical bundle",
+			a:        bundleAB,
+			b:        bundleAB,
+			expected: true,
+		},
+		{
+			name:     "superset and subset",
+			a:        bundleAB,
+			b:        certA,
+			expected: true,
+		},
+		{
+			name:     "subset and superset",
+			a:        certA,
+			b:        bundleAB,
+			expected: true,
+		},
+		{
+			name:     "reordered bundle",
+			a:        bundleBA,
+			b:        bundleAB,
+			expected: true,
+		},
+		{
+			name:     "disjoint certs",
+			a:        certA,
+			b:        certB,
+			expected: false,
+		},
+		{
+			name:     "empty a",
+			a:        []byte{},
+			b:        certA,
+			expected: false,
+		},
+		{
+			name:     "empty b",
+			a:        certA,
+			b:        []byte{},
+			expected: false,
+		},
+		{
+			name:     "invalid pem",
+			a:        []byte("not a pem"),
+			b:        certA,
+			expected: false,
+		},
+		{
+			name:     "three certs rotation adds one",
+			a:        bundleABC,
+			b:        bundleAB,
+			expected: true,
+		},
+		{
+			name:     "three certs rotation removes one",
+			a:        bundleAB,
+			b:        bundleABC,
+			expected: true,
+		},
+		{
+			name:     "three certs reordered",
+			a:        bundleCBA,
+			b:        bundleABC,
+			expected: true,
+		},
+		{
+			name:     "three certs partial overlap not subset",
+			a:        bundleAC,
+			b:        bundleAB,
+			expected: false,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			result := pemBundleHasSubsetRelation(tc.a, tc.b)
+			if result != tc.expected {
+				t.Errorf("pemBundleHasSubsetRelation() = %v, want %v", result, tc.expected)
+			}
+		})
+	}
 }

@@ -15,8 +15,6 @@
 package controller
 
 import (
-	"fmt"
-	"sync"
 	"testing"
 	"time"
 
@@ -24,29 +22,23 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	k8sv1 "sigs.k8s.io/gateway-api/apis/v1"
-	"sigs.k8s.io/gateway-api/apis/v1beta1"
 
-	"istio.io/api/annotation"
 	"istio.io/api/label"
 	meshconfig "istio.io/api/mesh/v1alpha1"
 	"istio.io/istio/pilot/pkg/features"
-	"istio.io/istio/pilot/pkg/model"
 	"istio.io/istio/pkg/config/constants"
-	"istio.io/istio/pkg/config/mesh"
+	"istio.io/istio/pkg/config/mesh/meshwatcher"
 	"istio.io/istio/pkg/config/schema/gvr"
-	"istio.io/istio/pkg/kube/controllers"
 	"istio.io/istio/pkg/kube/kclient"
 	"istio.io/istio/pkg/kube/kclient/clienttest"
-	"istio.io/istio/pkg/ptr"
 	"istio.io/istio/pkg/test"
 	"istio.io/istio/pkg/test/util/assert"
 	"istio.io/istio/pkg/test/util/retry"
-	"istio.io/istio/pkg/util/sets"
 )
 
 func TestNetworkUpdateTriggers(t *testing.T) {
 	test.SetForTest(t, &features.MultiNetworkGatewayAPI, true)
-	meshNetworks := mesh.NewFixedNetworksWatcher(nil)
+	meshNetworks := meshwatcher.NewFixedNetworksWatcher(nil)
 	c, _ := NewFakeControllerWithOptions(t, FakeControllerOptions{
 		ClusterID:       constants.DefaultClusterName,
 		NetworksWatcher: meshNetworks,
@@ -58,32 +50,14 @@ func TestNetworkUpdateTriggers(t *testing.T) {
 		t.Fatal("did not expect any gateways yet")
 	}
 
-	notifyCh := make(chan struct{}, 1)
-	var (
-		gwMu sync.Mutex
-		gws  []model.NetworkGateway
-	)
-	setGws := func(v []model.NetworkGateway) {
-		gwMu.Lock()
-		defer gwMu.Unlock()
-		gws = v
-	}
-	getGws := func() []model.NetworkGateway {
-		gwMu.Lock()
-		defer gwMu.Unlock()
-		return gws
-	}
-
-	c.AppendNetworkGatewayHandler(func() {
-		setGws(c.NetworkGateways())
-		notifyCh <- struct{}{}
-	})
+	// Poll the controller's reported state rather than counting notify events.
+	// Counting events races with the informer queue: a SetNetworks call can fire
+	// before the Service Adds are drained, producing a partial notification first
+	// and the full one once the queue catches up. State polling does not care
+	// about the order or how many partial notifications fire.
 	expectGateways := func(t *testing.T, expectedGws int) {
-		// wait for a notification
-		assert.ChannelHasItem(t, notifyCh)
-		if n := len(getGws()); n != expectedGws {
-			t.Errorf("expected %d gateways but got %d", expectedGws, n)
-		}
+		assert.EventuallyEqual(t, func() int { return len(c.NetworkGateways()) }, expectedGws,
+			retry.Timeout(30*time.Second), retry.BackoffDelay(5*time.Millisecond))
 	}
 
 	t.Run("add meshnetworks", func(t *testing.T) {
@@ -154,47 +128,47 @@ func removeLabeledServiceGateway(t *testing.T, c *FakeController) {
 // and it does so on an IP and a hostname
 func addOrUpdateGatewayResource(t *testing.T, c *FakeController, customPort int) {
 	passthroughMode := k8sv1.TLSModePassthrough
-	ipType := v1beta1.IPAddressType
-	hostnameType := v1beta1.HostnameAddressType
-	clienttest.Wrap(t, kclient.New[*v1beta1.Gateway](c.client)).CreateOrUpdate(&v1beta1.Gateway{
+	ipType := k8sv1.IPAddressType
+	hostnameType := k8sv1.HostnameAddressType
+	clienttest.Wrap(t, kclient.New[*k8sv1.Gateway](c.client)).CreateOrUpdate(&k8sv1.Gateway{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      "eastwest-gwapi",
 			Namespace: "istio-system",
 			Labels:    map[string]string{label.TopologyNetwork.Name: "nw2"},
 		},
-		Spec: v1beta1.GatewaySpec{
+		Spec: k8sv1.GatewaySpec{
 			GatewayClassName: "istio",
-			Addresses: []v1beta1.GatewayAddress{
+			Addresses: []k8sv1.GatewaySpecAddress{
 				{Type: &ipType, Value: "1.2.3.4"},
 				{Type: &hostnameType, Value: "some hostname"},
 			},
-			Listeners: []v1beta1.Listener{
+			Listeners: []k8sv1.Listener{
 				{
 					Name: "detected-by-options",
-					TLS: &v1beta1.GatewayTLSConfig{
+					TLS: &k8sv1.ListenerTLSConfig{
 						Mode: &passthroughMode,
-						Options: map[v1beta1.AnnotationKey]v1beta1.AnnotationValue{
+						Options: map[k8sv1.AnnotationKey]k8sv1.AnnotationValue{
 							constants.ListenerModeOption: constants.ListenerModeAutoPassthrough,
 						},
 					},
-					Port: v1beta1.PortNumber(customPort),
+					Port: k8sv1.PortNumber(customPort),
 				},
 				{
 					Name: "detected-by-number",
-					TLS:  &v1beta1.GatewayTLSConfig{Mode: &passthroughMode},
+					TLS:  &k8sv1.ListenerTLSConfig{Mode: &passthroughMode},
 					Port: 15443,
 				},
 			},
 		},
-		Status: v1beta1.GatewayStatus{},
+		Status: k8sv1.GatewayStatus{},
 	})
 }
 
 func removeGatewayResource(t *testing.T, c *FakeController) {
-	clienttest.Wrap(t, kclient.New[*v1beta1.Gateway](c.client)).Delete("eastwest-gwapi", "istio-system")
+	clienttest.Wrap(t, kclient.New[*k8sv1.Gateway](c.client)).Delete("eastwest-gwapi", "istio-system")
 }
 
-func addMeshNetworksFromRegistryGateway(t *testing.T, c *FakeController, watcher mesh.NetworksWatcher) {
+func addMeshNetworksFromRegistryGateway(t *testing.T, c *FakeController, watcher meshwatcher.TestNetworksWatcher) {
 	clienttest.Wrap(t, c.services).Create(&corev1.Service{
 		ObjectMeta: metav1.ObjectMeta{Name: "istio-meshnetworks-gw", Namespace: "istio-system"},
 		Spec: corev1.ServiceSpec{
@@ -246,188 +220,4 @@ func addMeshNetworksFromRegistryGateway(t *testing.T, c *FakeController, watcher
 			}},
 		},
 	}})
-}
-
-func TestAmbientSystemNamespaceNetworkChange(t *testing.T) {
-	test.SetForTest(t, &features.EnableAmbient, true)
-	testNS := "test"
-	systemNS := "istio-system"
-
-	s, fx := NewFakeControllerWithOptions(t, FakeControllerOptions{
-		SystemNamespace: systemNS,
-		NetworksWatcher: mesh.NewFixedNetworksWatcher(nil),
-	})
-
-	tracker := assert.NewTracker[string](t)
-
-	s.namespaces.AddEventHandler(controllers.ObjectHandler(func(o controllers.Object) {
-		tracker.Record(o.GetName())
-	}))
-
-	expectNetwork := func(t *testing.T, c *FakeController, network string) {
-		t.Helper()
-		retry.UntilSuccessOrFail(t, func() error {
-			t.Helper()
-			if c.networkFromSystemNamespace().String() != network {
-				return fmt.Errorf("no network system notify")
-			}
-			podNames := sets.New[string]("pod1", "pod2")
-			svcNames := sets.New[string]("svc1")
-			addresses := c.ambientIndex.All()
-			for _, addr := range addresses {
-				wl := addr.GetWorkload()
-				if wl != nil {
-					if !podNames.Contains(wl.Name) {
-						continue
-					}
-					if addr.GetWorkload().Network != network {
-						return fmt.Errorf("no network workload notify")
-					}
-				}
-				svc := addr.GetService()
-				if svc != nil {
-					if !svcNames.Contains(svc.Name) {
-						continue
-					}
-					for _, saddr := range svc.GetAddresses() {
-						if saddr.GetNetwork() != network {
-							return fmt.Errorf("no network service notify")
-						}
-					}
-				}
-			}
-			return nil
-		}, retry.Timeout(time.Second*5))
-	}
-
-	pc := clienttest.NewWriter[*corev1.Pod](t, s.client)
-	sc := clienttest.NewWriter[*corev1.Service](t, s.client)
-	pod1 := generatePod([]string{"127.0.0.1"}, "pod1", testNS, "sa1", "node1", map[string]string{"app": "a"}, nil)
-	pc.CreateOrUpdateStatus(pod1)
-	fx.WaitOrFail(t, "xds")
-
-	pod2 := generatePod([]string{"127.0.0.2"}, "pod2", testNS, "sa2", "node1", map[string]string{"app": "a"}, nil)
-	pc.CreateOrUpdateStatus(pod2)
-	fx.WaitOrFail(t, "xds")
-
-	sc.CreateOrUpdate(generateService("svc1", testNS, map[string]string{}, // labels
-		map[string]string{}, // annotations
-		[]int32{80},
-		map[string]string{"app": "a"}, // selector
-		[]string{"10.0.0.1"},
-	))
-	fx.WaitOrFail(t, "xds")
-
-	createOrUpdateNamespace(t, s, testNS, "")
-	createOrUpdateNamespace(t, s, systemNS, "")
-
-	tracker.WaitOrdered(testNS, systemNS)
-
-	t.Run("change namespace network to nw1", func(t *testing.T) {
-		createOrUpdateNamespace(t, s, systemNS, "nw1")
-		tracker.WaitOrdered(systemNS)
-		expectNetwork(t, s, "nw1")
-	})
-
-	t.Run("change namespace network to nw2", func(t *testing.T) {
-		createOrUpdateNamespace(t, s, systemNS, "nw2")
-		tracker.WaitOrdered(systemNS)
-		expectNetwork(t, s, "nw2")
-	})
-
-	t.Run("manually change namespace network to nw3, and update meshNetworks", func(t *testing.T) {
-		s.setNetworkFromNamespace(&corev1.Namespace{
-			ObjectMeta: metav1.ObjectMeta{
-				Name: systemNS,
-				Labels: map[string]string{
-					label.TopologyNetwork.Name: "nw3",
-				},
-			},
-		})
-		createOrUpdateNamespace(t, s, systemNS, "nw3")
-		tracker.WaitOrdered(systemNS)
-		addMeshNetworksFromRegistryGateway(t, s, s.meshNetworksWatcher)
-		expectNetwork(t, s, "nw3")
-	})
-}
-
-func TestAmbientSync(t *testing.T) {
-	test.SetForTest(t, &features.EnableAmbient, true)
-	systemNS := "istio-system"
-	stop := test.NewStop(t)
-	s, _ := NewFakeControllerWithOptions(t, FakeControllerOptions{
-		SystemNamespace: systemNS,
-		NetworksWatcher: mesh.NewFixedNetworksWatcher(nil),
-		SkipRun:         true,
-		CRDs:            []schema.GroupVersionResource{gvr.KubernetesGateway},
-		ConfigCluster:   true,
-	})
-	done := make(chan struct{})
-	// We want to test that ambient is not marked synced until the Kube controller is synced, since it depends on it for network
-	// information.
-	// To simulate this, we intentionally slow down the syncing process (which is hard to make slow with the fake client).
-	s.queue.Push(func() error {
-		time.Sleep(time.Millisecond * 20)
-		close(done)
-		return nil
-	})
-	go s.Run(stop)
-	// We should start as not synced
-	assert.Equal(t, s.ambientIndex.HasSynced(), false)
-	<-done
-	// Once the queue is done, eventually we should sync.
-	assert.EventuallyEqual(t, s.ambientIndex.HasSynced, true)
-
-	gtw := clienttest.NewWriter[*v1beta1.Gateway](t, s.client)
-
-	gateway := &v1beta1.Gateway{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      "remote-beta",
-			Namespace: "default",
-			Annotations: map[string]string{
-				annotation.GatewayServiceAccount.Name: "eastwest-istio-eastwest",
-			},
-			Labels: map[string]string{
-				label.TopologyNetwork.Name: "beta",
-			},
-		},
-		Spec: v1beta1.GatewaySpec{
-			GatewayClassName: "istio-remote",
-			Addresses: []v1beta1.GatewayAddress{
-				{
-					Type:  ptr.Of(v1beta1.IPAddressType),
-					Value: "172.18.1.45",
-				},
-			},
-			Listeners: []v1beta1.Listener{
-				{
-					Name:     "cross-network",
-					Port:     15008,
-					Protocol: v1beta1.ProtocolType("HBONE"),
-					TLS: &v1beta1.GatewayTLSConfig{
-						Mode: ptr.Of(v1beta1.TLSModeType("Passthrough")),
-						Options: map[v1beta1.AnnotationKey]v1beta1.AnnotationValue{
-							"gateway.istio.io/listener-protocol": "auto-passthrough",
-						},
-					},
-				},
-			},
-		},
-	}
-	gtw.Create(gateway)
-	assert.EventuallyEqual(t, func() int {
-		return len(s.ambientIndex.All())
-	}, 1)
-}
-
-func createOrUpdateNamespace(t *testing.T, c *FakeController, name, network string) {
-	namespace := &corev1.Namespace{
-		ObjectMeta: metav1.ObjectMeta{
-			Name: name,
-			Labels: map[string]string{
-				label.TopologyNetwork.Name: network,
-			},
-		},
-	}
-	clienttest.Wrap(t, c.namespaces).CreateOrUpdate(namespace)
 }

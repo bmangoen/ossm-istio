@@ -1,10 +1,11 @@
+{{- if or (eq .Values.global.resourceScope "all") (eq .Values.global.resourceScope "namespace") }}
 # Not created if istiod is running remotely
-{{- if not .Values.istiodRemote.enabled }}
+{{- if or (not .Values.istiodRemote.enabled) (and .Values.istiodRemote.enabled .Values.istiodRemote.enabledLocalInjectorIstiod) }}
 apiVersion: v1
 kind: Service
 metadata:
   name: istiod{{- if not (eq .Values.revision "") }}-{{ .Values.revision }}{{- end }}
-  namespace: {{ .Release.Namespace }}
+  namespace: {{ .Release.Namespace | quote }}
   {{- if .Values.serviceAnnotations }}
   annotations:
 {{ toYaml .Values.serviceAnnotations | indent 4 }}
@@ -51,5 +52,9 @@ spec:
   - {{ . }}
   {{- end }}
   {{- end }}
+  {{- if .Values.trafficDistribution }}
+  trafficDistribution: {{ .Values.trafficDistribution }}
+  {{- end }}
 ---
+{{- end }}
 {{- end }}

@@ -4,7 +4,7 @@
 
 # The following flags (in addition to ${V}) can be specified on the command-line, or the environment. This
 # is primarily used by the CI systems.
-_INTEGRATION_TEST_FLAGS ?= $(INTEGRATION_TEST_FLAGS)
+_INTEGRATION_TEST_FLAGS := $(INTEGRATION_TEST_FLAGS)
 
 # $(CI) specifies that the test is running in a CI system. This enables CI specific logging.
 ifneq ($(CI),)
@@ -36,6 +36,10 @@ ifneq ($(VARIANT),)
     _INTEGRATION_TEST_FLAGS += --istio.test.variant=$(VARIANT)
 endif
 
+ifneq ($(IP_FAMILIES),)
+   _INTEGRATION_TEST_FLAGS += --istio.test.IPFamilies=$(IP_FAMILIES)
+endif
+
 _INTEGRATION_TEST_SELECT_FLAGS ?= --istio.test.select=$(TEST_SELECT)
 ifneq ($(JOB_TYPE),postsubmit)
 	_INTEGRATION_TEST_SELECT_FLAGS:="$(_INTEGRATION_TEST_SELECT_FLAGS),-postsubmit"
@@ -43,11 +47,10 @@ endif
 
 # both ipv6 only and dual stack support ipv6
 support_ipv6 =
-ifeq ($(IP_FAMILY),ipv6)
+ifeq ($(KIND_IP_FAMILY),ipv6)
 	support_ipv6 = yes
-else ifeq ($(IP_FAMILY),dual)
+else ifeq ($(KIND_IP_FAMILY),dual)
 	support_ipv6 = yes
-	_INTEGRATION_TEST_FLAGS += --istio.test.enableDualStack
 endif
 ifdef support_ipv6
 	_INTEGRATION_TEST_SELECT_FLAGS:="$(_INTEGRATION_TEST_SELECT_FLAGS),-ipv4"
@@ -91,11 +94,12 @@ endef
 # Ensure that all test files are tagged properly. This ensures that we don't accidentally skip tests
 # and that integration tests are not run as part of the unit test suite.
 check-go-tag:
-	@go list ./tests/integration/... 2>/dev/null | xargs -r -I{} sh -c 'echo "Detected a file in tests/integration/ without a build tag set. Add // +build integ to the files: {}"; exit 2'
+	@go list ./tests/integration/... 2>/dev/null | xargs -r -I{} sh -c 'echo "Detected a file in tests/integration/ without a build tag set. Add //go:build integ to the files: {}"; exit 2'
 
 # Generate integration test targets for kubernetes environment.
+# Set SINGLE_PACKAGE=true to not include sub-packages (/... suffix).
 test.integration.%.kube: | $(JUNIT_REPORT) check-go-tag
-	$(call run-test,./tests/integration/$(subst .,/,$*)/...)
+	$(call run-test,./tests/integration/$(subst .,/,$*)/$(if $(SINGLE_PACKAGE),,...))
 
 # Generate integration fuzz test targets for kubernetes environment.
 test.integration-fuzz.%.kube: | $(JUNIT_REPORT) check-go-tag
@@ -122,5 +126,10 @@ test.integration.kube.environment: | $(JUNIT_REPORT) check-go-tag
 ifeq (${JOB_TYPE},postsubmit)
 	$(call run-test,./tests/integration/...)
 else
-	$(call run-test,./tests/integration/security/ ./tests/integration/pilot,-run="TestReachability|TestTraffic|TestGatewayConformance")
+	$(call run-test,./tests/integration/security/ ./tests/integration/pilot/,-run="TestReachability|TestTraffic|TestGatewayConformance")
 endif
+
+# Agentgateway support is currently experimental. Only used to run agentgateway tests as optional
+.PHONY: test.integration.kube.agentgateway
+test.integration.kube.agentgateway: | $(JUNIT_REPORT) check-go-tag
+	$(call run-test,./tests/integration/pilot/agentgateway/)

@@ -120,27 +120,41 @@ func (c *ConfigWriter) PrintSecretSummary() error {
 	return secretWriter.PrintSecretItems(secretItems)
 }
 
-func (c *ConfigWriter) PrintFullSummary(cf ClusterFilter, lf ListenerFilter, rf RouteFilter, epf EndpointFilter) error {
+func (c *ConfigWriter) printHeaders(summary string, withHeaders bool) {
+	if withHeaders {
+		_, _ = c.Stdout.Write([]byte("------ "))
+		_, _ = c.Stdout.Write([]byte(summary))
+		_, _ = c.Stdout.Write([]byte(" ------\n\n"))
+	}
+}
+
+func (c *ConfigWriter) PrintFullSummary(cf ClusterFilter, lf ListenerFilter, rf RouteFilter, epf EndpointFilter, withHeaders bool) error {
+	c.printHeaders("BOOTSTRAP INFO", withHeaders)
 	if err := c.PrintBootstrapSummary(); err != nil {
 		return err
 	}
 	_, _ = c.Stdout.Write([]byte("\n"))
+	c.printHeaders("CLUSTER INFO", withHeaders)
 	if err := c.PrintClusterSummary(cf); err != nil {
 		return err
 	}
 	_, _ = c.Stdout.Write([]byte("\n"))
+	c.printHeaders("LISTENER INFO", withHeaders)
 	if err := c.PrintListenerSummary(lf); err != nil {
 		return err
 	}
 	_, _ = c.Stdout.Write([]byte("\n"))
+	c.printHeaders("ROUTE INFO", withHeaders)
 	if err := c.PrintRouteSummary(rf); err != nil {
 		return err
 	}
 	_, _ = c.Stdout.Write([]byte("\n"))
+	c.printHeaders("SECRET INFO", withHeaders)
 	if err := c.PrintSecretSummary(); err != nil {
 		return err
 	}
 	_, _ = c.Stdout.Write([]byte("\n"))
+	c.printHeaders("ENDPOINTS INFO", withHeaders)
 	if err := c.PrintEndpointsSummary(epf); err != nil {
 		return err
 	}
@@ -179,31 +193,25 @@ func (c *ConfigWriter) PrintBootstrapSummary() error {
 }
 
 // PrintPodRootCAFromDynamicSecretDump prints just pod's root ca from dynamic secret config dump to the ConfigWriter stdout
-func (c *ConfigWriter) PrintPodRootCAFromDynamicSecretDump() (string, error) {
+func (c *ConfigWriter) PrintPodRootCAFromDynamicSecretDump() ([]byte, error) {
 	if c.configDump == nil {
-		return "", fmt.Errorf("config writer has not been primed")
+		return nil, fmt.Errorf("config writer has not been primed")
 	}
 	secretDump, err := c.configDump.GetSecretConfigDump()
 	if err != nil {
-		return "", fmt.Errorf("sidecar doesn't support secrets: %v", err)
+		return nil, fmt.Errorf("sidecar doesn't support secrets: %v", err)
 	}
 	for _, secret := range secretDump.DynamicActiveSecrets {
 		// check the ROOTCA from secret dump
 		if secret.Name == "ROOTCA" {
-			var returnStr string
-			var returnErr error
-			strCA, err := c.configDump.GetRootCAFromSecretConfigDump(secret.GetSecret())
+			rootCAData, err := c.configDump.GetRootCAFromSecretConfigDump(secret.GetSecret())
 			if err != nil {
-				returnStr = ""
-				returnErr = fmt.Errorf("can not dump ROOTCA from secret: %v", err)
-			} else {
-				returnStr = strCA
-				returnErr = nil
+				return nil, fmt.Errorf("can not dump ROOTCA from secret: %v", err)
 			}
-			return returnStr, returnErr
+			return rootCAData, nil
 		}
 	}
-	return "", fmt.Errorf("can not find ROOTCA from secret")
+	return nil, fmt.Errorf("cannot find ROOTCA from secret")
 }
 
 func (c *ConfigWriter) getIstioVersionInfo(bootstrapDump *adminv3.BootstrapConfigDump) (version, sha string) {
@@ -224,7 +232,7 @@ func (c *ConfigWriter) getIstioVersionInfo(bootstrapDump *adminv3.BootstrapConfi
 		}
 	}
 
-	return
+	return version, sha
 }
 
 func (c *ConfigWriter) getUserAgentVersionInfo(bootstrapDump *adminv3.BootstrapConfigDump) string {

@@ -32,6 +32,7 @@ import (
 	"istio.io/istio/operator/pkg/util"
 	"istio.io/istio/operator/pkg/util/clog"
 	"istio.io/istio/operator/pkg/values"
+	"istio.io/istio/pkg/env"
 	"istio.io/istio/pkg/kube"
 	pkgversion "istio.io/istio/pkg/version"
 )
@@ -65,7 +66,7 @@ func GenerateManifest(files []string, setFlags []string, force bool, client kube
 	}
 
 	// Render each component
-	var allManifests []manifest.ManifestSet
+	allManifests := map[component.Name]manifest.ManifestSet{}
 	var chartWarnings util.Errors
 	for _, comp := range component.AllComponents {
 		specs, err := comp.Get(merged)
@@ -76,7 +77,7 @@ func GenerateManifest(files []string, setFlags []string, force bool, client kube
 			// Each component may get a different view of the values; modify them as needed (with a copy)
 			compVals := applyComponentValuesToHelmValues(comp, spec, merged)
 			// Render the chart
-			rendered, warnings, err := helm.Render(spec.Namespace, comp.HelmSubdir, compVals, kubernetesVersion)
+			rendered, warnings, err := helm.Render("istio", spec.Namespace, comp.HelmSubdir, compVals, kubernetesVersion)
 			if err != nil {
 				return nil, nil, fmt.Errorf("helm render: %v", err)
 			}
@@ -86,10 +87,16 @@ func GenerateManifest(files []string, setFlags []string, force bool, client kube
 			if err != nil {
 				return nil, nil, fmt.Errorf("post processing: %v", err)
 			}
-			allManifests = append(allManifests, manifest.ManifestSet{
-				Component: comp.UserFacingName,
-				Manifests: finalized,
-			})
+			manifests, found := allManifests[comp.UserFacingName]
+			if found {
+				manifests.Manifests = append(manifests.Manifests, finalized...)
+				allManifests[comp.UserFacingName] = manifests
+			} else {
+				allManifests[comp.UserFacingName] = manifest.ManifestSet{
+					Component: comp.UserFacingName,
+					Manifests: finalized,
+				}
+			}
 		}
 	}
 
@@ -99,7 +106,14 @@ func GenerateManifest(files []string, setFlags []string, force bool, client kube
 			logger.LogAndErrorf("%s %v", "❗", w)
 		}
 	}
-	return allManifests, merged, nil
+
+	values := make([]manifest.ManifestSet, 0, len(allManifests))
+
+	for _, v := range allManifests {
+		values = append(values, v)
+	}
+
+	return values, merged, nil
 }
 
 type MigrationResult struct {
@@ -148,7 +162,7 @@ func Migrate(files []string, setFlags []string, client kube.Client) (MigrationRe
 			// Each component may get a different view of the values; modify them as needed (with a copy)
 			compVals := applyComponentValuesToHelmValues(comp, spec, merged)
 			// Render the chart
-			rendered, _, err := helm.Render(spec.Namespace, comp.HelmSubdir, compVals, kubernetesVersion)
+			rendered, _, err := helm.Render("istio", spec.Namespace, comp.HelmSubdir, compVals, kubernetesVersion)
 			if err != nil {
 				return res, fmt.Errorf("helm render: %v", err)
 			}
@@ -179,6 +193,40 @@ func applyComponentValuesToHelmValues(comp component.Component, spec apis.Gatewa
 			var ports []map[string]any
 			_ = json.Unmarshal(b, &ports)
 			_ = merged.SetPath(fmt.Sprintf("spec.values.%s.ports", root), ports)
+		}
+	}
+	// For Deployment-based components, translate k8s HPA/replica settings to Helm
+	// values so that template guard conditions (e.g. PDB requiring autoscaleMin > 1)
+	// see them. Without this, k8s.hpaSpec.minReplicas only patches the HPA
+	// post-render and the PDB is never generated. DaemonSet components (CNI,
+	// ztunnel) have no autoscaling, so we skip them.
+	if comp.ResourceType == "Deployment" && spec.Kubernetes != nil {
+		if !comp.IsGateway() {
+			merged = merged.DeepClone()
+		}
+		if spec.Kubernetes.HpaSpec != nil {
+			if spec.Kubernetes.HpaSpec.MinReplicas != nil {
+				_ = merged.SetPath(fmt.Sprintf("spec.values.%s.autoscaleMin", root), int64(*spec.Kubernetes.HpaSpec.MinReplicas))
+			}
+			if spec.Kubernetes.HpaSpec.MaxReplicas > 0 {
+				_ = merged.SetPath(fmt.Sprintf("spec.values.%s.autoscaleMax", root), int64(spec.Kubernetes.HpaSpec.MaxReplicas))
+			}
+		}
+		if spec.Kubernetes.ReplicaCount > 0 {
+			_ = merged.SetPath(fmt.Sprintf("spec.values.%s.replicaCount", root), int64(spec.Kubernetes.ReplicaCount))
+		}
+	}
+	// Translate k8s.resources CPU into Helm values so chart guard conditions (e.g.
+	// ztunnel's ZTUNNEL_RESOURCE_CPU_* env vars) see operator-set resources. Without
+	// this, k8s.resources only patches the container post-render and is invisible at
+	// template time, so the guards would never fire on the istioctl/operator path.
+	if spec.Kubernetes != nil && spec.Kubernetes.Resources != nil {
+		merged = merged.DeepClone()
+		if cpu := spec.Kubernetes.Resources.Limits.Cpu(); !cpu.IsZero() {
+			_ = merged.SetPath(fmt.Sprintf("spec.values.%s.resources.limits.cpu", root), cpu.String())
+		}
+		if cpu := spec.Kubernetes.Resources.Requests.Cpu(); !cpu.IsZero() {
+			_ = merged.SetPath(fmt.Sprintf("spec.values.%s.resources.requests.cpu", root), cpu.String())
 		}
 	}
 	// No changes needed, skip early to avoid copy
@@ -406,6 +454,8 @@ func readProfileInternal(path string, profile string) (values.Map, error) {
 	return values.MapFromYaml(pb)
 }
 
+var allowGKEAutoDetection = env.Register("AUTO_GKE_DETECTION", true, "If true, GKE will be detected automatically.").Get()
+
 // clusterSpecificSettings computes any automatically detected settings from the cluster.
 func clusterSpecificSettings(client kube.Client) []string {
 	if client == nil {
@@ -417,8 +467,15 @@ func clusterSpecificSettings(client kube.Client) []string {
 	}
 	// https://istio.io/latest/docs/setup/additional-setup/cni/#hosted-kubernetes-settings
 	// GKE requires deployment in kube-system namespace.
-	if strings.Contains(ver.GitVersion, "-gke") {
-		return []string{"components.cni.namespace=kube-system"}
+	if allowGKEAutoDetection && strings.Contains(ver.GitVersion, "-gke") {
+		return []string{
+			// This could be in istio-system with ResourceQuotas, but for backwards compatibility we move it to kube-system still
+			"components.cni.namespace=kube-system",
+			// Enable GKE profile, which ensures CNI Bin Dir is set appropriately
+			"values.global.platform=gke",
+			// Since we already put it in kube-system, don't bother deploying a resource quota
+			"values.cni.resourceQuotas.enabled=false",
+		}
 	}
 	return nil
 }

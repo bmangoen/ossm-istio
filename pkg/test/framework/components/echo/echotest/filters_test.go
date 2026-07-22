@@ -331,7 +331,7 @@ func TestRun(t *testing.T) {
 				testTopology := map[string]map[string]int{}
 				tt.run(t, testTopology)
 				if diff := cmp.Diff(testTopology, tt.expect); diff != "" {
-					t.Errorf(diff)
+					t.Errorf("%s", diff)
 				}
 			})
 		}
@@ -381,8 +381,8 @@ func (f fakeInstance) NamespaceName() string {
 	return f.Config().NamespaceName()
 }
 
-func (f fakeInstance) ServiceAccountName() string {
-	return f.Config().ServiceAccountName()
+func (f fakeInstance) SpiffeIdentity() string {
+	return f.Config().SpiffeIdentity()
 }
 
 func (f fakeInstance) ClusterLocalFQDN() string {

@@ -1,5 +1,4 @@
 //go:build integ
-// +build integ
 
 // Copyright Istio Authors. All Rights Reserved.
 //
@@ -22,7 +21,6 @@ import (
 	"testing"
 	"time"
 
-	"istio.io/istio/pkg/config/constants"
 	"istio.io/istio/pkg/config/protocol"
 	"istio.io/istio/pkg/http/headers"
 	"istio.io/istio/pkg/test/framework"
@@ -33,7 +31,7 @@ import (
 )
 
 const (
-	imageName      = "istio-testing/wasm/header-injector"
+	imageName      = "testing/wasm/header-injector"
 	injectedHeader = "x-resp-injection"
 	wasmConfigFile = "testdata/wasm-filter.yaml"
 )
@@ -132,11 +130,12 @@ func sendTraffic(ctx framework.TestContext, checker echo.Checker, options ...ret
 	if len(GetClientInstances()) == 0 {
 		ctx.Fatal("there is no client")
 	}
-	cltInstance := GetClientInstances()[0]
+	// TODO: Figure out if/how to support multiple clusters
+	cltInstance := GetClientInstances().ForCluster(ctx.Clusters().Default().Name())[0]
 
 	defaultOptions := []retry.Option{retry.Delay(100 * time.Millisecond), retry.Timeout(200 * time.Second)}
 	httpOpts := echo.CallOptions{
-		To: GetTarget(),
+		To: GetTarget().Instances().ForCluster(ctx.Clusters().Default().Name()),
 		Port: echo.Port{
 			Name: "http",
 		},
@@ -216,25 +215,21 @@ func TestWasmPluginConfigurations(t *testing.T) {
 					desc:       "Configure WebAssembly filter for waypoint",
 					name:       "waypoint-wasm-test",
 					targetType: "gateway",
-					targetName: constants.DefaultNamespaceWaypoint,
+					targetName: GetTarget().Config().ServiceWaypointProxy,
 				},
 				{
 					desc:       "Configure WebAssembly filter for specific service",
 					name:       "service-wasm-test",
 					targetType: "service",
-					targetName: GetTarget().(echo.Instances).ServiceName(),
+					targetName: GetTarget().Instances().ServiceName(),
 				},
 			}
 
 			for _, tc := range testCases {
-				if tc.name == "service-wasm-test" {
-					t.Skip("https://github.com/istio/istio/issues/51288/")
-				}
-
 				if tc.name == "gateway-wasm-test" {
 					crd.DeployGatewayAPIOrSkip(t)
 					args := map[string]any{
-						"To": GetTarget().(echo.Instances),
+						"To": GetTarget().Instances(),
 					}
 					t.ConfigIstio().EvalFile(apps.Namespace.Name(), args, "testdata/gateway-api.yaml").ApplyOrFail(t)
 				}

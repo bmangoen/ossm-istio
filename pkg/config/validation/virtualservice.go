@@ -98,7 +98,7 @@ func validateHTTPRoute(http *networking.HTTPRoute, delegate, gatewaySemantics bo
 
 	errs = AppendValidation(errs, validateDestination(http.Mirror))
 	errs = AppendValidation(errs, validateHTTPMirrors(http.Mirrors))
-	errs = AppendValidation(errs, validateHTTPRedirect(http.Redirect))
+	errs = AppendValidation(errs, validateHTTPRedirect(http.Redirect, http.Match))
 	errs = AppendValidation(errs, validateHTTPDirectResponse(http.DirectResponse))
 	errs = AppendValidation(errs, validateHTTPRetry(http.Retries))
 	errs = AppendValidation(errs, validateHTTPRewrite(http.Rewrite))
@@ -108,7 +108,7 @@ func validateHTTPRoute(http *networking.HTTPRoute, delegate, gatewaySemantics bo
 		errs = AppendValidation(errs, agent.ValidateDuration(http.Timeout))
 	}
 
-	return
+	return errs
 }
 
 // validateAuthorityRewrite ensures we only attempt rewrite authority in a single place.
@@ -183,7 +183,7 @@ func validateHTTPRouteMatchRequest(http *networking.HTTPRoute) (errs error) {
 		}
 	}
 
-	return
+	return errs
 }
 
 func validateHTTPRouteConflict(http *networking.HTTPRoute, routeType HTTPRouteType) (errs error) {

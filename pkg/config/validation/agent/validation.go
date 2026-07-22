@@ -30,6 +30,7 @@ import (
 	meshconfig "istio.io/api/mesh/v1alpha1"
 	networking "istio.io/api/networking/v1alpha3"
 	"istio.io/istio/pilot/pkg/features"
+	"istio.io/istio/pilot/pkg/model/credentials"
 	"istio.io/istio/pilot/pkg/serviceregistry/util/label"
 	"istio.io/istio/pkg/config/labels"
 	"istio.io/istio/pkg/config/security"
@@ -161,7 +162,7 @@ func ValidateDrainDuration(drainTime *durationpb.Duration) (errs error) {
 		errs = multierror.Append(errs, multierror.Prefix(err, "invalid drain duration:"))
 	}
 	if errs != nil {
-		return
+		return errs
 	}
 
 	drainDuration := drainTime.AsDuration()
@@ -170,7 +171,7 @@ func ValidateDrainDuration(drainTime *durationpb.Duration) (errs error) {
 		errs = multierror.Append(errs,
 			errors.New("drain time only supports durations to seconds precision"))
 	}
-	return
+	return errs
 }
 
 // ValidatePort checks that the network port is in range
@@ -276,9 +277,18 @@ func ValidateDatadogCollector(d *meshconfig.Tracing_Datadog) error {
 	return ValidateProxyAddress(strings.Replace(d.GetAddress(), "$(HOST_IP)", "127.0.0.1", 1))
 }
 
-func ValidateTLS(settings *networking.ClientTLSSettings) (errs error) {
+func ValidateTLS(configNamespace string, settings *networking.ClientTLSSettings) (errs error) {
 	if settings == nil {
-		return
+		return errs
+	}
+
+	if settings.CredentialName != "" && strings.HasPrefix(settings.CredentialName, credentials.KubernetesConfigMapTypeURI) {
+		rn, err := credentials.ParseResourceName(settings.CredentialName, configNamespace, "", "")
+		if err != nil {
+			errs = AppendErrors(errs, fmt.Errorf("invalid configmap:// credentialName: %v", err))
+		} else if rn.Namespace != configNamespace || configNamespace == "" {
+			errs = AppendErrors(errs, fmt.Errorf("invalid configmap:// credentialName: namespace must match the configuration namespace %q", configNamespace))
+		}
 	}
 
 	if settings.GetInsecureSkipVerify().GetValue() {
@@ -307,7 +317,7 @@ func ValidateTLS(settings *networking.ClientTLSSettings) (errs error) {
 
 		// If tls mode is SIMPLE or MUTUAL, and CredentialName is specified, credentials are fetched
 		// remotely. ServerCertificate and CaCertificates fields are not required.
-		return
+		return errs
 	}
 
 	if settings.Mode == networking.ClientTLSSettings_MUTUAL {
@@ -319,11 +329,12 @@ func ValidateTLS(settings *networking.ClientTLSSettings) (errs error) {
 		}
 	}
 
-	return
+	return errs
 }
 
 // ValidateMeshConfigProxyConfig checks that the mesh config is well-formed
-func ValidateMeshConfigProxyConfig(config *meshconfig.ProxyConfig) (errs error) {
+func ValidateMeshConfigProxyConfig(config *meshconfig.ProxyConfig) Validation {
+	var errs, warnings error
 	if config.ConfigPath == "" {
 		errs = multierror.Append(errs, errors.New("config path must be set"))
 	}
@@ -375,7 +386,7 @@ func ValidateMeshConfigProxyConfig(config *meshconfig.ProxyConfig) (errs error) 
 	}
 
 	if tracer := config.GetTracing().GetTlsSettings(); tracer != nil {
-		if err := ValidateTLS(tracer); err != nil {
+		if err := ValidateTLS("", tracer); err != nil {
 			errs = multierror.Append(errs, multierror.Prefix(err, "invalid tracing TLS config:"))
 		}
 	}
@@ -399,6 +410,12 @@ func ValidateMeshConfigProxyConfig(config *meshconfig.ProxyConfig) (errs error) 
 		} else {
 			scope.Warnf("EnvoyMetricsServiceAddress is deprecated, use EnvoyMetricsService instead.") // nolint: stylecheck
 		}
+	}
+
+	// use of "ISTIO_META_DNS_AUTO_ALLOCATE" is being deprecated, check and warn
+	if _, autoAllocationV1Used := config.GetProxyMetadata()["ISTIO_META_DNS_AUTO_ALLOCATE"]; autoAllocationV1Used {
+		warnings = multierror.Append(warnings, errors.New("'ISTIO_META_DNS_AUTO_ALLOCATE' is deprecated; review "+
+			"https://istio.io/latest/docs/ops/configuration/traffic-management/dns-proxy/#dns-auto-allocation-v2 for information about replacement functionality"))
 	}
 
 	if config.EnvoyMetricsService != nil && config.EnvoyMetricsService.Address != "" {
@@ -431,7 +448,13 @@ func ValidateMeshConfigProxyConfig(config *meshconfig.ProxyConfig) (errs error) 
 		}
 	}
 
-	return
+	if cs := config.GetConnectionSettings(); cs != nil {
+		if err := validateConnectionSettings(cs); err != nil {
+			errs = multierror.Append(errs, multierror.Prefix(err, "invalid connection settings:"))
+		}
+	}
+
+	return Validation{errs, warnings}
 }
 
 func ValidateControlPlaneAuthPolicy(policy meshconfig.AuthenticationPolicy) error {
@@ -506,12 +529,12 @@ func ValidateProtocolDetectionTimeout(timeout *durationpb.Duration) error {
 // ValidateLocalityLbSetting checks the LocalityLbSetting of MeshConfig
 func ValidateLocalityLbSetting(lb *networking.LocalityLoadBalancerSetting, outlier *networking.OutlierDetection) (errs Validation) {
 	if lb == nil {
-		return
+		return errs
 	}
 
 	if len(lb.GetDistribute()) > 0 && len(lb.GetFailover()) > 0 {
 		errs = AppendValidation(errs, fmt.Errorf("can not simultaneously specify 'distribute' and 'failover'"))
-		return
+		return errs
 	}
 
 	if len(lb.GetFailover()) > 0 && len(lb.GetFailoverPriority()) > 0 {
@@ -519,7 +542,7 @@ func ValidateLocalityLbSetting(lb *networking.LocalityLoadBalancerSetting, outli
 			switch priorityLabel {
 			case label.LabelTopologyRegion, label.LabelTopologyZone, label.LabelTopologySubzone:
 				errs = AppendValidation(errs, fmt.Errorf("can not simultaneously set 'failover' and topology label '%s' in 'failover_priority'", priorityLabel))
-				return
+				return errs
 			}
 		}
 	}
@@ -533,13 +556,13 @@ func ValidateLocalityLbSetting(lb *networking.LocalityLoadBalancerSetting, outli
 			destLocalities = append(destLocalities, loc)
 			if weight <= 0 || weight > 100 {
 				errs = AppendValidation(errs, fmt.Errorf("locality weight must be in range [1, 100]"))
-				return
+				return errs
 			}
 			totalWeight += weight
 		}
 		if totalWeight != 100 {
 			errs = AppendValidation(errs, fmt.Errorf("total locality weight %v != 100", totalWeight))
-			return
+			return errs
 		}
 		errs = AppendValidation(errs, validateLocalities(destLocalities))
 	}
@@ -562,7 +585,56 @@ func ValidateLocalityLbSetting(lb *networking.LocalityLoadBalancerSetting, outli
 		}
 	}
 
-	return
+	return errs
+}
+
+// ValidateZoneAwareLbSetting checks the ZoneAwareLoadBalancerSetting on a
+// DestinationRule's TrafficPolicy. ZoneAwareLbSetting differs from
+// LocalityLbSetting in that region-, zone-, and subzone-level routing are all
+// handled automatically by Envoy: endpoints are always partitioned by region and
+// zone/subzone routing within a region is implicit. As a result, failover only
+// configures cross-region ordering, and failover_priority must not contain the
+// region, zone, or subzone topology labels.
+func ValidateZoneAwareLbSetting(lb *networking.ZoneAwareLoadBalancerSetting, outlier *networking.OutlierDetection) (errs Validation) {
+	if lb == nil {
+		return errs
+	}
+
+	for _, priorityLabel := range lb.GetFailoverPriority() {
+		// Region-, zone-, and subzone-level routing are all handled automatically by
+		// zone-aware LB: endpoints are always partitioned by region (use `failover` to
+		// order the cross-region tiers) and zone/subzone routing within a region is
+		// implicit. Allowing these topology labels in failover_priority would be
+		// redundant with, or conflict with, the ordering Envoy already applies.
+		switch priorityLabel {
+		case label.LabelTopologyRegion, label.LabelTopologyZone, label.LabelTopologySubzone:
+			errs = AppendValidation(
+				errs,
+				fmt.Errorf(
+					"'failover_priority' for zone aware lb must not use topology label '%s'; region- and zone-level routing are handled automatically",
+					priorityLabel,
+				),
+			)
+		}
+	}
+
+	if (len(lb.GetFailover()) != 0 || len(lb.GetFailoverPriority()) != 0) && outlier == nil {
+		errs = AppendValidation(errs, WrapWarning(fmt.Errorf("outlier detection policy must be provided for failover")))
+	}
+
+	for _, failover := range lb.GetFailover() {
+		if failover.From == failover.To {
+			errs = AppendValidation(errs, fmt.Errorf("zone aware lb failover settings must specify different regions"))
+		}
+		if strings.Contains(failover.From, "/") || strings.Contains(failover.To, "/") {
+			errs = AppendValidation(errs, fmt.Errorf("zone aware lb failover only specifies region; zone and subzone failover are handled automatically"))
+		}
+		if strings.Contains(failover.To, "*") || strings.Contains(failover.From, "*") {
+			errs = AppendValidation(errs, fmt.Errorf("zone aware lb failover region should not contain '*' wildcard"))
+		}
+	}
+
+	return errs
 }
 
 const (
@@ -658,7 +730,7 @@ func validateServiceSettings(config *meshconfig.MeshConfig) (errs error) {
 			}
 		}
 	}
-	return
+	return errs
 }
 
 // ValidateWildcardDomain checks that a domain is a valid FQDN, but also allows wildcard prefixes.
@@ -747,7 +819,7 @@ func validateTrustDomainConfig(config *meshconfig.MeshConfig) (errs error) {
 			errs = multierror.Append(errs, fmt.Errorf("trustDomainAliases[%d], domain `%s` : %v", i, tda, err))
 		}
 	}
-	return
+	return errs
 }
 
 func ValidateMeshTLSConfig(mesh *meshconfig.MeshConfig) (errs error) {
@@ -780,7 +852,87 @@ func ValidateMeshTLSDefaults(mesh *meshconfig.MeshConfig) (v Validation) {
 	if len(duplicateECDHCurves) > 0 {
 		v = AppendWarningf(v, "detected duplicate ECDH curves: %v", sets.SortedList(duplicateECDHCurves))
 	}
-	return
+	return v
+}
+
+// validateMeshConfigDefaultTrafficPolicy validates the value constraints of the mesh-wide
+// baseline traffic policy. It mirrors the connectionPool / outlierDetection checks applied to
+// a DestinationRule traffic policy, since the field reuses the same sub-types.
+func validateMeshConfigDefaultTrafficPolicy(dtp *meshconfig.MeshConfig_DefaultTrafficPolicy) (errs Validation) {
+	if dtp == nil {
+		return errs
+	}
+	if cp := dtp.GetConnectionPool(); cp != nil {
+		if cp.Http == nil && cp.Tcp == nil {
+			errs = AppendValidation(errs, errors.New("connection pool must have at least one field"))
+		}
+		if http := cp.Http; http != nil {
+			if http.Http1MaxPendingRequests < 0 {
+				errs = AppendValidation(errs, errors.New("http1 max pending requests must be non-negative"))
+			}
+			if http.Http2MaxRequests < 0 {
+				errs = AppendValidation(errs, errors.New("http2 max requests must be non-negative"))
+			}
+			if http.MaxRequestsPerConnection < 0 {
+				errs = AppendValidation(errs, errors.New("max requests per connection must be non-negative"))
+			}
+			if http.MaxRetries < 0 {
+				errs = AppendValidation(errs, errors.New("max retries must be non-negative"))
+			}
+			if http.MaxConcurrentStreams < 0 {
+				errs = AppendValidation(errs, errors.New("max concurrent streams must be non-negative"))
+			}
+			if http.IdleTimeout != nil {
+				errs = AppendValidation(errs, ValidateDuration(http.IdleTimeout))
+			}
+			if http.H2UpgradePolicy == networking.ConnectionPoolSettings_HTTPSettings_UPGRADE && http.UseClientProtocol {
+				errs = AppendValidation(errs, errors.New("use client protocol must not be true when H2UpgradePolicy is UPGRADE"))
+			}
+		}
+		if tcp := cp.Tcp; tcp != nil {
+			if tcp.MaxConnections < 0 {
+				errs = AppendValidation(errs, errors.New("max connections must be non-negative"))
+			}
+			if tcp.ConnectTimeout != nil {
+				errs = AppendValidation(errs, ValidateDuration(tcp.ConnectTimeout))
+			}
+			if tcp.MaxConnectionDuration != nil {
+				errs = AppendValidation(errs, ValidateDuration(tcp.MaxConnectionDuration))
+			}
+			if tcp.IdleTimeout != nil && tcp.IdleTimeout.AsDuration().Milliseconds() != 0 {
+				errs = AppendValidation(errs, ValidateDuration(tcp.IdleTimeout))
+			}
+			if ka := tcp.TcpKeepalive; ka != nil {
+				if ka.Time != nil {
+					errs = AppendValidation(errs, ValidateDuration(ka.Time))
+				}
+				if ka.Interval != nil {
+					errs = AppendValidation(errs, ValidateDuration(ka.Interval))
+				}
+			}
+		}
+	}
+	if od := dtp.GetOutlierDetection(); od != nil {
+		if od.BaseEjectionTime != nil {
+			errs = AppendValidation(errs, ValidateDuration(od.BaseEjectionTime))
+		}
+		if od.Interval != nil {
+			errs = AppendValidation(errs, ValidateDuration(od.Interval))
+		}
+		if !od.SplitExternalLocalOriginErrors && od.ConsecutiveLocalOriginFailures.GetValue() > 0 {
+			errs = AppendValidation(errs, errors.New("outlier detection consecutive local origin failures is specified, "+
+				"but split external local origin errors is set to false"))
+		}
+		errs = AppendValidation(errs, validatePercent(od.MaxEjectionPercent), validatePercent(od.MinHealthPercent))
+	}
+	return errs
+}
+
+func validatePercent(val int32) error {
+	if val < 0 || val > 100 {
+		return fmt.Errorf("percentage %v is not in range 0..100", val)
+	}
+	return nil
 }
 
 // ValidateMeshConfig checks that the mesh config is well-formed
@@ -804,7 +956,14 @@ func ValidateMeshConfig(mesh *meshconfig.MeshConfig) (Warning, error) {
 		v = AppendValidation(v, ValidateMeshConfigProxyConfig(mesh.DefaultConfig))
 	}
 
+	// LocalityLbSetting and ZoneAwareLbSetting are not mutually exclusive at the mesh level:
+	// the default mesh config always enables LocalityLbSetting, and load-balancer resolution
+	// (GetEffectiveLbSetting) gives ZoneAwareLbSetting deterministic precedence over
+	// LocalityLbSetting, so a user opting into mesh-wide zone-aware LB simply has locality LB
+	// ignored. The mutual-exclusion check is still enforced for DestinationRule LoadBalancerSettings,
+	// where specifying both in a single policy is a genuine mistake.
 	v = AppendValidation(v, ValidateLocalityLbSetting(mesh.LocalityLbSetting, &networking.OutlierDetection{}))
+	v = AppendValidation(v, ValidateZoneAwareLbSetting(mesh.ZoneAwareLbSetting, &networking.OutlierDetection{}))
 	v = AppendValidation(v, validateServiceSettings(mesh))
 	v = AppendValidation(v, validateTrustDomainConfig(mesh))
 
@@ -815,6 +974,8 @@ func ValidateMeshConfig(mesh *meshconfig.MeshConfig) (Warning, error) {
 	v = AppendValidation(v, ValidateMeshTLSConfig(mesh))
 
 	v = AppendValidation(v, ValidateMeshTLSDefaults(mesh))
+
+	v = AppendValidation(v, validateMeshConfigDefaultTrafficPolicy(mesh.GetDefaultTrafficPolicy()))
 
 	return v.Unwrap()
 }
@@ -858,7 +1019,7 @@ func validateSidecarOrGatewayHostnamePart(hostname string, isGateway bool) (errs
 	// Gateway: https://istio.io/latest/docs/reference/config/networking/gateway/
 	// SideCar: https://istio.io/latest/docs/reference/config/networking/sidecar/#IstioEgressListener
 	errs = AppendErrors(errs, ValidatePartialWildCard(hostname))
-	return
+	return errs
 }
 
 func ValidateNamespaceSlashWildcardHostname(hostname string, isGateway bool, gatewaySemantics bool) (errs error) {
@@ -869,7 +1030,7 @@ func ValidateNamespaceSlashWildcardHostname(hostname string, isGateway bool, gat
 			return validateSidecarOrGatewayHostnamePart(hostname, true)
 		}
 		errs = AppendErrors(errs, fmt.Errorf("host must be of form namespace/dnsName"))
-		return
+		return errs
 	}
 
 	if len(parts[0]) == 0 || len(parts[1]) == 0 {
@@ -877,23 +1038,20 @@ func ValidateNamespaceSlashWildcardHostname(hostname string, isGateway bool, gat
 	}
 
 	if !isGateway {
-		// namespace can be * or . or ~ or a valid DNS label in sidecars
-		if parts[0] != "*" && parts[0] != "." && parts[0] != "~" {
-			if !labels.IsDNS1123Label(parts[0]) {
-				errs = AppendErrors(errs, fmt.Errorf("invalid namespace value %q in sidecar", parts[0]))
-			}
+		// namespace can be *, ., or a valid DNS label, optionally ~-prefixed to exclude it.
+		ns := strings.TrimPrefix(parts[0], "~")
+		if ns != "" && ns != "*" && ns != "." && !labels.IsDNS1123Label(ns) {
+			errs = AppendErrors(errs, fmt.Errorf("invalid namespace value %q in sidecar", parts[0]))
 		}
-	} else {
+	} else if parts[0] != "*" && parts[0] != "." && (parts[0] != "~" || !gatewaySemantics) {
 		// namespace can be * or . or a valid DNS label in gateways
 		// namespace can be ~ in gateways converted from Gateway API when no routes match
-		if parts[0] != "*" && parts[0] != "." && (parts[0] != "~" || !gatewaySemantics) {
-			if !labels.IsDNS1123Label(parts[0]) {
-				errs = AppendErrors(errs, fmt.Errorf("invalid namespace value %q in gateway", parts[0]))
-			}
+		if !labels.IsDNS1123Label(parts[0]) {
+			errs = AppendErrors(errs, fmt.Errorf("invalid namespace value %q in gateway", parts[0]))
 		}
 	}
 	errs = AppendErrors(errs, validateSidecarOrGatewayHostnamePart(parts[1], isGateway))
-	return
+	return errs
 }
 
 // ValidateIPSubnet checks that a string is in "CIDR notation" or "Dot-decimal notation"
@@ -944,7 +1102,55 @@ func validateNetwork(network *meshconfig.Network) (errs error) {
 			errs = multierror.Append(errs, err)
 		}
 	}
-	return
+	return errs
+}
+
+func validateConnectionSettings(cs *meshconfig.ProxyConfig_ConnectionSettings) error {
+	var errs error
+	if v := cs.GetListenerPerConnectionBufferLimitBytes(); v != nil && v.GetValue() < 0 {
+		errs = multierror.Append(errs, errors.New("listener_per_connection_buffer_limit_bytes must be non-negative"))
+	}
+	if v := cs.GetClusterPerConnectionBufferLimitBytes(); v != nil && v.GetValue() < 0 {
+		errs = multierror.Append(errs, errors.New("cluster_per_connection_buffer_limit_bytes must be non-negative"))
+	}
+	if d := cs.GetHttpIdleTimeout(); d != nil && d.AsDuration() < 0 {
+		errs = multierror.Append(errs, errors.New("http_idle_timeout must be non-negative"))
+	}
+	if d := cs.GetHttpMaxConnectionDuration(); d != nil && d.AsDuration() < 0 {
+		errs = multierror.Append(errs, errors.New("http_max_connection_duration must be non-negative"))
+	}
+	if d := cs.GetHttpDrainTimeout(); d != nil && d.AsDuration() < 0 {
+		errs = multierror.Append(errs, errors.New("http_drain_timeout must be non-negative"))
+	}
+	if d := cs.GetHttpRequestTimeout(); d != nil && d.AsDuration() < 0 {
+		errs = multierror.Append(errs, errors.New("http_request_timeout must be non-negative"))
+	}
+	if d := cs.GetHttpRequestHeadersTimeout(); d != nil && d.AsDuration() < 0 {
+		errs = multierror.Append(errs, errors.New("http_request_headers_timeout must be non-negative"))
+	}
+	if d := cs.GetHttpStreamIdleTimeout(); d != nil && d.AsDuration() < 0 {
+		errs = multierror.Append(errs, errors.New("http_stream_idle_timeout must be non-negative"))
+	}
+	if d := cs.GetHttpMaxStreamDuration(); d != nil && d.AsDuration() < 0 {
+		errs = multierror.Append(errs, errors.New("http_max_stream_duration must be non-negative"))
+	}
+	if v := cs.GetHttpMaxConcurrentStreams(); v != nil && v.GetValue() <= 0 {
+		errs = multierror.Append(errs, errors.New("http_max_concurrent_streams must be positive"))
+	}
+	if v := cs.GetHttp2InitialStreamWindowSize(); v != nil && v.GetValue() < 65535 {
+		errs = multierror.Append(errs, errors.New("http2_initial_stream_window_size must be at least 65535"))
+	}
+	if v := cs.GetHttp2InitialConnectionWindowSize(); v != nil && v.GetValue() < 65535 {
+		errs = multierror.Append(errs, errors.New("http2_initial_connection_window_size must be at least 65535"))
+	}
+	// TODO: ListenerConnectionLimit and GlobalDownstreamConnectionLimit are validated here but wired in later PR (listener limits).
+	if v := cs.GetListenerConnectionLimit(); v != nil && v.GetValue() <= 0 {
+		errs = multierror.Append(errs, errors.New("listener_connection_limit must be positive"))
+	}
+	if v := cs.GetGlobalDownstreamConnectionLimit(); v != nil && v.GetValue() <= 0 {
+		errs = multierror.Append(errs, errors.New("global_downstream_connection_limit must be positive"))
+	}
+	return errs
 }
 
 // ValidateMeshNetworks validates meshnetworks.
@@ -955,5 +1161,5 @@ func ValidateMeshNetworks(meshnetworks *meshconfig.MeshNetworks) (errs error) {
 			errs = multierror.Append(errs, multierror.Prefix(err, fmt.Sprintf("invalid network %v:", name)))
 		}
 	}
-	return
+	return errs
 }

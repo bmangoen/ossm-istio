@@ -23,6 +23,7 @@ import (
 	"strings"
 
 	"istio.io/istio/pkg/env"
+	"istio.io/istio/pkg/log"
 	"istio.io/istio/tools/istio-iptables/pkg/constants"
 )
 
@@ -30,36 +31,39 @@ var DryRunFilePath = env.Register("DRY_RUN_FILE_PATH", "", "If provided, StdoutS
 
 // TODO BML replace DIY mocks/state with something better
 type DependenciesStub struct {
-	ExecutedNormally []string
-	ExecutedQuietly  []string
-	ExecutedStdin    []string
-	ExecutedAll      []string
+	ExecutedNormally       []string
+	ExecutedQuietly        []string
+	ExecutedStdin          []string
+	ExecutedAll            []string
+	ForceIPv4DetectionFail bool
+	ForceIPv6DetectionFail bool
 }
 
-func (s *DependenciesStub) Run(cmd constants.IptablesCmd, iptVer *IptablesVersion, stdin io.ReadSeeker, args ...string) error {
-	s.execute(false /*quietly*/, cmd, iptVer, stdin, args...)
-	_ = s.writeAllToDryRunPath()
-	return nil
-}
-
-func (s *DependenciesStub) RunWithOutput(cmd constants.IptablesCmd, iptVer *IptablesVersion, stdin io.ReadSeeker, args ...string) (*bytes.Buffer, error) {
-	s.execute(false /*quietly*/, cmd, iptVer, stdin, args...)
+func (s *DependenciesStub) Run(logger *log.Scope,
+	quietLogging bool,
+	cmd constants.IptablesCmd,
+	iptVer *IptablesVersion,
+	stdin io.ReadSeeker,
+	args ...string,
+) (*bytes.Buffer, error) {
+	s.execute(quietLogging, cmd, iptVer, stdin, args...)
 	_ = s.writeAllToDryRunPath()
 	return &bytes.Buffer{}, nil
 }
 
-func (s *DependenciesStub) RunQuietlyAndIgnore(cmd constants.IptablesCmd, iptVer *IptablesVersion, stdin io.ReadSeeker, args ...string) {
-	s.execute(true /*quietly*/, cmd, iptVer, stdin, args...)
-	_ = s.writeAllToDryRunPath()
-}
-
 func (s *DependenciesStub) DetectIptablesVersion(ipV6 bool) (IptablesVersion, error) {
 	if ipV6 {
+		if s.ForceIPv6DetectionFail {
+			return IptablesVersion{}, fmt.Errorf("ip6tables binary not found")
+		}
 		return IptablesVersion{
 			DetectedBinary:        "ip6tables",
 			DetectedSaveBinary:    "ip6tables-save",
 			DetectedRestoreBinary: "ip6tables-restore",
 		}, nil
+	}
+	if s.ForceIPv4DetectionFail {
+		return IptablesVersion{}, fmt.Errorf("iptables binary not found")
 	}
 	return IptablesVersion{
 		DetectedBinary:        "iptables",

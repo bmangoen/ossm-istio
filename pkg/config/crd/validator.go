@@ -49,6 +49,22 @@ import (
 	"istio.io/istio/pkg/util/sets"
 )
 
+type validatorConfig struct {
+	skipCRDValidation bool
+}
+
+// ValidatorOption configures how validators are built.
+type ValidatorOption func(*validatorConfig)
+
+// WithoutCRDValidation skips validating each CRD definition before building validators.
+// This avoids Kubernetes' full CRD validator, which is expensive; use this when
+// the CRDs are already trusted and only resource validation is needed.
+func WithoutCRDValidation() ValidatorOption {
+	return func(o *validatorConfig) {
+		o.skipCRDValidation = true
+	}
+}
+
 // Validator returns a new validator for custom resources
 // Warning: this is meant for usage in tests only
 type Validator struct {
@@ -64,7 +80,7 @@ type ValidationIgnorer struct {
 	patternsByNamespace map[string]sets.String
 }
 
-// NewValidationIgnorer initializes the ignorer for the validatior, pairs are in namespace/namePattern format.
+// NewValidationIgnorer initializes the ignorer for the validator, pairs are in namespace/namePattern format.
 func NewValidationIgnorer(pairs ...string) *ValidationIgnorer {
 	vi := &ValidationIgnorer{
 		patternsByNamespace: make(map[string]sets.String),
@@ -166,6 +182,11 @@ func (v *Validator) ValidateCustomResource(o runtime.Object) error {
 }
 
 func NewValidatorFromFiles(files ...string) (*Validator, error) {
+	return NewValidatorFromFilesWithOptions(files)
+}
+
+// NewValidatorFromFilesWithOptions builds a Validator from CRD YAML files.
+func NewValidatorFromFilesWithOptions(files []string, opts ...ValidatorOption) (*Validator, error) {
 	crds := []apiextensions.CustomResourceDefinition{}
 	closers := make([]io.Closer, 0, len(files))
 	defer func() {
@@ -183,7 +204,7 @@ func NewValidatorFromFiles(files ...string) (*Validator, error) {
 		yamlDecoder := kubeyaml.NewYAMLOrJSONDecoder(data, 512*1024)
 		for {
 			un := &unstructured.Unstructured{}
-			err = yamlDecoder.Decode(&un)
+			err = yamlDecoder.Decode(un)
 			if err == io.EOF {
 				break
 			}
@@ -218,16 +239,41 @@ func NewValidatorFromFiles(files ...string) (*Validator, error) {
 				if err := apiextensionsv1beta1.Convert_v1beta1_CustomResourceDefinition_To_apiextensions_CustomResourceDefinition(&crdv1beta1, &crd, nil); err != nil {
 					return nil, err
 				}
+			case schema.GroupVersionKind{
+				Group:   "admissionregistration.k8s.io",
+				Version: "v1",
+				Kind:    "ValidatingAdmissionPolicyBinding",
+			}:
+				continue
+			case schema.GroupVersionKind{
+				Group:   "admissionregistration.k8s.io",
+				Version: "v1",
+				Kind:    "ValidatingAdmissionPolicy",
+			}:
+				continue
+			case schema.GroupVersionKind{}:
+				// Not a CRD, skip. Sometimes people put empty objects in YAML files.
+				continue
 			default:
 				return nil, fmt.Errorf("unknown CRD type: %v", un.GroupVersionKind())
 			}
 			crds = append(crds, crd)
 		}
 	}
-	return NewValidatorFromCRDs(crds...)
+	return NewValidatorFromCRDsWithOptions(crds, opts...)
 }
 
 func NewValidatorFromCRDs(crds ...apiextensions.CustomResourceDefinition) (*Validator, error) {
+	return NewValidatorFromCRDsWithOptions(crds)
+}
+
+// NewValidatorFromCRDsWithOptions builds a Validator from CRD definitions.
+func NewValidatorFromCRDsWithOptions(crds []apiextensions.CustomResourceDefinition, opts ...ValidatorOption) (*Validator, error) {
+	cfg := validatorConfig{}
+	for _, opt := range opts {
+		opt(&cfg)
+	}
+
 	v := &Validator{
 		byGvk:      map[schema.GroupVersionKind]validation.SchemaCreateValidator{},
 		structural: map[schema.GroupVersionKind]*structuralschema.Structural{},
@@ -241,9 +287,11 @@ func NewValidatorFromCRDs(crds ...apiextensions.CustomResourceDefinition) (*Vali
 		crd.Status.StoredVersions = slices.Map(versions, func(e apiextensions.CustomResourceDefinitionVersion) string {
 			return e.Name
 		})
-		errs := apiextval.ValidateCustomResourceDefinition(context.Background(), &crd)
-		if len(errs) > 0 {
-			return nil, fmt.Errorf("CRD %v is not valid: %v", crd.Name, errs.ToAggregate())
+		if !cfg.skipCRDValidation {
+			errs := apiextval.ValidateCustomResourceDefinition(context.Background(), &crd)
+			if len(errs) > 0 {
+				return nil, fmt.Errorf("CRD %v is not valid: %v", crd.Name, errs.ToAggregate())
+			}
 		}
 		for _, ver := range versions {
 			gvk := schema.GroupVersionKind{
@@ -283,6 +331,7 @@ func NewValidatorFromCRDs(crds ...apiextensions.CustomResourceDefinition) (*Vali
 
 func NewIstioValidator(t test.Failer) *Validator {
 	v, err := NewValidatorFromFiles(
+		filepath.Join(env.IstioSrc, "tests/integration/pilot/testdata/gateway-api-inference-extension-crd.yaml"),
 		filepath.Join(env.IstioSrc, "tests/integration/pilot/testdata/gateway-api-crd.yaml"),
 		filepath.Join(env.IstioSrc, "manifests/charts/base/files/crd-all.gen.yaml"),
 	)

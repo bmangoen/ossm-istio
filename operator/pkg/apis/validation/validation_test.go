@@ -15,14 +15,21 @@
 package validation_test
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"testing"
+
+	v1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 
 	"istio.io/istio/operator/pkg/apis"
 	"istio.io/istio/operator/pkg/apis/validation"
 	"istio.io/istio/operator/pkg/util"
 	"istio.io/istio/operator/pkg/values"
+	"istio.io/istio/pkg/kube"
 	"istio.io/istio/pkg/test/util/assert"
 )
 
@@ -272,7 +279,15 @@ cni:
   cniConfDir: "/var/run/multus/cni/net.d"
 `,
 		},
-
+		{
+			desc: "CNIReconcileIptablesOnStartup",
+			yamlStr: `
+cni:
+  ambient:
+    enabled: true
+    reconcileIptablesOnStartup: true
+`,
+		},
 		{
 			desc: "BadIPRange",
 			yamlStr: `
@@ -353,6 +368,143 @@ cni:
 			_, errs := validation.ParseAndValidateIstioOperator(values.MakeMap(m, "spec", "values"), nil)
 			if gotErr, wantErr := errs, tt.wantErrs; !util.EqualErrors(gotErr, wantErr) {
 				t.Errorf("CheckValues(%s)(%v): gotErr:%s, wantErr:%s", tt.desc, tt.yamlStr, gotErr, wantErr)
+			}
+		})
+	}
+}
+
+// nolint: lll
+func TestDetectCniIncompatibility(t *testing.T) {
+	tests := []struct {
+		desc         string
+		ioYamlStr    string
+		calicoConfig *unstructured.Unstructured
+		ciliumConfig *v1.ConfigMap
+		wantWarnings util.Errors
+	}{
+		{
+			desc: "Calico bpfConnectTimeLoadBalancing TCP",
+			calicoConfig: &unstructured.Unstructured{
+				Object: map[string]interface{}{
+					"apiVersion": "projectcalico.org/v3",
+					"kind":       "FelixConfiguration",
+					"metadata": map[string]interface{}{
+						"name": "default",
+					},
+					"spec": map[string]interface{}{
+						"bpfConnectTimeLoadBalancing": "TCP",
+					},
+				},
+			},
+
+			wantWarnings: makeErrors([]string{`detected Calico CNI with 'bpfConnectTimeLoadBalancing=TCP'; this must be set to 'bpfConnectTimeLoadBalancing=Disabled' in the Calico configuration`}),
+		},
+		{
+			desc: "Calico bpfConnectTimeLoadBalancingEnabled true",
+			calicoConfig: &unstructured.Unstructured{
+				Object: map[string]interface{}{
+					"apiVersion": "projectcalico.org/v3",
+					"kind":       "FelixConfiguration",
+					"metadata": map[string]interface{}{
+						"name": "default",
+					},
+					"spec": map[string]interface{}{
+						"bpfConnectTimeLoadBalancingEnabled": true,
+					},
+				},
+			},
+
+			wantWarnings: makeErrors([]string{`detected Calico CNI with 'bpfConnectTimeLoadBalancingEnabled=true'; this must be set to 'bpfConnectTimeLoadBalancingEnabled=false' in the Calico configuration`}),
+		},
+		{
+			desc: "Cilium enable-bpf-masquerade true",
+			ioYamlStr: `
+spec:
+  components:
+    ztunnel:
+      enabled: true
+`,
+			ciliumConfig: &v1.ConfigMap{
+				ObjectMeta: metav1.ObjectMeta{Namespace: "kube-system", Name: "cilium-config"},
+				Data: map[string]string{
+					"enable-bpf-masquerade": "true",
+				},
+			},
+			wantWarnings: makeErrors([]string{`detected Cilium CNI with 'enable-bpf-masquerade=true'; this must be set to 'false' when using ambient mode`}),
+		},
+		{
+			desc: "Cilium bpf-lb-sock=true + bpf-lb-sock-hostns-only=false => error",
+			ioYamlStr: `
+spec:
+  components:
+    cni:
+      enabled: true
+`,
+			ciliumConfig: &v1.ConfigMap{
+				ObjectMeta: metav1.ObjectMeta{Namespace: "kube-system", Name: "cilium-config"},
+				Data: map[string]string{
+					"bpf-lb-sock":             "true",
+					"bpf-lb-sock-hostns-only": "false",
+				},
+			},
+			wantWarnings: makeErrors([]string{
+				"detected Cilium CNI with 'bpf-lb-sock=true'; this requires 'bpf-lb-sock-hostns-only=true' to be set",
+			}),
+		},
+		{
+			desc: "Cilium kube-proxy-replacement=strict + bpf-lb-sock-hostns-only=false => error",
+			ioYamlStr: `
+spec:
+  components:
+    cni:
+      enabled: true
+`,
+			ciliumConfig: &v1.ConfigMap{
+				ObjectMeta: metav1.ObjectMeta{Namespace: "kube-system", Name: "cilium-config"},
+				Data: map[string]string{
+					"kube-proxy-replacement":  "strict",
+					"bpf-lb-sock-hostns-only": "false",
+				},
+			},
+			wantWarnings: makeErrors([]string{
+				"detected Cilium CNI with 'kube-proxy-replacement=strict' and 'bpf-lb-sock-hostns-only=false'; please set 'bpf-lb-sock-hostns-only=true' to avoid conflicts with Istio",
+			}),
+		},
+		{
+			desc: "Cilium kube-proxy-replacement=strict + bpf-lb-sock-hostns-only=true => no error",
+			ioYamlStr: `
+spec:
+  components:
+    cni:
+      enabled: true
+`,
+			ciliumConfig: &v1.ConfigMap{
+				ObjectMeta: metav1.ObjectMeta{Namespace: "kube-system", Name: "cilium-config"},
+				Data: map[string]string{
+					"kube-proxy-replacement":  "strict",
+					"bpf-lb-sock-hostns-only": "true",
+				},
+			},
+			wantWarnings: nil,
+		},
+	}
+
+	calicoResource := schema.GroupVersionResource{Group: "projectcalico.org", Version: "v3", Resource: "felixconfigurations"}
+	for _, tt := range tests {
+		t.Run(tt.desc, func(t *testing.T) {
+			m, err := values.MapFromYaml([]byte(tt.ioYamlStr))
+			assert.NoError(t, err)
+
+			client := kube.NewFakeClient()
+			if tt.calicoConfig != nil {
+				client.Dynamic().Resource(calicoResource).Create(context.Background(), tt.calicoConfig, metav1.CreateOptions{})
+			}
+			if tt.ciliumConfig != nil {
+				client.Kube().CoreV1().ConfigMaps("kube-system").Create(context.Background(), tt.ciliumConfig, metav1.CreateOptions{})
+			}
+			warnings, _ := validation.ParseAndValidateIstioOperator(m, client)
+			if gotWarnings, wantWarnings := warnings, tt.wantWarnings; !util.EqualErrors(gotWarnings, wantWarnings) {
+				t.Errorf("CheckValues(%s): gotWarnings:%s, wantWarnings:%s", tt.desc, gotWarnings, wantWarnings)
 			}
 		})
 	}

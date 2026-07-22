@@ -16,9 +16,12 @@ package dependencies
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"io"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"syscall"
@@ -30,6 +33,8 @@ import (
 	"istio.io/istio/pkg/log"
 	"istio.io/istio/tools/istio-iptables/pkg/constants"
 )
+
+var testRuleAdd = []string{"-t", "nat", "-A", "INPUT", "-p", "255", "-j", "RETURN"}
 
 // TODO the entire `istio-iptables` package is linux-specific, I'm not sure we really need
 // platform-differentiators for the `dependencies` package itself.
@@ -49,6 +54,7 @@ var (
 )
 
 func shouldUseBinaryForCurrentContext(iptablesBin string) (IptablesVersion, error) {
+	log := log.WithLabels("binary", iptablesBin)
 	// We assume that whatever `iptablesXXX` binary you pass us also has a `iptablesXXX-save` and `iptablesXXX-restore`
 	// binary - which should always be true for any valid iptables installation
 	// (we use both in our iptables code later on anyway)
@@ -97,6 +103,34 @@ func shouldUseBinaryForCurrentContext(iptablesBin string) (IptablesVersion, erro
 		isNft = false
 	}
 
+	// `filter` should ALWAYS exist if kernel support for this version is locally present,
+	// so try to add a no-op rule to that table, and make sure it doesn't fail - if it does, we can't use this version
+	// as the host is missing kernel support for it.
+	// (255 is a nonexistent protocol number, IANA reserved, see `cat /etc/protocols`, so this rule will never match anything)
+	// should use the wait flag if supported to avoid lock contention whenever possible
+	needLock := !isNft && !parsedVer.LessThan(IptablesRestoreLocking)
+	testArgs := append(make([]string, 0, len(testRuleAdd)+1), testRuleAdd...)
+	if needLock {
+		testArgs = append(testArgs, "--wait=30")
+	}
+	testCmd := exec.Command(iptablesBin, testArgs...)
+
+	var testStdErr bytes.Buffer
+	testCmd.Stderr = &testStdErr
+	testRes := testCmd.Run()
+	// If we can't add a rule to the basic `filter` table, we can't use this binary - bail out.
+	// Otherwise, delete the no-op rule and carry on with other checks
+	if testRes != nil || strings.Contains(testStdErr.String(), "does not exist") {
+		return IptablesVersion{}, fmt.Errorf("iptables binary %s has no loaded kernel support and cannot be used, err: %v out: %s",
+			iptablesBin, testRes, testStdErr.String())
+	}
+
+	testRuleDel := append(make([]string, 0, len(testArgs)), testArgs...)
+	testRuleDel[2] = "-D"
+
+	testCmd = exec.Command(iptablesBin, testRuleDel...)
+	_ = testCmd.Run()
+
 	// if binary seems to exist, check the dump of rules in our netns, and see if any rules exist there
 	// Note that this is highly dependent on context.
 	// new pod netns? probably no rules. Hostnetns? probably rules
@@ -138,8 +172,16 @@ func runInSandbox(lockFile string, f func() error) error {
 		}
 		// Remount / as a private mount so that our mounts do not impact outside the namespace
 		// (see https://unix.stackexchange.com/questions/246312/why-is-my-bind-mount-visible-outside-its-mount-namespace).
+		// MS_PRIVATE is preferred because it completely stops mount event propagation in both directions.
+		// However, on some systems (for example Bottlerocket on EKS), seccomp or LSM policies may block
+		// mount() calls that use MS_PRIVATE, even when running inside a new mount namespace. If that
+		// happens, we fall back to MS_SLAVE. For our use case this still achieves the main goal as it
+		// prevents our bind mounts from propagating back to the parent namespace, while being less likely
+		// to be blocked by stricter security policies.
 		if err := unix.Mount("", "/", "", unix.MS_PRIVATE|unix.MS_REC, ""); err != nil {
-			return fmt.Errorf("failed to remount /: %v", err)
+			if slaveErr := unix.Mount("", "/", "", unix.MS_SLAVE|unix.MS_REC, ""); slaveErr != nil {
+				return fmt.Errorf("failed to remount /: (MS_PRIVATE returned: %v; MS_SLAVE returned: %v)", err, slaveErr)
+			}
 		}
 		// In CNI, we are running the pod network namespace, but the host filesystem. Locking the host is both useless and harmful,
 		// as it opens the risk of lock contention with other node actors (such as kube-proxy), and isn't actually needed at all.
@@ -203,8 +245,46 @@ func mount(src, dst string) error {
 	return syscall.Mount(src, dst, "", syscall.MS_BIND|syscall.MS_RDONLY, "")
 }
 
-func (r *RealDependencies) executeXTablesWithOutput(cmd constants.IptablesCmd, iptVer *IptablesVersion,
-	ignoreErrors bool, stdin io.ReadSeeker, args ...string,
+// build fd /proc path to use for nsenter
+func buildProcFdPath(fd int) string {
+	return fmt.Sprintf("/proc/%d/fd/%d", os.Getpid(), fd)
+}
+
+// retrieves the internal namespace id of the kernel for the given fd namespace path
+func getNsID(nsPath string) (int, error) {
+	fd, err := unix.Open(nsPath, unix.O_RDONLY, 0)
+	if err != nil {
+		return 0, err
+	}
+	defer unix.Close(fd)
+
+	var stat unix.Stat_t
+	err = unix.Fstat(fd, &stat)
+	if err != nil {
+		return 0, err
+	}
+
+	return int(stat.Ino), nil
+}
+
+// retrieves on success the parent user ns fd and return the fd
+func getParentUserNsByNsPath(nsPath string) (int, error) {
+	fd, err := unix.Open(nsPath, unix.O_RDONLY, 0)
+	if err != nil {
+		return 0, err
+	}
+	defer unix.Close(fd)
+
+	nsFd, err := unix.IoctlRetInt(fd, unix.NS_GET_USERNS)
+	if err != nil {
+		return 0, err
+	}
+
+	return nsFd, nil
+}
+
+func (r *RealDependencies) executeXTables(log *log.Scope, cmd constants.IptablesCmd, iptVer *IptablesVersion,
+	silenceErrors bool, stdin io.ReadSeeker, args ...string,
 ) (*bytes.Buffer, error) {
 	mode := "without lock"
 	stdout := &bytes.Buffer{}
@@ -219,7 +299,48 @@ func (r *RealDependencies) executeXTablesWithOutput(cmd constants.IptablesCmd, i
 	run := func(c *exec.Cmd) error {
 		return c.Run()
 	}
-	if r.HostFilesystemPodNetwork {
+	if needLock {
+		// For _any_ mode where we need a lock (sandboxed or not)
+		// use the wait flag. In sandbox mode we use the container's netns itself
+		// as the lockfile, if one is needed, to avoid lock contention 99% of the time.
+		// But a container netns is just a file, and like any Linux file,
+		// we can't guarantee no other process has it locked.
+		args = append(args, "--wait=30")
+	}
+
+	// Check if we need to switch into the User Namespace for hostUsers: false
+	executable, errName := os.Executable()
+	// check only in istio-cni mode for backwards compatibility
+	if errName == nil && filepath.Base(executable) == "istio-cni" {
+		parentNs, errParent := getParentUserNsByNsPath(r.NetworkNamespace)
+		defer unix.Close(parentNs)
+		grandParentNs, errGrandParent := getParentUserNsByNsPath(buildProcFdPath(parentNs))
+		defer unix.Close(grandParentNs)
+
+		if errParent == nil && errGrandParent == nil {
+			// retrieve nsID for comparison, if grandParentNsID is 0 (access denied)
+			// it means it's already kernel base user namepace or we don't have the permissions
+			// in that case ignore it
+			netNsID, errNsID := getNsID(r.NetworkNamespace)
+			parentNsID, errParentNsID := getNsID(buildProcFdPath(parentNs))
+			grandParentNsID, errGrandParentNsID := getNsID(buildProcFdPath(grandParentNs))
+			// we successfully retrieved parentNs and grandParentNs if they do not match the net ns is inside a linux user ns
+			if errNsID == nil && errParentNsID == nil && errGrandParentNsID == nil && parentNsID != grandParentNsID {
+				log.Debugf("k8s user namespaces relationship detected linux base %d -> %d -> %d", grandParentNsID, parentNsID, netNsID)
+				log.Debugf("using nsenter with --user=%s --net=%s %s", buildProcFdPath(parentNs), r.NetworkNamespace, cmdBin)
+				// check if nsenter is available otherwise inform user about that fact and k8s user namespace detection
+				_, errNsBinaryPath := exec.LookPath("nsenter")
+				if errNsBinaryPath != nil {
+					log.Errorf("k8s user namespace / hostUsers: false pod network namespace %s detected, but no nsenter binary found", r.NetworkNamespace)
+				} else {
+					args = append([]string{fmt.Sprintf("--user=%s", buildProcFdPath(parentNs)), fmt.Sprintf("--net=%s", r.NetworkNamespace), cmdBin}, args...)
+					cmdBin = "nsenter"
+				}
+			}
+		}
+	}
+
+	if r.UsePodScopedXtablesLock {
 		c = exec.Command(cmdBin, args...)
 		// In CNI, we are running the pod network namespace, but the host filesystem, so we need to do some tricks
 		// Call our binary again, but with <original binary> "unshare (subcommand to trigger mounts)" --lock-file=<network namespace> <original command...>
@@ -227,14 +348,14 @@ func (r *RealDependencies) executeXTablesWithOutput(cmd constants.IptablesCmd, i
 		var lockFile string
 		if needLock {
 			if iptVer.Version.LessThan(IptablesLockfileEnv) {
-				mode = "without lock by mount and nss"
+				mode = "sandboxed local lock by mount and nss"
 				lockFile = r.NetworkNamespace
 			} else {
-				mode = "without lock by env and nss"
+				mode = "sandboxed local lock by env and nss"
 				c.Env = append(c.Env, "XTABLES_LOCKFILE="+r.NetworkNamespace)
 			}
 		} else {
-			mode = "without nss"
+			mode = "sandboxed without lock"
 		}
 
 		run = func(c *exec.Cmd) error {
@@ -244,42 +365,40 @@ func (r *RealDependencies) executeXTablesWithOutput(cmd constants.IptablesCmd, i
 		}
 	} else {
 		if needLock {
-			// We want the lock. Wait up to 30s for it.
-			args = append(args, "--wait=30")
 			c = exec.Command(cmdBin, args...)
 			log.Debugf("running with lock")
-			mode = "with wait lock"
+			mode = "with global lock"
 		} else {
 			// No locking supported/needed, just run as is. Nothing special
 			c = exec.Command(cmdBin, args...)
 		}
 	}
-	log.Infof("Running command (%s): %s %s", mode, cmdBin, strings.Join(args, " "))
+	log.Debugf("Running command (%s): %s %s", mode, cmdBin, strings.Join(args, " "))
 
 	c.Stdout = stdout
 	c.Stderr = stderr
 	c.Stdin = stdin
 	err := run(c)
 	if len(stdout.String()) != 0 {
-		log.Infof("Command output: \n%v", stdout.String())
+		log.Debugf("Command output: \n%v", stdout.String())
 	}
 
-	// TODO Check naming and redirection logic
-	if (err != nil || len(stderr.String()) != 0) && !ignoreErrors {
-		stderrStr := stderr.String()
+	stderrStr := stderr.String()
 
-		// Transform to xtables-specific error messages with more useful and actionable hints.
-		if err != nil {
-			stderrStr = transformToXTablesErrorMessage(stderrStr, err)
+	if err != nil {
+		// Transform to xtables-specific error messages
+		transformedErr := transformToXTablesErrorMessage(stderrStr, err)
+
+		if !silenceErrors {
+			log.Errorf("Command error: %v", transformedErr)
+		} else {
+			// Log ignored errors for debugging purposes
+			log.Debugf("Ignoring iptables command error: %v", transformedErr)
 		}
-
-		log.Errorf("Command error output: %v", stderrStr)
+		err = errors.Join(err, errors.New(stderrStr))
+	} else if len(stderrStr) > 0 {
+		log.Debugf("Command stderr output: %s", stderrStr)
 	}
 
 	return stdout, err
-}
-
-func (r *RealDependencies) executeXTables(cmd constants.IptablesCmd, iptVer *IptablesVersion, ignoreErrors bool, stdin io.ReadSeeker, args ...string) error {
-	_, err := r.executeXTablesWithOutput(cmd, iptVer, ignoreErrors, stdin, args...)
-	return err
 }

@@ -16,14 +16,19 @@ package filters
 
 import (
 	cluster "github.com/envoyproxy/go-control-plane/envoy/config/cluster/v3"
+	mutation_rulesv3 "github.com/envoyproxy/go-control-plane/envoy/config/common/mutation_rules/v3"
 	core "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
 	listener "github.com/envoyproxy/go-control-plane/envoy/config/listener/v3"
 	route "github.com/envoyproxy/go-control-plane/envoy/config/route/v3"
+	dfpcommon "github.com/envoyproxy/go-control-plane/envoy/extensions/common/dynamic_forward_proxy/v3"
 	sfsvalue "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/common/set_filter_state/v3"
 	cors "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/cors/v3"
+	dfp "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/dynamic_forward_proxy/v3"
+	extproc "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/ext_proc/v3"
 	fault "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/fault/v3"
 	grpcstats "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/grpc_stats/v3"
 	grpcweb "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/grpc_web/v3"
+	header_mutationv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/header_mutation/v3"
 	router "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/router/v3"
 	sfs "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/set_filter_state/v3"
 	statefulsession "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/stateful_session/v3"
@@ -37,11 +42,14 @@ import (
 	previoushost "github.com/envoyproxy/go-control-plane/envoy/extensions/retry/host/previous_hosts/v3"
 	resourcedetectors "github.com/envoyproxy/go-control-plane/envoy/extensions/tracers/opentelemetry/resource_detectors/v3"
 	rawbuffer "github.com/envoyproxy/go-control-plane/envoy/extensions/transport_sockets/raw_buffer/v3"
+	"google.golang.org/protobuf/types/known/durationpb"
 	"google.golang.org/protobuf/types/known/wrapperspb"
 
 	alpn "istio.io/api/envoy/config/filter/http/alpn/v2alpha1"
+	"istio.io/istio/pilot/pkg/features"
 	"istio.io/istio/pilot/pkg/networking/util"
 	"istio.io/istio/pilot/pkg/util/protoconv"
+	"istio.io/istio/pkg/config/constants"
 	"istio.io/istio/pkg/wellknown"
 )
 
@@ -51,7 +59,7 @@ const (
 
 	// Alpn HTTP filter name which will override the ALPN for upstream TLS connection.
 	AlpnFilterName = "istio.alpn"
-
+	// MxFilterName TCP MX is an Istio filter defined in https://github.com/istio/proxy/tree/master/source/extensions/filters/network/metadata_exchange.
 	MxFilterName = "istio.metadata_exchange"
 
 	// EnvoyJwtFilterName is the name of the Envoy JWT filter.
@@ -59,6 +67,24 @@ const (
 
 	// EnvoyJwtFilterPayload is the struct field for the payload in dynamic metadata in Envoy JWT filter.
 	EnvoyJwtFilterPayload = "payload"
+
+	PeerMetadataTypeURL              = "type.googleapis.com/io.istio.http.peer_metadata.Config"
+	MetadataExchangeTypeURL          = "type.googleapis.com/envoy.tcp.metadataexchange.config.MetadataExchange"
+	HBONEListenerPeerMetadataTypeURL = "type.googleapis.com/envoy.extensions.network_filters.peer_metadata.Config"
+	HBONEClusterPeerMetadataTypeURL  = "type.googleapis.com/envoy.extensions.network_filters.peer_metadata.UpstreamConfig"
+	// OriginalDstFilterStateKey is a filter state key where we store the :authority. This has traditionally been an
+	// IP address, but it can also be a hostname if the incoming CONNECT tunnel was sent via double-HBONE.
+	// It will fail if the value is not a valid IP address.
+	OriginalDstFilterStateKey = "envoy.filters.listener.original_dst.local_ip"
+
+	// Authority Key is another filter state key where we store :authority. Because this is not a
+	// well-known filter state key, we can store non-IP address :authorities in here
+	AuthorityFilterStateKey = "io.istio.connect_authority"
+
+	// RequestSourceFilterStateKey is a filter state key where we store the value of x-istio-source header
+	// for incoming HBONE connections. This header when set to waypoint indicates that request has been processed
+	// by a waypoint already and therfore L7 policies have been applied already and we should skip them.
+	RequestSourceFilterStateKey = "io.istio.source"
 )
 
 // Define static filters to be reused across the codebase. This avoids duplicate marshaling/unmarshaling
@@ -145,6 +171,35 @@ var (
 			TypedConfig: protoconv.MessageToAny(&statefulsession.StatefulSession{}),
 		},
 	}
+	InferencePoolExtProc = &hcm.HttpFilter{
+		Name: wellknown.HTTPExternalProcessing,
+		ConfigType: &hcm.HttpFilter_TypedConfig{
+			TypedConfig: protoconv.MessageToAny(&extproc.ExternalProcessor{
+				GrpcService: &core.GrpcService{
+					TargetSpecifier: &core.GrpcService_EnvoyGrpc_{
+						EnvoyGrpc: &core.GrpcService_EnvoyGrpc{
+							ClusterName: "dummy",
+						},
+					},
+					Timeout: &durationpb.Duration{Seconds: 10},
+				},
+				FailureModeAllow: true,
+				ProcessingMode: &extproc.ProcessingMode{
+					RequestHeaderMode:  extproc.ProcessingMode_SKIP,
+					ResponseHeaderMode: extproc.ProcessingMode_SKIP,
+				},
+				MessageTimeout: &durationpb.Duration{Seconds: 1000},
+				MetadataOptions: &extproc.MetadataOptions{
+					ReceivingNamespaces: &extproc.MetadataOptions_MetadataNamespaces{
+						Untyped: []string{constants.EnvoySubsetNamespace},
+					},
+					ForwardingNamespaces: &extproc.MetadataOptions_MetadataNamespaces{
+						Untyped: []string{constants.EnvoySubsetNamespace},
+					},
+				},
+			}),
+		},
+	}
 	Alpn = &hcm.HttpFilter{
 		Name: AlpnFilterName,
 		ConfigType: &hcm.HttpFilter_TypedConfig{
@@ -167,119 +222,37 @@ var (
 		},
 	}
 
-	// TCP MX is an Istio filter defined in https://github.com/istio/proxy/tree/master/source/extensions/filters/network/metadata_exchange.
-	tcpMx = protoconv.TypedStructWithFields("type.googleapis.com/envoy.tcp.metadataexchange.config.MetadataExchange",
-		map[string]any{
-			"protocol":         "istio-peer-exchange",
-			"enable_discovery": true,
-		})
-
-	TCPListenerMx = &listener.Filter{
-		Name:       MxFilterName,
-		ConfigType: &listener.Filter_TypedConfig{TypedConfig: tcpMx},
-	}
-
-	TCPClusterMx = &cluster.Filter{
-		Name:        MxFilterName,
-		TypedConfig: tcpMx,
-	}
-
-	WaypointDownstreamMetadataFilter = &hcm.HttpFilter{
-		Name: "waypoint_downstream_peer_metadata",
+	// This filter is used to capture value of istio-l7-policies-applied header from the HBONE connect request in the filter state.
+	// This header in multi-network ambient mode indicates whether L7 policies have been applied already to the
+	// request. For example, if the request went from ztunnel to waypoint and then to E/W gateway, then waypoint would have already
+	// applied L7 policies to the request, so E/W gateway should not send the request to waypoint to avoid applying the L7 policies
+	// again. On the other hand, if ztunnel directly sent the request to the E/W gateway, then the request still needs L7 policies
+	// to be applied and so has to be routed to the waypoint if the service has one.
+	RequestSourceFilter = &hcm.HttpFilter{
+		Name: "request_source",
 		ConfigType: &hcm.HttpFilter_TypedConfig{
-			TypedConfig: protoconv.TypedStructWithFields("type.googleapis.com/io.istio.http.peer_metadata.Config",
-				map[string]any{
-					"downstream_discovery": []any{
-						map[string]any{
-							"workload_discovery": map[string]any{},
+			TypedConfig: protoconv.MessageToAny(&sfs.Config{
+				OnRequestHeaders: []*sfsvalue.FilterStateValue{
+					{
+						Key: &sfsvalue.FilterStateValue_ObjectKey{
+							ObjectKey: RequestSourceFilterStateKey,
 						},
-					},
-					"shared_with_upstream": true,
-				}),
-		},
-	}
-
-	WaypointUpstreamMetadataFilter = &hcm.HttpFilter{
-		Name: "waypoint_upstream_peer_metadata",
-		ConfigType: &hcm.HttpFilter_TypedConfig{
-			TypedConfig: protoconv.TypedStructWithFields("type.googleapis.com/io.istio.http.peer_metadata.Config",
-				map[string]any{
-					"upstream_discovery": []any{
-						map[string]any{
-							"workload_discovery": map[string]any{},
-						},
-					},
-				}),
-		},
-	}
-
-	SidecarInboundMetadataFilter = &hcm.HttpFilter{
-		Name: MxFilterName,
-		ConfigType: &hcm.HttpFilter_TypedConfig{
-			TypedConfig: protoconv.TypedStructWithFields("type.googleapis.com/io.istio.http.peer_metadata.Config",
-				map[string]any{
-					"downstream_discovery": []any{
-						map[string]any{
-							"istio_headers": map[string]any{},
-						},
-						map[string]any{
-							"workload_discovery": map[string]any{},
-						},
-					},
-					"downstream_propagation": []any{
-						map[string]any{
-							"istio_headers": map[string]any{},
-						},
-					},
-				}),
-		},
-	}
-
-	SidecarOutboundMetadataFilter = &hcm.HttpFilter{
-		Name: MxFilterName,
-		ConfigType: &hcm.HttpFilter_TypedConfig{
-			TypedConfig: protoconv.TypedStructWithFields("type.googleapis.com/io.istio.http.peer_metadata.Config",
-				map[string]any{
-					"upstream_discovery": []any{
-						map[string]any{
-							"istio_headers": map[string]any{},
-						},
-						map[string]any{
-							"workload_discovery": map[string]any{},
-						},
-					},
-					"upstream_propagation": []any{
-						map[string]any{
-							"istio_headers": map[string]any{},
-						},
-					},
-				}),
-		},
-	}
-	// TODO https://github.com/istio/istio/issues/46740
-	// false values can be omitted in protobuf, results in diff JSON values between control plane and envoy config dumps
-	// long term fix will be to add the metadata config to istio/api and use that over TypedStruct
-	SidecarOutboundMetadataFilterSkipHeaders = &hcm.HttpFilter{
-		Name: MxFilterName,
-		ConfigType: &hcm.HttpFilter_TypedConfig{
-			TypedConfig: protoconv.TypedStructWithFields("type.googleapis.com/io.istio.http.peer_metadata.Config",
-				map[string]any{
-					"upstream_discovery": []any{
-						map[string]any{
-							"istio_headers": map[string]any{},
-						},
-						map[string]any{
-							"workload_discovery": map[string]any{},
-						},
-					},
-					"upstream_propagation": []any{
-						map[string]any{
-							"istio_headers": map[string]any{
-								"skip_external_clusters": true,
+						Value: &sfsvalue.FilterStateValue_FormatString{
+							FormatString: &core.SubstitutionFormatString{
+								Format: &core.SubstitutionFormatString_TextFormatSource{
+									TextFormatSource: &core.DataSource{
+										Specifier: &core.DataSource_InlineString{
+											InlineString: "%REQ(x-istio-source)%",
+										},
+									},
+								},
 							},
 						},
+						FactoryKey:         "istio.hashable_string",
+						SharedWithUpstream: sfsvalue.FilterStateValue_ONCE,
 					},
-				}),
+				},
+			}),
 		},
 	}
 
@@ -290,7 +263,7 @@ var (
 				OnRequestHeaders: []*sfsvalue.FilterStateValue{
 					{
 						Key: &sfsvalue.FilterStateValue_ObjectKey{
-							ObjectKey: "envoy.filters.listener.original_dst.local_ip",
+							ObjectKey: OriginalDstFilterStateKey,
 						},
 						Value: &sfsvalue.FilterStateValue_FormatString{
 							FormatString: &core.SubstitutionFormatString{
@@ -303,6 +276,145 @@ var (
 								},
 							},
 						},
+						SharedWithUpstream: sfsvalue.FilterStateValue_ONCE,
+					}, {
+						Key: &sfsvalue.FilterStateValue_ObjectKey{
+							ObjectKey: AuthorityFilterStateKey,
+						},
+						Value: &sfsvalue.FilterStateValue_FormatString{
+							FormatString: &core.SubstitutionFormatString{
+								Format: &core.SubstitutionFormatString_TextFormatSource{
+									TextFormatSource: &core.DataSource{
+										Specifier: &core.DataSource_InlineString{
+											InlineString: "%REQ(:AUTHORITY)%",
+										},
+									},
+								},
+							},
+						},
+						FactoryKey:         "istio.hashable_string",
+						SharedWithUpstream: sfsvalue.FilterStateValue_ONCE,
+					}, {
+						Key: &sfsvalue.FilterStateValue_ObjectKey{
+							ObjectKey: "envoy.filters.listener.original_dst.remote_ip",
+						},
+						Value: &sfsvalue.FilterStateValue_FormatString{
+							FormatString: &core.SubstitutionFormatString{
+								Format: &core.SubstitutionFormatString_TextFormatSource{
+									TextFormatSource: &core.DataSource{
+										Specifier: &core.DataSource_InlineString{
+											InlineString: "%DOWNSTREAM_REMOTE_ADDRESS%",
+										},
+									},
+								},
+							},
+						},
+						SharedWithUpstream: sfsvalue.FilterStateValue_ONCE,
+					}, {
+						Key: &sfsvalue.FilterStateValue_ObjectKey{
+							ObjectKey: "io.istio.peer_principal",
+						},
+						FactoryKey: "istio.hashable_string",
+						Value: &sfsvalue.FilterStateValue_FormatString{
+							FormatString: &core.SubstitutionFormatString{
+								Format: &core.SubstitutionFormatString_TextFormatSource{
+									TextFormatSource: &core.DataSource{
+										Specifier: &core.DataSource_InlineString{
+											InlineString: "%DOWNSTREAM_PEER_URI_SAN%",
+										},
+									},
+								},
+							},
+						},
+						SharedWithUpstream: sfsvalue.FilterStateValue_ONCE,
+					}, {
+						Key: &sfsvalue.FilterStateValue_ObjectKey{
+							ObjectKey: "io.istio.local_principal",
+						},
+						FactoryKey: "istio.hashable_string",
+						Value: &sfsvalue.FilterStateValue_FormatString{
+							FormatString: &core.SubstitutionFormatString{
+								Format: &core.SubstitutionFormatString_TextFormatSource{
+									TextFormatSource: &core.DataSource{
+										Specifier: &core.DataSource_InlineString{
+											InlineString: "%DOWNSTREAM_LOCAL_URI_SAN%",
+										},
+									},
+								},
+							},
+						},
+						SharedWithUpstream: sfsvalue.FilterStateValue_ONCE,
+					},
+				},
+			}),
+		},
+	}
+
+	RequestSourceFilterPre1_29_2 = &hcm.HttpFilter{
+		Name: "request_source",
+		ConfigType: &hcm.HttpFilter_TypedConfig{
+			TypedConfig: protoconv.MessageToAny(&sfs.Config{
+				OnRequestHeaders: []*sfsvalue.FilterStateValue{
+					{
+						Key: &sfsvalue.FilterStateValue_ObjectKey{
+							ObjectKey: RequestSourceFilterStateKey,
+						},
+						Value: &sfsvalue.FilterStateValue_FormatString{
+							FormatString: &core.SubstitutionFormatString{
+								Format: &core.SubstitutionFormatString_TextFormatSource{
+									TextFormatSource: &core.DataSource{
+										Specifier: &core.DataSource_InlineString{
+											InlineString: "%REQ(x-istio-source)%",
+										},
+									},
+								},
+							},
+						},
+						FactoryKey:         "envoy.string",
+						SharedWithUpstream: sfsvalue.FilterStateValue_ONCE,
+					},
+				},
+			}),
+		},
+	}
+
+	ConnectAuthorityFilterPre1_29_2 = &hcm.HttpFilter{
+		Name: "connect_authority",
+		ConfigType: &hcm.HttpFilter_TypedConfig{
+			TypedConfig: protoconv.MessageToAny(&sfs.Config{
+				OnRequestHeaders: []*sfsvalue.FilterStateValue{
+					{
+						Key: &sfsvalue.FilterStateValue_ObjectKey{
+							ObjectKey: OriginalDstFilterStateKey,
+						},
+						Value: &sfsvalue.FilterStateValue_FormatString{
+							FormatString: &core.SubstitutionFormatString{
+								Format: &core.SubstitutionFormatString_TextFormatSource{
+									TextFormatSource: &core.DataSource{
+										Specifier: &core.DataSource_InlineString{
+											InlineString: "%REQ(:AUTHORITY)%",
+										},
+									},
+								},
+							},
+						},
+						SharedWithUpstream: sfsvalue.FilterStateValue_ONCE,
+					}, {
+						Key: &sfsvalue.FilterStateValue_ObjectKey{
+							ObjectKey: AuthorityFilterStateKey,
+						},
+						Value: &sfsvalue.FilterStateValue_FormatString{
+							FormatString: &core.SubstitutionFormatString{
+								Format: &core.SubstitutionFormatString_TextFormatSource{
+									TextFormatSource: &core.DataSource{
+										Specifier: &core.DataSource_InlineString{
+											InlineString: "%REQ(:AUTHORITY)%",
+										},
+									},
+								},
+							},
+						},
+						FactoryKey:         "envoy.string",
 						SharedWithUpstream: sfsvalue.FilterStateValue_ONCE,
 					}, {
 						Key: &sfsvalue.FilterStateValue_ObjectKey{
@@ -359,14 +471,13 @@ var (
 			}),
 		},
 	}
-
 	ConnectAuthorityNetworkFilter = &listener.Filter{
 		Name: "connect_authority",
 		ConfigType: &listener.Filter_TypedConfig{
 			TypedConfig: protoconv.MessageToAny(&sfsnetwork.Config{
 				OnNewConnection: []*sfsvalue.FilterStateValue{{
 					Key: &sfsvalue.FilterStateValue_ObjectKey{
-						ObjectKey: "envoy.filters.listener.original_dst.local_ip",
+						ObjectKey: OriginalDstFilterStateKey,
 					},
 					Value: &sfsvalue.FilterStateValue_FormatString{
 						FormatString: &core.SubstitutionFormatString{
@@ -381,6 +492,33 @@ var (
 					},
 					SharedWithUpstream: sfsvalue.FilterStateValue_ONCE,
 				}},
+			}),
+		},
+	}
+
+	// WaypointXFCCClientIdentityFilter synthesizes an x-forwarded-client-cert header
+	// on the waypoint main_internal HCM, populated from the ztunnel-provided source
+	// workload identity kept in filter state. mTLS is terminated on the outer
+	// CONNECT listener, so Envoy's native XFCC handling on main_internal has no peer
+	// cert and cannot populate the header. Any existing XFCC on the request is
+	// replaced to avoid forwarding values the waypoint has not verified.
+	WaypointXFCCClientIdentityFilter = &hcm.HttpFilter{
+		Name: "istio.waypoint.xfcc_client_identity",
+		ConfigType: &hcm.HttpFilter_TypedConfig{
+			TypedConfig: protoconv.MessageToAny(&header_mutationv3.HeaderMutation{
+				Mutations: &header_mutationv3.Mutations{
+					RequestMutations: []*mutation_rulesv3.HeaderMutation{{
+						Action: &mutation_rulesv3.HeaderMutation_Append{
+							Append: &core.HeaderValueOption{
+								Header: &core.HeaderValue{
+									Key:   "x-forwarded-client-cert",
+									Value: `By=%FILTER_STATE(io.istio.local_principal:PLAIN)%;URI=%FILTER_STATE(io.istio.peer_principal:PLAIN)%`,
+								},
+								AppendAction: core.HeaderValueOption_OVERWRITE_IF_EXISTS_OR_ADD,
+							},
+						},
+					}},
+				},
 			}),
 		},
 	}
@@ -436,3 +574,253 @@ var (
 		TypedConfig: protoconv.MessageToAny(&resourcedetectors.DynatraceResourceDetectorConfig{}),
 	}
 )
+
+var (
+	TCPClusterMx = func() *cluster.Filter {
+		cfg := map[string]any{
+			"protocol":         "istio-peer-exchange",
+			"enable_discovery": true,
+		}
+		additionalLabels(cfg)
+
+		return &cluster.Filter{
+			Name:        MxFilterName,
+			TypedConfig: protoconv.TypedStructWithFields(MetadataExchangeTypeURL, cfg),
+		}
+	}()
+
+	TCPListenerMx = func() *listener.Filter {
+		cfg := map[string]any{
+			"protocol":         "istio-peer-exchange",
+			"enable_discovery": true,
+		}
+		additionalLabels(cfg)
+
+		return &listener.Filter{
+			Name: MxFilterName,
+			ConfigType: &listener.Filter_TypedConfig{
+				TypedConfig: protoconv.TypedStructWithFields(MetadataExchangeTypeURL, cfg),
+			},
+		}
+	}()
+
+	WaypointClusterBaggagePeerMetadata = &cluster.Filter{
+		Name:        "upstream_hbone_peer_metadata",
+		TypedConfig: protoconv.TypedStructWithFields(HBONEClusterPeerMetadataTypeURL, map[string]any{}),
+	}
+
+	WaypointListenerBaggagePeerMetadata = &listener.Filter{
+		Name: "upstream_hbone_peer_metadata",
+		ConfigType: &listener.Filter_TypedConfig{
+			TypedConfig: protoconv.TypedStructWithFields(HBONEListenerPeerMetadataTypeURL, map[string]any{
+				"baggage_key": "io.istio.baggage",
+			}),
+		},
+	}
+
+	SidecarInboundMetadataFilter = func() *hcm.HttpFilter {
+		cfg := map[string]any{
+			"downstream_discovery": []any{
+				map[string]any{
+					"istio_headers": map[string]any{},
+				},
+				map[string]any{
+					"workload_discovery": map[string]any{},
+				},
+			},
+			"downstream_propagation": []any{
+				map[string]any{
+					"istio_headers": map[string]any{},
+				},
+			},
+		}
+		additionalLabels(cfg)
+
+		return &hcm.HttpFilter{
+			Name: MxFilterName,
+			ConfigType: &hcm.HttpFilter_TypedConfig{
+				TypedConfig: protoconv.TypedStructWithFields(PeerMetadataTypeURL, cfg),
+			},
+		}
+	}()
+
+	SidecarOutboundMetadataFilter = func() *hcm.HttpFilter {
+		cfg := map[string]any{
+			"upstream_discovery": []any{
+				map[string]any{
+					"istio_headers": map[string]any{},
+				},
+				map[string]any{
+					"workload_discovery": map[string]any{},
+				},
+			},
+			"upstream_propagation": []any{
+				map[string]any{
+					"istio_headers": map[string]any{},
+				},
+			},
+		}
+		additionalLabels(cfg)
+
+		return &hcm.HttpFilter{
+			Name: MxFilterName,
+			ConfigType: &hcm.HttpFilter_TypedConfig{
+				TypedConfig: protoconv.TypedStructWithFields(PeerMetadataTypeURL, cfg),
+			},
+		}
+	}()
+
+	SidecarOutboundMetadataFilterSkipHeaders = func() *hcm.HttpFilter {
+		// TODO https://github.com/istio/istio/issues/46740
+		// false values can be omitted in protobuf, results in diff JSON values between control plane and envoy config dumps
+		// long term fix will be to add the metadata config to istio/api and use that over TypedStruct
+		cfg := map[string]any{
+			"upstream_discovery": []any{
+				map[string]any{
+					"istio_headers": map[string]any{},
+				},
+				map[string]any{
+					"workload_discovery": map[string]any{},
+				},
+			},
+			"upstream_propagation": []any{
+				map[string]any{
+					"istio_headers": map[string]any{
+						"skip_external_clusters": true,
+					},
+				},
+			},
+		}
+		additionalLabels(cfg)
+
+		return &hcm.HttpFilter{
+			Name: MxFilterName,
+			ConfigType: &hcm.HttpFilter_TypedConfig{
+				TypedConfig: protoconv.TypedStructWithFields(PeerMetadataTypeURL, cfg),
+			},
+		}
+	}()
+
+	WaypointDownstreamMetadataFilter = &hcm.HttpFilter{
+		Name: "waypoint_downstream_peer_metadata",
+		ConfigType: &hcm.HttpFilter_TypedConfig{
+			TypedConfig: protoconv.TypedStructWithFields(PeerMetadataTypeURL,
+				map[string]any{
+					"downstream_discovery": []any{
+						map[string]any{
+							"workload_discovery": map[string]any{},
+						},
+					},
+					"shared_with_upstream": true,
+				}),
+		},
+	}
+
+	WaypointUpstreamMetadataFilter = &hcm.HttpFilter{
+		Name: "waypoint_upstream_peer_metadata",
+		ConfigType: &hcm.HttpFilter_TypedConfig{
+			TypedConfig: protoconv.TypedStructWithFields(PeerMetadataTypeURL,
+				map[string]any{
+					"upstream_discovery": []any{
+						map[string]any{
+							"workload_discovery": map[string]any{},
+						},
+					},
+				}),
+		},
+	}
+
+	WaypointDownstreamMetadataFilterForAmbientBaggage = &hcm.HttpFilter{
+		Name: "waypoint_downstream_peer_metadata",
+		ConfigType: &hcm.HttpFilter_TypedConfig{
+			TypedConfig: protoconv.TypedStructWithFields(PeerMetadataTypeURL,
+				map[string]any{
+					"downstream_discovery": []any{
+						map[string]any{
+							"workload_discovery": map[string]any{},
+						},
+						map[string]any{
+							"baggage": map[string]any{},
+						},
+					},
+					"downstream_propagation": []any{
+						map[string]any{
+							"baggage": map[string]any{},
+						},
+					},
+					"shared_with_upstream": true,
+				}),
+		},
+	}
+
+	WaypointUpstreamMetadataFilterForAmbientBaggage = &hcm.HttpFilter{
+		Name: "waypoint_upstream_peer_metadata",
+		ConfigType: &hcm.HttpFilter_TypedConfig{
+			TypedConfig: protoconv.TypedStructWithFields(PeerMetadataTypeURL,
+				map[string]any{
+					"upstream_discovery": []any{
+						map[string]any{
+							"workload_discovery": map[string]any{},
+						},
+						map[string]any{
+							"upstream_filter_state": map[string]any{
+								"peer_metadata_key": "upstream_peer",
+							},
+						},
+					},
+				}),
+		},
+	}
+)
+
+// GenerateWaypointDownstreamMetadataFilter returns the waypoint downstream peer metadata filter.
+func GenerateWaypointDownstreamMetadataFilter() *hcm.HttpFilter {
+	if features.EnableAmbientBaggage {
+		return WaypointDownstreamMetadataFilterForAmbientBaggage
+	}
+	return WaypointDownstreamMetadataFilter
+}
+
+func GenerateWaypointUpstreamMetadataFilter() *hcm.HttpFilter {
+	if features.EnableAmbientBaggage {
+		return WaypointUpstreamMetadataFilterForAmbientBaggage
+	}
+	return WaypointUpstreamMetadataFilter
+}
+
+func additionalLabels(cfg map[string]any) {
+	if additionalLabels := features.MetadataExchangeAdditionalLabels; len(additionalLabels) != 0 {
+		cfg["additional_labels"] = additionalLabels
+	}
+}
+
+// BuildWaypointInboundDFPFilter builds a dynamic forward proxy filter for waypoint inbound listeners
+// using the specified DNS cache config name and lookup family. The name and lookup family must match
+// those used in the corresponding dynamic forward proxy cluster, since Envoy dedupes DNS caches by name.
+func BuildWaypointInboundDFPFilter(dnsCacheConfigName string, lookupFamily cluster.Cluster_DnsLookupFamily) *hcm.HttpFilter {
+	return buildDynamicForwardProxyFilter(dnsCacheConfigName, lookupFamily)
+}
+
+// BuildSidecarOutboundDynamicForwardProxyFilter builds a dynamic forward proxy filter for sidecar outbound listeners
+// using the specified DNS cache config name and lookup family. The name and lookup family must match those used in
+// the corresponding dynamic forward proxy cluster, since Envoy dedupes DNS caches by name.
+func BuildSidecarOutboundDynamicForwardProxyFilter(dnsCacheConfigName string, lookupFamily cluster.Cluster_DnsLookupFamily) *hcm.HttpFilter {
+	return buildDynamicForwardProxyFilter(dnsCacheConfigName, lookupFamily)
+}
+
+// buildDynamicForwardProxyFilter builds a DFP HTTP filter using the specified DNS cache config name and lookup family.
+func buildDynamicForwardProxyFilter(dnsCacheConfigName string, lookupFamily cluster.Cluster_DnsLookupFamily) *hcm.HttpFilter {
+	return &hcm.HttpFilter{
+		Name: "envoy.filters.http.dynamic_forward_proxy",
+		ConfigType: &hcm.HttpFilter_TypedConfig{
+			TypedConfig: protoconv.MessageToAny(&dfp.FilterConfig{
+				ImplementationSpecifier: &dfp.FilterConfig_DnsCacheConfig{
+					DnsCacheConfig: &dfpcommon.DnsCacheConfig{
+						Name:            dnsCacheConfigName,
+						DnsLookupFamily: lookupFamily,
+					},
+				},
+			}),
+		},
+	}
+}

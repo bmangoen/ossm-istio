@@ -18,7 +18,6 @@ import (
 	"sort"
 	"sync"
 
-	"istio.io/istio/pilot/pkg/features"
 	"istio.io/istio/pilot/pkg/serviceregistry/provider"
 	"istio.io/istio/pkg/cluster"
 	"istio.io/istio/pkg/config/schema/kind"
@@ -191,23 +190,31 @@ func (e *EndpointIndex) ShardsForService(serviceName, namespace string) (*Endpoi
 // GetOrCreateEndpointShard returns the shards. The second return parameter will be true if this service was seen
 // for the first time.
 func (e *EndpointIndex) GetOrCreateEndpointShard(serviceName, namespace string) (*EndpointShards, bool) {
+	// attempt to find endpoint shard with a read lock first, to avoid unnecessary lock contention. If not found, acquire a write lock and create it.
+	if ep, ok := e.ShardsForService(serviceName, namespace); ok {
+		return ep, false
+	}
+
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
-	if _, exists := e.shardsBySvc[serviceName]; !exists {
-		e.shardsBySvc[serviceName] = map[string]*EndpointShards{}
+	m, ok := e.shardsBySvc[serviceName]
+	if !ok {
+		m = map[string]*EndpointShards{}
+		e.shardsBySvc[serviceName] = m
 	}
-	if ep, exists := e.shardsBySvc[serviceName][namespace]; exists {
-		return ep, false
+
+	ep, ok := m[namespace]
+	if !ok {
+		ep = &EndpointShards{
+			Shards:          map[ShardKey][]*IstioEndpoint{},
+			ServiceAccounts: sets.String{},
+		}
+		m[namespace] = ep
+		// Clear the cache here to avoid race in cache writes.
+		e.clearCacheForService(serviceName, namespace)
 	}
-	// This endpoint is for a service that was not previously loaded.
-	ep := &EndpointShards{
-		Shards:          map[ShardKey][]*IstioEndpoint{},
-		ServiceAccounts: sets.String{},
-	}
-	e.shardsBySvc[serviceName][namespace] = ep
-	// Clear the cache here to avoid race in cache writes.
-	e.clearCacheForService(serviceName, namespace)
+
 	return ep, true
 }
 
@@ -273,6 +280,7 @@ func (e *EndpointIndex) UpdateServiceEndpoints(
 	hostname string,
 	namespace string,
 	istioEndpoints []*IstioEndpoint,
+	logPushType bool,
 ) PushType {
 	if len(istioEndpoints) == 0 {
 		// Should delete the service EndpointShards when endpoints become zero to prevent memory leak,
@@ -280,7 +288,11 @@ func (e *EndpointIndex) UpdateServiceEndpoints(
 		// unnecessary full push which can become a real problem if a pod is in crashloop and thus endpoints
 		// flip flopping between 1 and 0.
 		e.DeleteServiceShard(shard, hostname, namespace, true)
-		log.Infof("Incremental push, service %s at shard %v has no endpoints", hostname, shard)
+		if logPushType {
+			log.Infof("Incremental push, service %s at shard %v has no endpoints", hostname, shard)
+		} else {
+			log.Infof("Cache Update, Service %s at shard %v has no endpoints", hostname, shard)
+		}
 		return IncrementalPush
 	}
 
@@ -289,7 +301,11 @@ func (e *EndpointIndex) UpdateServiceEndpoints(
 	ep, created := e.GetOrCreateEndpointShard(hostname, namespace)
 	// If we create a new endpoint shard, that means we have not seen the service earlier. We should do a full push.
 	if created {
-		log.Infof("Full push, new service %s/%s", namespace, hostname)
+		if logPushType {
+			log.Infof("Full push, new service %s/%s", namespace, hostname)
+		} else {
+			log.Infof("Cache Update, new service %s/%s", namespace, hostname)
+		}
 		pushType = FullPush
 	}
 
@@ -311,7 +327,11 @@ func (e *EndpointIndex) UpdateServiceEndpoints(
 	// For existing endpoints, we need to do full push if service accounts change.
 	if saUpdated && pushType != FullPush {
 		// Avoid extra logging if already a full push
-		log.Infof("Full push, service accounts changed, %v", hostname)
+		if logPushType {
+			log.Infof("Full push, service accounts changed, %v", hostname)
+		} else {
+			log.Infof("Cache Update, service accounts changed, %v", hostname)
+		}
 		pushType = FullPush
 	}
 
@@ -361,7 +381,7 @@ func endpointUpdateRequiresPush(oldIstioEndpoints []*IstioEndpoint, incomingEndp
 			// new endpoint. Always send new healthy endpoints.
 			// Also send new unhealthy endpoints when SendUnhealthyEndpoints is enabled.
 			// This is OK since we disable panic threshold when SendUnhealthyEndpoints is enabled.
-			if nie.HealthStatus != UnHealthy || features.SendUnhealthyEndpoints.Load() {
+			if nie.HealthStatus != UnHealthy || nie.SendUnhealthyEndpoints {
 				needPush = true
 			}
 			newIstioEndpoints = append(newIstioEndpoints, nie)
@@ -402,47 +422,4 @@ func updateShardServiceAccount(shards *EndpointShards, serviceName string) bool 
 	}
 
 	return false
-}
-
-// EndpointIndexUpdater is an updater that will keep an EndpointIndex in sync. This is intended for tests only.
-type EndpointIndexUpdater struct {
-	Index *EndpointIndex
-	// Optional; if set, we will trigger ConfigUpdates in response to EDS updates as appropriate
-	ConfigUpdateFunc func(req *PushRequest)
-}
-
-var _ XDSUpdater = &EndpointIndexUpdater{}
-
-func NewEndpointIndexUpdater(ei *EndpointIndex) *EndpointIndexUpdater {
-	return &EndpointIndexUpdater{Index: ei}
-}
-
-func (f *EndpointIndexUpdater) ConfigUpdate(*PushRequest) {}
-
-func (f *EndpointIndexUpdater) EDSUpdate(shard ShardKey, serviceName string, namespace string, eps []*IstioEndpoint) {
-	pushType := f.Index.UpdateServiceEndpoints(shard, serviceName, namespace, eps)
-	if f.ConfigUpdateFunc != nil && (pushType == IncrementalPush || pushType == FullPush) {
-		// Trigger a push
-		f.ConfigUpdateFunc(&PushRequest{
-			Full:           pushType == FullPush,
-			ConfigsUpdated: sets.New(ConfigKey{Kind: kind.ServiceEntry, Name: serviceName, Namespace: namespace}),
-			Reason:         NewReasonStats(EndpointUpdate),
-		})
-	}
-}
-
-func (f *EndpointIndexUpdater) EDSCacheUpdate(shard ShardKey, serviceName string, namespace string, eps []*IstioEndpoint) {
-	f.Index.UpdateServiceEndpoints(shard, serviceName, namespace, eps)
-}
-
-func (f *EndpointIndexUpdater) SvcUpdate(shard ShardKey, hostname string, namespace string, event Event) {
-	if event == EventDelete {
-		f.Index.DeleteServiceShard(shard, hostname, namespace, false)
-	}
-}
-
-func (f *EndpointIndexUpdater) ProxyUpdate(_ cluster.ID, _ string) {}
-
-func (f *EndpointIndexUpdater) RemoveShard(shardKey ShardKey) {
-	f.Index.DeleteShard(shardKey)
 }

@@ -16,6 +16,10 @@ package xds_test
 
 import (
 	"context"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -36,10 +40,16 @@ import (
 	"istio.io/istio/pkg/config/constants"
 	"istio.io/istio/pkg/config/schema/gvk"
 	"istio.io/istio/pkg/kube/kclient/clienttest"
+	"istio.io/istio/pkg/log"
 	"istio.io/istio/pkg/test"
 	"istio.io/istio/pkg/test/util/assert"
 	"istio.io/istio/pkg/util/sets"
 )
+
+func init() {
+	// Most tests need this, and setting it per-test can trigger races from tests still executing after completion
+	features.EnableAmbient = true
+}
 
 func buildExpect(t *testing.T) func(resp *discovery.DeltaDiscoveryResponse, names ...string) {
 	return func(resp *discovery.DeltaDiscoveryResponse, names ...string) {
@@ -90,7 +100,6 @@ func buildExpectAddedAndRemoved(t *testing.T) func(resp *discovery.DeltaDiscover
 }
 
 func TestWorkloadReconnect(t *testing.T) {
-	test.SetForTest(t, &features.EnableAmbient, true)
 	t.Run("ondemand", func(t *testing.T) {
 		expect := buildExpect(t)
 		s := xds.NewFakeDiscoveryServer(t, xds.FakeOptions{
@@ -114,7 +123,7 @@ func TestWorkloadReconnect(t *testing.T) {
 		createPod(s, "pod2", "sa", "127.0.0.2", "node")
 		// Wait for it to be ready
 		assert.EventuallyEqual(t, func() int {
-			return len(s.KubeRegistry.All())
+			return len(s.AmbientIndex.All())
 		}, 2)
 
 		// Reconnect
@@ -148,7 +157,7 @@ func TestWorkloadReconnect(t *testing.T) {
 		createPod(s, "pod2", "sa", "127.0.0.2", "node")
 		// Wait for it to be ready
 		assert.EventuallyEqual(t, func() int {
-			return len(s.KubeRegistry.All())
+			return len(s.AmbientIndex.All())
 		}, 2)
 
 		// Reconnect
@@ -157,15 +166,109 @@ func TestWorkloadReconnect(t *testing.T) {
 			ResourceNamesSubscribe:   []string{},
 			ResourceNamesUnsubscribe: []string{},
 			InitialResourceVersions: map[string]string{
-				"/127.0.0.1": "",
+				"Kubernetes//Pod/default/pod": "",
 			},
 		})
 		expect(ads.ExpectResponse(), "Kubernetes//Pod/default/pod", "Kubernetes//Pod/default/pod2")
 	})
+	t.Run("ondemand-versioned", func(t *testing.T) {
+		expect := buildExpect(t)
+		s := xds.NewFakeDiscoveryServer(t, xds.FakeOptions{
+			KubernetesObjects: []runtime.Object{mkPod("pod", "sa", "127.0.0.1", "not-node")},
+		})
+		ads := s.ConnectDeltaADS().WithType(v3.AddressType).WithMetadata(model.NodeMetadata{NodeName: "node"})
+		ads.Request(&discovery.DeltaDiscoveryRequest{
+			ResourceNamesSubscribe:   []string{"*"},
+			ResourceNamesUnsubscribe: []string{"*"},
+		})
+		ads.ExpectEmptyResponse()
+
+		// Subscribe to the pod and record the version the server assigns.
+		resp := ads.RequestResponseAck(&discovery.DeltaDiscoveryRequest{
+			ResourceNamesSubscribe: []string{"/127.0.0.1"},
+		})
+		expect(resp, "Kubernetes//Pod/default/pod")
+		podVersion := resp.Resources[0].Version
+		if podVersion == "" {
+			t.Fatal("resource sent without a version")
+		}
+		ads.Cleanup()
+
+		// Reconnect claiming the retained version. The content is unchanged, so it is not re-sent.
+		ads = s.ConnectDeltaADS().WithType(v3.AddressType).WithMetadata(model.NodeMetadata{NodeName: "node"})
+		ads.Request(&discovery.DeltaDiscoveryRequest{
+			ResourceNamesSubscribe:   []string{"*"},
+			ResourceNamesUnsubscribe: []string{"*"},
+			InitialResourceVersions: map[string]string{
+				"Kubernetes//Pod/default/pod": podVersion,
+			},
+		})
+		ads.ExpectEmptyResponse()
+		ads.Cleanup()
+
+		// Reconnect claiming a stale version. The pod must be re-sent.
+		ads = s.ConnectDeltaADS().WithType(v3.AddressType).WithMetadata(model.NodeMetadata{NodeName: "node"})
+		ads.Request(&discovery.DeltaDiscoveryRequest{
+			ResourceNamesSubscribe:   []string{"*"},
+			ResourceNamesUnsubscribe: []string{"*"},
+			InitialResourceVersions: map[string]string{
+				"Kubernetes//Pod/default/pod": "stale",
+			},
+		})
+		expect(ads.ExpectResponse(), "Kubernetes//Pod/default/pod")
+	})
+	t.Run("wildcard-versioned", func(t *testing.T) {
+		expectAddedAndRemoved := buildExpectAddedAndRemoved(t)
+		s := xds.NewFakeDiscoveryServer(t, xds.FakeOptions{
+			KubernetesObjects: []runtime.Object{
+				mkPod("pod", "sa", "127.0.0.1", "not-node"),
+				mkPod("pod2", "sa", "127.0.0.2", "node"),
+			},
+		})
+		ads := s.ConnectDeltaADS().WithType(v3.AddressType).WithMetadata(model.NodeMetadata{NodeName: "node"})
+
+		// Subscribe to everything and record the versions the server assigns.
+		resp := ads.RequestResponseAck(&discovery.DeltaDiscoveryRequest{})
+		retained := map[string]string{}
+		for _, r := range resp.Resources {
+			if r.Version == "" {
+				t.Fatalf("resource %v sent without a version", r.Name)
+			}
+			retained[r.Name] = r.Version
+		}
+		assert.Equal(t, len(retained), 2)
+		ads.Cleanup()
+
+		// While disconnected, delete pod2 and create pod3.
+		deletePod(s, "pod2")
+		assert.EventuallyEqual(t, func() int {
+			return len(s.AmbientIndex.All())
+		}, 1)
+		createPod(s, "pod3", "sa", "127.0.0.3", "node")
+		assert.EventuallyEqual(t, func() int {
+			return len(s.AmbientIndex.All())
+		}, 2)
+
+		// Reconnect with the retained versions: the unchanged pod is skipped, pod3 is sent, and
+		// pod2 is removed.
+		ads = s.ConnectDeltaADS().WithType(v3.AddressType).WithMetadata(model.NodeMetadata{NodeName: "node"})
+		ads.Request(&discovery.DeltaDiscoveryRequest{InitialResourceVersions: retained})
+		resp = ads.ExpectResponse()
+		expectAddedAndRemoved(resp, []string{"Kubernetes//Pod/default/pod3"}, []string{"Kubernetes//Pod/default/pod2"})
+		pod3Version := resp.Resources[0].Version
+		ads.Cleanup()
+
+		// Reconnect claiming a stale version for the pod: it must be re-sent.
+		ads = s.ConnectDeltaADS().WithType(v3.AddressType).WithMetadata(model.NodeMetadata{NodeName: "node"})
+		ads.Request(&discovery.DeltaDiscoveryRequest{InitialResourceVersions: map[string]string{
+			"Kubernetes//Pod/default/pod":  "stale",
+			"Kubernetes//Pod/default/pod3": pod3Version,
+		}})
+		expectAddedAndRemoved(ads.ExpectResponse(), []string{"Kubernetes//Pod/default/pod"}, nil)
+	})
 }
 
 func TestWorkload(t *testing.T) {
-	test.SetForTest(t, &features.EnableAmbient, true)
 	t.Run("ondemand", func(t *testing.T) {
 		expect := buildExpect(t)
 		expectRemoved := buildExpectExpectRemoved(t)
@@ -173,6 +276,7 @@ func TestWorkload(t *testing.T) {
 			DebounceTime: time.Millisecond * 25,
 		})
 		ads := s.ConnectDeltaADS().WithTimeout(time.Second * 5).WithType(v3.AddressType).WithMetadata(model.NodeMetadata{NodeName: "node"})
+		spamDebugEndpointsToDetectRace(t, s)
 
 		ads.Request(&discovery.DeltaDiscoveryRequest{
 			ResourceNamesSubscribe:   []string{"*"},
@@ -244,12 +348,14 @@ func TestWorkload(t *testing.T) {
 		expect(ads.ExpectResponse(), "Kubernetes//Pod/default/pod4")
 	})
 	t.Run("wildcard", func(t *testing.T) {
+		log.FindScope("delta").SetOutputLevel(log.DebugLevel)
 		expect := buildExpect(t)
 		expectRemoved := buildExpectExpectRemoved(t)
 		s := xds.NewFakeDiscoveryServer(t, xds.FakeOptions{
 			DebounceTime: time.Millisecond * 25,
 		})
 		ads := s.ConnectDeltaADS().WithTimeout(time.Second * 5).WithType(v3.AddressType).WithMetadata(model.NodeMetadata{NodeName: "node"})
+		spamDebugEndpointsToDetectRace(t, s)
 
 		ads.Request(&discovery.DeltaDiscoveryRequest{
 			ResourceNamesSubscribe: []string{"*"},
@@ -279,6 +385,45 @@ func TestWorkload(t *testing.T) {
 		createService(s, "svc1", "default", map[string]string{"app": "not-sa"})
 		expect(ads.ExpectResponse(), "Kubernetes//Pod/default/pod", "Kubernetes//Pod/default/pod2")
 	})
+}
+
+// Historically, the debug interface has been a common source of race conditions in the discovery server
+// spamDebugEndpointsToDetectRace hits all the endpoints, attempting to trigger any latent race conditions.
+func spamDebugEndpointsToDetectRace(t *testing.T, s *xds.FakeDiscoveryServer) {
+	stop := test.NewStop(t)
+	go func() {
+		for _, proxySpecific := range []bool{true, false} {
+			for range 10 {
+				for _, url := range s.Discovery.DebugEndpoints() {
+					select {
+					case <-stop:
+						// Test is over, stop early
+						return
+					default:
+					}
+					// Drop mutating URLs
+					if strings.Contains(url, "push=true") {
+						continue
+					}
+					if strings.Contains(url, "clear=true") {
+						continue
+					}
+					if proxySpecific {
+						url += "?proxyID=test"
+					}
+					req, err := http.NewRequest(http.MethodGet, url, nil)
+					if err != nil {
+						panic(err.Error())
+					}
+					log.Debugf("calling %v..", req.URL)
+					rr := httptest.NewRecorder()
+					h, _ := s.DiscoveryDebug.Handler(req)
+					h.ServeHTTP(rr, req)
+					_, _ = io.Copy(io.Discard, rr.Body)
+				}
+			}
+		}
+	}()
 }
 
 func deletePod(s *xds.FakeDiscoveryServer, name string) {
@@ -384,7 +529,6 @@ func createService(s *xds.FakeDiscoveryServer, name, namespace string, selector 
 }
 
 func TestWorkloadAuthorizationPolicy(t *testing.T) {
-	test.SetForTest(t, &features.EnableAmbient, true)
 	expect := buildExpect(t)
 	expectRemoved := buildExpectExpectRemoved(t)
 	s := xds.NewFakeDiscoveryServer(t, xds.FakeOptions{})
@@ -412,7 +556,6 @@ func TestWorkloadAuthorizationPolicy(t *testing.T) {
 }
 
 func TestWorkloadPeerAuthentication(t *testing.T) {
-	test.SetForTest(t, &features.EnableAmbient, true)
 	expect := buildExpect(t)
 	expectAddedAndRemoved := buildExpectAddedAndRemoved(t)
 	s := xds.NewFakeDiscoveryServer(t, xds.FakeOptions{})
@@ -457,7 +600,6 @@ func TestWorkloadPeerAuthentication(t *testing.T) {
 
 // Regression tests for NOP PeerAuthentication triggering a removal
 func TestPeerAuthenticationUpdate(t *testing.T) {
-	test.SetForTest(t, &features.EnableAmbient, true)
 	expectAddedAndRemoved := buildExpectAddedAndRemoved(t)
 	s := xds.NewFakeDiscoveryServer(t, xds.FakeOptions{})
 	ads := s.ConnectDeltaADS().WithType(v3.WorkloadAuthorizationType).WithTimeout(time.Second * 10).WithNodeType(model.Ztunnel)

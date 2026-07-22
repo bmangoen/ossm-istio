@@ -22,8 +22,8 @@ import (
 	"github.com/containernetworking/plugins/pkg/ns"
 
 	"istio.io/istio/pkg/log"
+	"istio.io/istio/tools/common/config"
 	"istio.io/istio/tools/istio-iptables/pkg/cmd"
-	"istio.io/istio/tools/istio-iptables/pkg/config"
 	"istio.io/istio/tools/istio-iptables/pkg/dependencies"
 )
 
@@ -47,7 +47,7 @@ func (ipt *iptables) Program(podName, netns string, rdrct *Redirect) error {
 	cfg.OutboundPortsExclude = rdrct.excludeOutboundPorts
 	cfg.OutboundPortsInclude = rdrct.includeOutboundPorts
 	cfg.OutboundIPRangesExclude = rdrct.excludeIPCidrs
-	cfg.KubeVirtInterfaces = rdrct.kubevirtInterfaces
+	cfg.RerouteVirtualInterfaces = rdrct.rerouteVirtualInterfaces
 	cfg.DryRun = dependencies.DryRunFilePath.Get() != ""
 	cfg.RedirectDNS = rdrct.dnsRedirect
 	cfg.CaptureAllDNS = rdrct.dnsRedirect

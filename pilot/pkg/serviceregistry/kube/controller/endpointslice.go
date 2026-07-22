@@ -15,6 +15,7 @@
 package controller
 
 import (
+	"strings"
 	"sync"
 
 	"github.com/hashicorp/go-multierror"
@@ -26,6 +27,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	mcs "sigs.k8s.io/mcs-api/pkg/apis/v1alpha1"
 
+	"istio.io/api/annotation"
 	"istio.io/istio/pilot/pkg/features"
 	"istio.io/istio/pilot/pkg/model"
 	"istio.io/istio/pkg/config"
@@ -83,12 +85,12 @@ func (esc *endpointSliceController) initializeNamespace(ns string, filtered bool
 	return err.ErrorOrNil()
 }
 
-func (esc *endpointSliceController) onEvent(_, ep *v1.EndpointSlice, event model.Event) error {
-	esc.onEventInternal(nil, ep, event)
+func (esc *endpointSliceController) onEvent(old, ep *v1.EndpointSlice, event model.Event) error {
+	esc.onEventInternal(old, ep, event)
 	return nil
 }
 
-func (esc *endpointSliceController) onEventInternal(_, ep *v1.EndpointSlice, event model.Event) {
+func (esc *endpointSliceController) onEventInternal(old, ep *v1.EndpointSlice, event model.Event) {
 	esLabels := ep.GetLabels()
 	if !endpointSliceSelector.Matches(klabels.Set(esLabels)) {
 		return
@@ -100,58 +102,68 @@ func (esc *endpointSliceController) onEventInternal(_, ep *v1.EndpointSlice, eve
 	if event == model.EventDelete {
 		esc.deleteEndpointSlice(ep)
 	} else {
+		if event == model.EventUpdate && old != nil {
+			esc.cleanupRemovedEndpoints(old, ep)
+		}
 		esc.updateEndpointSlice(ep)
 	}
-	hostnames := esc.c.hostNamesForNamespacedName(namespacedName)
-	// Trigger EDS push for all hostnames.
-	esc.pushEDS(hostnames, namespacedName.Namespace)
 
+	// Now check if we need to do a full push for the service.
+	// If the service is headless, we need to do a full push if service exposes TCP ports
+	// to create IP based listeners. For pure HTTP headless services, we only need to push NDS.
 	name := serviceNameForEndpointSlice(esLabels)
 	namespace := ep.GetNamespace()
 	svc := esc.c.services.Get(name, namespace)
+	if svc != nil && !serviceNeedsPush(svc) {
+		return
+	}
+
+	hostnames := esc.c.hostNamesForNamespacedName(namespacedName)
+	log.Debugf("triggering EDS push for %s in namespace %s", hostnames, namespacedName.Namespace)
+	// Trigger EDS push for all hostnames.
+	esc.pushEDS(hostnames, namespacedName.Namespace)
+
 	if svc == nil || svc.Spec.ClusterIP != corev1.ClusterIPNone || svc.Spec.Type == corev1.ServiceTypeExternalName {
 		return
 	}
 
-	configs := []types.NamespacedName{}
-	pureHTTP := true
+	configsUpdated := sets.New[model.ConfigKey]()
+	supportsOnlyHTTP := true
 	for _, modelSvc := range esc.c.servicesForNamespacedName(config.NamespacedName(svc)) {
-		// skip push if it is not exported
-		if modelSvc.Attributes.ExportTo.Contains(visibility.None) {
-			continue
-		}
-
-		configs = append(configs, types.NamespacedName{Name: modelSvc.Hostname.String(), Namespace: svc.Namespace})
-
 		for _, p := range modelSvc.Ports {
 			if !p.Protocol.IsHTTP() {
-				pureHTTP = false
+				supportsOnlyHTTP = false
 				break
 			}
 		}
-	}
-
-	configsUpdated := sets.New[model.ConfigKey]()
-	for _, config := range configs {
-		if !pureHTTP {
-			configsUpdated.Insert(model.ConfigKey{Kind: kind.ServiceEntry, Name: config.Name, Namespace: config.Namespace})
-		} else {
+		if supportsOnlyHTTP {
 			// pure HTTP headless services should not need a full push since they do not
 			// require a Listener based on IP: https://github.com/istio/istio/issues/48207
-			configsUpdated.Insert(model.ConfigKey{Kind: kind.DNSName, Name: config.Name, Namespace: config.Namespace})
+			configsUpdated.Insert(model.ConfigKey{Kind: kind.DNSName, Name: modelSvc.Hostname.String(), Namespace: svc.Namespace})
+		} else {
+			configsUpdated.Insert(model.ConfigKey{Kind: kind.ServiceEntry, Name: modelSvc.Hostname.String(), Namespace: svc.Namespace})
 		}
 	}
 
 	if len(configsUpdated) > 0 {
-		// For headless services, trigger a full push.
-		// If EnableHeadlessService is true and svc ports are not pure HTTP, we need to regenerate listeners per endpoint.
-		// Otherwise we only need to push NDS, but still need to set full but we skip all other xDS except NDS during the push.
 		esc.c.opts.XDSUpdater.ConfigUpdate(&model.PushRequest{
-			Full:           true,
 			ConfigsUpdated: configsUpdated,
 			Reason:         model.NewReasonStats(model.HeadlessEndpointUpdate),
 		})
 	}
+}
+
+func serviceNeedsPush(svc *corev1.Service) bool {
+	if svc.Annotations[annotation.NetworkingExportTo.Name] != "" {
+		namespaces := strings.Split(svc.Annotations[annotation.NetworkingExportTo.Name], ",")
+		for _, ns := range namespaces {
+			ns = strings.TrimSpace(ns)
+			if ns == string(visibility.None) {
+				return false
+			}
+		}
+	}
+	return true
 }
 
 // GetProxyServiceTargets returns service instances co-located with a given proxy
@@ -223,6 +235,26 @@ func (esc *endpointSliceController) deleteEndpointSlice(slice *v1.EndpointSlice)
 	}
 }
 
+// cleanupRemovedEndpoints calls endpointDeleted for any IP present in old but absent in cur.
+// This prevents needResync entries from leaking when an EndpointSlice UPDATE removes an address
+// (e.g. after a pod fails and is filtered from the pod cache by the FieldSelector added in #58250).
+func (esc *endpointSliceController) cleanupRemovedEndpoints(old, cur *v1.EndpointSlice) {
+	curAddrs := sets.New[string]()
+	for _, e := range cur.Endpoints {
+		for _, a := range e.Addresses {
+			curAddrs.Insert(a)
+		}
+	}
+	key := config.NamespacedName(cur)
+	for _, e := range old.Endpoints {
+		for _, a := range e.Addresses {
+			if !curAddrs.Contains(a) {
+				esc.c.pods.endpointDeleted(key, a)
+			}
+		}
+	}
+}
+
 func (esc *endpointSliceController) updateEndpointSlice(slice *v1.EndpointSlice) {
 	for _, hostname := range esc.c.hostNamesForNamespacedName(getServiceNamespacedName(slice)) {
 		esc.updateEndpointCacheForSlice(hostname, slice)
@@ -234,10 +266,17 @@ func endpointHealthStatus(svc *model.Service, e v1.Endpoint) model.HealthStatus 
 		return model.Healthy
 	}
 
+	// An endpoint is draining only if it was previously ready (serving == true) and persistent sessions is enabled
 	if svc != nil && svc.SupportsDrainingEndpoints() &&
 		(e.Conditions.Serving == nil || *e.Conditions.Serving) &&
 		(e.Conditions.Terminating == nil || *e.Conditions.Terminating) {
 		return model.Draining
+	}
+
+	// If it is shutting down, mark it as terminating. This occurs regardless of whether it was previously healthy or not.
+	if svc != nil &&
+		(e.Conditions.Terminating == nil || *e.Conditions.Terminating) {
+		return model.Terminating
 	}
 
 	return model.UnHealthy
@@ -270,7 +309,7 @@ func (esc *endpointSliceController) updateEndpointCacheForSlice(hostName host.Na
 
 			var overrideAddresses []string
 			// If not expect a pod, it means this is not an endpointslice not managed by kubernetes.
-			// We donot add all pod ips to the istio endpoint.
+			// We do not add all pod ips to the istio endpoint.
 			if features.EnableDualStack && expectedPod && svcCore != nil && len(pod.Status.PodIPs) > 1 && len(svcCore.Spec.ClusterIPs) > 1 {
 				if epSlice.AddressType == v1.AddressTypeIPv6 {
 					// For endpointslice with targetRef and the pod has dual stack ip.
@@ -295,7 +334,7 @@ func (esc *endpointSliceController) updateEndpointCacheForSlice(hostName host.Na
 					portName = *port.Name
 				}
 
-				istioEndpoint := builder.buildIstioEndpoint(a, portNum, portName, discoverabilityPolicy, healthStatus)
+				istioEndpoint := builder.buildIstioEndpoint(a, portNum, portName, discoverabilityPolicy, healthStatus, svc.SupportsUnhealthyEndpoints())
 				if len(overrideAddresses) > 1 {
 					istioEndpoint.Addresses = overrideAddresses
 				}

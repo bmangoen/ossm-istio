@@ -65,8 +65,8 @@ func (fx *Updater) ConfigUpdate(req *model.PushRequest) {
 	if fx.SplitEvents {
 		for _, n := range names {
 			event := "xds"
-			if req.Full {
-				event += " full"
+			if req.Forced {
+				event += " forced"
 			}
 			select {
 			case fx.Events <- Event{Type: event, ID: n}:
@@ -76,8 +76,8 @@ func (fx *Updater) ConfigUpdate(req *model.PushRequest) {
 	} else {
 		id := strings.Join(names, ",")
 		event := "xds"
-		if req.Full {
-			event += " full"
+		if req.Forced {
+			event += " forced"
 		}
 		select {
 		case fx.Events <- Event{Type: event, ID: id, Reason: req.Reason}:
@@ -116,6 +116,16 @@ type Event struct {
 
 	// EndpointCount, used in matches only
 	EndpointCount int
+}
+
+type EventMatcher struct {
+	// Type must match exactly
+	Type string
+	// A prefix to match the id of incoming events.
+	IDPrefix string
+
+	// A prefix to match the namespace of incoming events.
+	NamespacePrefix string
 }
 
 func (fx *Updater) EDSUpdate(c model.ShardKey, hostname string, ns string, entry []*model.IstioEndpoint) {
@@ -202,6 +212,7 @@ func (fx *Updater) matchOrFail(t test.Failer, strict bool, events ...Event) {
 		}
 		select {
 		case e := <-fx.Events:
+			t.Logf("got event %q/%v", e.Type, e.ID)
 			found := false
 			for i, want := range events {
 				if e.Type == want.Type &&
@@ -254,6 +265,37 @@ func (fx *Updater) AssertEmpty(t test.Failer, dur time.Duration) {
 		select {
 		case e := <-fx.Events:
 			t.Fatalf("got unexpected event %+v", e)
+		case <-time.After(dur):
+		}
+	}
+}
+
+func (fx *Updater) AssertNoMatch(t test.Failer, dur time.Duration, matchers ...EventMatcher) {
+	t.Helper()
+	if dur == 0 {
+		select {
+		case e := <-fx.Events:
+			t.Logf("got event %q/%v", e.Type, e.ID)
+			for _, m := range matchers {
+				if e.Type == m.Type &&
+					(m.IDPrefix != "" && strings.HasPrefix(e.ID, m.IDPrefix)) ||
+					(m.NamespacePrefix != "" && strings.HasPrefix(e.Namespace, m.NamespacePrefix)) {
+					t.Fatalf("got unexpected matching event %+v", e)
+				}
+			}
+		default:
+		}
+	} else {
+		select {
+		case e := <-fx.Events:
+			t.Logf("got event %q/%v", e.Type, e.ID)
+			for _, m := range matchers {
+				if e.Type == m.Type &&
+					(m.IDPrefix != "" && strings.HasPrefix(e.ID, m.IDPrefix)) ||
+					(m.NamespacePrefix != "" && strings.HasPrefix(e.Namespace, m.NamespacePrefix)) {
+					t.Fatalf("got unexpected matching event before timeout %+v", e)
+				}
+			}
 		case <-time.After(dur):
 		}
 	}

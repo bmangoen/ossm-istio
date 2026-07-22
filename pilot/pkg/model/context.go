@@ -19,7 +19,6 @@ import (
 	"fmt"
 	"net"
 	"regexp"
-	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -29,7 +28,9 @@ import (
 	discovery "github.com/envoyproxy/go-control-plane/envoy/service/discovery/v3"
 	anypb "google.golang.org/protobuf/types/known/anypb"
 	"google.golang.org/protobuf/types/known/structpb"
+	"k8s.io/apimachinery/pkg/types"
 
+	"istio.io/api/label"
 	meshconfig "istio.io/api/mesh/v1alpha1"
 	"istio.io/istio/pilot/pkg/credentials"
 	"istio.io/istio/pilot/pkg/features"
@@ -38,14 +39,18 @@ import (
 	networkutil "istio.io/istio/pilot/pkg/util/network"
 	v3 "istio.io/istio/pilot/pkg/xds/v3"
 	"istio.io/istio/pkg/cluster"
+	"istio.io/istio/pkg/config"
 	"istio.io/istio/pkg/config/constants"
 	"istio.io/istio/pkg/config/host"
 	"istio.io/istio/pkg/config/mesh"
+	"istio.io/istio/pkg/config/mesh/meshwatcher"
 	"istio.io/istio/pkg/config/protocol"
+	"istio.io/istio/pkg/config/schema/kind"
 	"istio.io/istio/pkg/maps"
 	pm "istio.io/istio/pkg/model"
 	"istio.io/istio/pkg/monitoring"
 	"istio.io/istio/pkg/network"
+	"istio.io/istio/pkg/slices"
 	"istio.io/istio/pkg/spiffe"
 	"istio.io/istio/pkg/util/identifier"
 	netutil "istio.io/istio/pkg/util/net"
@@ -71,6 +76,7 @@ const (
 	Router       = pm.Router
 	Waypoint     = pm.Waypoint
 	Ztunnel      = pm.Ztunnel
+	Agentgateway = pm.Agentgateway
 
 	IPv4 = pm.IPv4
 	IPv6 = pm.IPv6
@@ -87,11 +93,15 @@ func NewEnvironment() *Environment {
 		cache = DisabledCache{}
 	}
 	return &Environment{
-		pushContext:   NewPushContext(),
-		Cache:         cache,
-		EndpointIndex: NewEndpointIndex(cache),
+		pushContext:    NewPushContext(),
+		Cache:          cache,
+		EndpointIndex:  NewEndpointIndex(cache),
+		AmbientIndexes: &NoopAmbientIndexes{},
 	}
 }
+
+// Watcher is a type alias to keep the embedded type name stable.
+type Watcher = meshwatcher.WatcherCollection
 
 // Environment provides an aggregate environmental API for Pilot
 type Environment struct {
@@ -102,7 +112,10 @@ type Environment struct {
 	ConfigStore
 
 	// Watcher is the watcher for the mesh config (to be merged into the config store)
-	mesh.Watcher
+	Watcher
+
+	// AmbientIndexes provides access to ambient mesh data (workloads, services, policies).
+	AmbientIndexes
 
 	// NetworksWatcher (loaded from a config map) provides information about the
 	// set of networks inside a mesh and how to route to endpoints in each
@@ -135,12 +148,17 @@ type Environment struct {
 
 	GatewayAPIController GatewayController
 
+	// AgentgatewayController is the controller for agentgateway.
+	AgentgatewayController AgentgatewayController
+
 	// EndpointShards for a service. This is a global (per-server) list, built from
 	// incremental updates. This is keyed by service and namespace
 	EndpointIndex *EndpointIndex
 
 	// Cache for XDS resources.
 	Cache XdsCache
+
+	VirtualServiceController *VirtualServiceController
 }
 
 func (e *Environment) Mesh() *meshconfig.MeshConfig {
@@ -218,7 +236,7 @@ func (e *Environment) Init() {
 
 func (e *Environment) InitNetworksManager(updater XDSUpdater) (err error) {
 	e.NetworkManager, err = NewNetworkManager(e, updater)
-	return
+	return err
 }
 
 func (e *Environment) ClusterLocal() ClusterLocalProvider {
@@ -285,6 +303,14 @@ type XdsDeltaResourceGenerator interface {
 	GenerateDeltas(proxy *Proxy, req *PushRequest, w *WatchedResource) (Resources, DeletedResources, XdsLogDetails, bool, error)
 }
 
+// LocalServiceInfo identifies the local service associated with a proxy: the service's
+// hostname, namespace, and the port used to model the proxy's self-discovery local_cluster.
+type LocalServiceInfo struct {
+	Name      string
+	Namespace string
+	Port      int
+}
+
 // Proxy contains information about an specific instance of a proxy (envoy sidecar, gateway,
 // etc). The Proxy is initialized when a sidecar connects to Pilot, and populated from
 // 'node' info in the protocol as well as data extracted from registries.
@@ -346,6 +372,16 @@ type Proxy struct {
 	// ServiceTargets will maintain a list entry for each Service-port, so if we have 2 services each with 3 ports, we
 	// would have 6 entries.
 	ServiceTargets []ServiceTarget
+
+	// LocalService identifies the local service associated with the proxy. It is populated in
+	// SetServiceTargets from the first entry in ServiceTargets, or the zero value if there is none.
+	// Carrying the port here avoids re-deriving it from ServiceTargets when building the
+	// self-discovery local_cluster, and lets incremental pushes detect port changes.
+	LocalService LocalServiceInfo
+
+	// PrevLocalService is the value of LocalService prior to the most recent SetServiceTargets call,
+	// used to detect local-service transitions during incremental pushes.
+	PrevLocalService LocalServiceInfo
 
 	// Istio version associated with the Proxy
 	IstioVersion *IstioVersion
@@ -423,6 +459,11 @@ func (node *Proxy) IsZTunnel() bool {
 // IsAmbient returns true if the proxy is acting as either a ztunnel or a waypoint proxy in an ambient mesh.
 func (node *Proxy) IsAmbient() bool {
 	return node.IsWaypointProxy() || node.IsZTunnel()
+}
+
+// IsAgentgateway returns true if the proxy is acting as an agentgateway.
+func (node *Proxy) IsAgentgateway() bool {
+	return node.Type == Agentgateway
 }
 
 var NodeTypes = [...]NodeType{SidecarProxy, Router, Waypoint, Ztunnel}
@@ -523,11 +564,19 @@ func compareVersion(ov, nv int) int {
 	return 1
 }
 
-func (node *Proxy) VersionGreaterAndEqual(inv *IstioVersion) bool {
+func (node *Proxy) VersionGreaterOrEqual(inv *IstioVersion) bool {
 	if inv == nil {
 		return true
 	}
 	return node.IstioVersion.Compare(inv) >= 0
+}
+
+func (node *Proxy) IsAmbientEastWestGateway() bool {
+	if node == nil || node.Type != Waypoint {
+		return false
+	}
+	controller, ok := node.Labels[label.GatewayManaged.Name]
+	return ok && controller == constants.ManagedGatewayEastWestControllerLabel
 }
 
 // SetGatewaysForProxy merges the Gateway objects associated with this
@@ -536,7 +585,7 @@ func (node *Proxy) VersionGreaterAndEqual(inv *IstioVersion) bool {
 // fetch all the gateways and invoke the merge call in multiple places (lds/rds).
 // Must be called after ServiceTargets are set
 func (node *Proxy) SetGatewaysForProxy(ps *PushContext) {
-	if node.Type != Router {
+	if node.Type != Router && !node.IsAmbientEastWestGateway() {
 		return
 	}
 	var prevMergedGateway MergedGateway
@@ -547,24 +596,45 @@ func (node *Proxy) SetGatewaysForProxy(ps *PushContext) {
 	node.PrevMergedGateway = &PrevMergedGateway{
 		ContainsAutoPassthroughGateways: prevMergedGateway.ContainsAutoPassthroughGateways,
 		AutoPassthroughSNIHosts:         prevMergedGateway.GetAutoPassthroughGatewaySNIHosts(),
+		GatewayNameForServer:            prevMergedGateway.GatewayNameForServer,
 	}
+}
+
+func (node *Proxy) ShouldUpdateServiceTargets(updates sets.Set[ConfigKey]) bool {
+	// we only care for services which can actually select this proxy
+	for config := range updates {
+		if config.Kind == kind.ServiceEntry && config.Namespace == node.Metadata.Namespace {
+			return true
+		}
+	}
+
+	return false
 }
 
 func (node *Proxy) SetServiceTargets(serviceDiscovery ServiceDiscovery) {
 	instances := serviceDiscovery.GetProxyServiceTargets(node)
 
 	// Keep service instances in order of creation/hostname.
-	sort.SliceStable(instances, func(i, j int) bool {
-		if instances[i].Service != nil && instances[j].Service != nil {
-			if !instances[i].Service.CreationTime.Equal(instances[j].Service.CreationTime) {
-				return instances[i].Service.CreationTime.Before(instances[j].Service.CreationTime)
+	slices.SortStableFunc(instances, func(a, b ServiceTarget) int {
+		if a.Service != nil && b.Service != nil {
+			if c := a.Service.CreationTime.Compare(b.Service.CreationTime); c != 0 {
+				return c
 			}
 			// Additionally, sort by hostname just in case services created automatically at the same second.
-			return instances[i].Service.Hostname < instances[j].Service.Hostname
+			return strings.Compare(string(a.Service.Hostname), string(b.Service.Hostname))
 		}
-		return true
+		return -1
 	})
 
+	node.PrevLocalService = node.LocalService
+	node.LocalService = LocalServiceInfo{}
+	if len(instances) > 0 {
+		node.LocalService = LocalServiceInfo{
+			Name:      string(instances[0].Service.Hostname),
+			Namespace: instances[0].Service.Attributes.Namespace,
+			Port:      instances[0].Port.Port,
+		}
+	}
 	node.ServiceTargets = instances
 }
 
@@ -625,7 +695,7 @@ func (node *Proxy) GetIPMode() IPMode {
 }
 
 // SetIPMode set node's ip mode
-// Note: Donot use this function directly in most cases, use DiscoverIPMode instead.
+// Note: Do not use this function directly in most cases, use DiscoverIPMode instead.
 func (node *Proxy) SetIPMode(mode IPMode) {
 	node.ipMode = mode
 }
@@ -822,7 +892,9 @@ func conflictWithReservedListener(proxy *Proxy, push *PushContext, bind string, 
 	// bind == wildcard
 	// or bind unspecified, but protocol is HTTP
 	if proxy.Metadata != nil {
-		conflictWithStaticListener = proxy.Metadata.EnvoyStatusPort == port || proxy.Metadata.EnvoyPrometheusPort == port
+		conflictWithStaticListener = proxy.Metadata.EnvoyStatusPort == port || proxy.Metadata.EnvoyPrometheusPort == port ||
+			(proxy.Metadata.EnvoySecureMetricsPort != 0 && proxy.Metadata.EnvoySecureMetricsPort == port) ||
+			(proxy.Metadata.EnvoySecureMergedMetricsPort != 0 && proxy.Metadata.EnvoySecureMergedMetricsPort == port)
 	}
 	if push != nil {
 		conflictWithVirtualListener = int(push.Mesh.ProxyListenPort) == port || int(push.Mesh.ProxyInboundListenPort) == port
@@ -979,7 +1051,7 @@ func (node *Proxy) Clusters() []string {
 	defer node.RUnlock()
 	wr := node.WatchedResources[v3.EndpointType]
 	if wr != nil {
-		return wr.ResourceNames
+		return wr.ResourceNames.UnsortedList()
 	}
 	return nil
 }
@@ -988,7 +1060,7 @@ func (node *Proxy) NewWatchedResource(typeURL string, names []string) {
 	node.Lock()
 	defer node.Unlock()
 
-	node.WatchedResources[typeURL] = &WatchedResource{TypeUrl: typeURL, ResourceNames: names}
+	node.WatchedResources[typeURL] = &WatchedResource{TypeUrl: typeURL, ResourceNames: sets.New(names...)}
 	// For all EDS requests that we have already responded with in the same stream let us
 	// force the response. It is important to respond to those requests for Envoy to finish
 	// warming of those resources(Clusters).
@@ -1045,15 +1117,29 @@ func (node *Proxy) DeleteWatchedResource(typeURL string) {
 	delete(node.WatchedResources, typeURL)
 }
 
+type InferenceGatewayContext interface {
+	// HasInferencePool returns whether or not a given gateway has a reference to an InferencePool
+	HasInferencePool(types.NamespacedName) bool
+}
+
 type GatewayController interface {
 	ConfigStoreController
+	InferenceGatewayContext
 	// Reconcile updates the internal state of the gateway controller for a given input. This should be
 	// called before any List/Get calls if the state has changed
-	Reconcile(ctx *PushContext) error
+	Reconcile(ctx *PushContext)
 	// SecretAllowed determines if a SDS credential is accessible to a given namespace.
 	// For example, for resourceName of `kubernetes-gateway://ns-name/secret-name` and namespace of `ingress-ns`,
 	// this would return true only if there was a policy allowing `ingress-ns` to access Secrets in the `ns-name` namespace.
-	SecretAllowed(resourceName string, namespace string) bool
+	SecretAllowed(ourKind config.GroupVersionKind, resourceName string, namespace string) bool
+}
+
+type AgentgatewayController interface {
+	ConfigStoreController
+	// Reconcile updates the internal state of the agentgateway controller for a given input. This should be
+	// called before any List/Get calls if the state has changed
+	// Required for current status implementation
+	Reconcile(ctx *PushContext)
 }
 
 // OutboundListenerClass is a helper to turn a NodeType for outbound to a ListenerClass.
@@ -1062,4 +1148,33 @@ func OutboundListenerClass(t NodeType) istionetworking.ListenerClass {
 		return istionetworking.ListenerClassGateway
 	}
 	return istionetworking.ListenerClassSidecarOutbound
+}
+
+func IsIngressGateway(proxy *Proxy) bool {
+	if proxy == nil || proxy.Type != Router {
+		return false
+	}
+
+	return proxy.Labels[label.GatewayManaged.Name] == constants.ManagedGatewayControllerLabel ||
+		proxy.Labels[constants.IstioLabel] == constants.IstioIngressLabelValue // This is a legacy label
+}
+
+func IsWaypointProxy(node *Proxy) bool {
+	if node == nil || node.Type != Waypoint {
+		return false
+	}
+	controller, isManagedGateway := node.Labels[label.GatewayManaged.Name]
+
+	return isManagedGateway && controller == constants.ManagedGatewayMeshControllerLabel
+}
+
+func ShouldCreateDoubleHBONEResources(p *Proxy) bool {
+	isHBONESendEnabled := bool(!p.Metadata.DisableHBONESend) && features.EnableHBONESend
+
+	// Note that we only consider EnableHBONESend for ingress gateway, as traditionally
+	// that flag has been ignored for waypoints when generating endpoint/cluster discovery
+	// information.
+	return features.EnableAmbientMultiNetwork &&
+		(IsIngressGateway(p) && features.EnableAmbientIngressMultiNetwork && isHBONESendEnabled) ||
+		(IsWaypointProxy(p) && features.EnableAmbientWaypointMultiNetwork)
 }

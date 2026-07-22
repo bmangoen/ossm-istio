@@ -17,6 +17,7 @@ package xds
 import (
 	discovery "github.com/envoyproxy/go-control-plane/envoy/service/discovery/v3"
 
+	"istio.io/istio/pilot/pkg/features"
 	"istio.io/istio/pilot/pkg/model"
 	"istio.io/istio/pilot/pkg/networking/core"
 	"istio.io/istio/pilot/pkg/util/protoconv"
@@ -39,6 +40,8 @@ var skippedLdsConfigs = map[model.NodeType]sets.Set[kind.Kind]{
 		kind.Secret,
 		kind.ProxyConfig,
 		kind.DNSName,
+		kind.Endpoints,
+		kind.Address,
 	),
 	model.SidecarProxy: sets.New(
 		kind.Gateway,
@@ -47,54 +50,63 @@ var skippedLdsConfigs = map[model.NodeType]sets.Set[kind.Kind]{
 		kind.Secret,
 		kind.ProxyConfig,
 		kind.DNSName,
-
-		kind.KubernetesGateway,
+		kind.Endpoints,
+		kind.Address,
 	),
-	model.Waypoint: sets.New(
-		kind.Gateway,
-		kind.WorkloadGroup,
-		kind.WorkloadEntry,
-		kind.Secret,
-		kind.ProxyConfig,
-		kind.DNSName,
-
-		kind.KubernetesGateway,
-	),
+	model.Waypoint: func() sets.Set[kind.Kind] {
+		s := sets.New(
+			kind.Gateway,
+			kind.WorkloadGroup,
+			kind.WorkloadEntry,
+			kind.Secret,
+			kind.ProxyConfig,
+			kind.DNSName,
+			kind.Endpoints,
+		)
+		if features.ScopedAddressPushes {
+			// Address changes are handled by waypointNeedsPush, scoped to the affected waypoints
+			s.Insert(kind.Address)
+		}
+		return s
+	}(),
 }
 
 func ldsNeedsPush(proxy *model.Proxy, req *model.PushRequest) bool {
-	if req == nil {
+	if res, ok := xdsNeedsPush(req, proxy); ok {
+		return res
+	}
+	if proxy.Type == model.Waypoint && waypointNeedsPush(req, proxy) {
 		return true
 	}
-	switch proxy.Type {
-	case model.Waypoint:
-		if model.HasConfigsOfKind(req.ConfigsUpdated, kind.Address) {
-			// Waypoint proxies have a matcher against pod IPs in them. Historically, any LDS change would do a full
-			// push, recomputing push context. Doing that on every IP change doesn't scale, so we need these to remain
-			// incremental pushes.
-			// This allows waypoints only to push LDS on incremental pushes to Address type which would otherwise be skipped.
-			return true
-		}
-		// Otherwise, only handle full pushes (skip endpoint-only updates)
-		if !req.Full {
-			return false
-		}
-	default:
-		if !req.Full {
-			// LDS only handles full push
-			return false
-		}
-	}
-	// If none set, we will always push
-	if len(req.ConfigsUpdated) == 0 {
-		return true
-	}
+
+	// Optimization: Routers don't need LDS updates for headless endpoint changes.
+	// However, if ServiceUpdate is also present, the service definition changed
+	// (ports, labels, etc.) and we need to push LDS.
+	headlessOnly := proxy.Type == model.Router && req.Reason.Has(model.HeadlessEndpointUpdate) && !req.Reason.Has(model.ServiceUpdate)
+	sawServiceEntry := false
+
 	for config := range req.ConfigsUpdated {
+		if headlessOnly {
+			if config.Kind == kind.ServiceEntry {
+				// Defer the decision on ServiceEntry until we know whether all updates are ServiceEntry.
+				sawServiceEntry = true
+				continue
+			}
+			// Check if all updates are ServiceEntry (headless endpoint marker); if so, and this is a
+			// headless-only update, none of them need to trigger a push on their own.
+			headlessOnly = false
+		}
 		if !skippedLdsConfigs[proxy.Type].Contains(config.Kind) {
+			if config.Kind == kind.PeerAuthentication && config.Namespace != proxy.ConfigNamespace &&
+				config.Namespace != req.Push.Mesh.RootNamespace {
+				// PeerAuthentication of the configNamespace or rootNamespace can only impact lds
+				continue
+			}
 			return true
 		}
 	}
-	return false
+	// ServiceEntry updates only trigger a push here if they weren't exclusively headless endpoint markers.
+	return sawServiceEntry && !headlessOnly
 }
 
 func (l LdsGenerator) Generate(proxy *model.Proxy, _ *model.WatchedResource, req *model.PushRequest) (model.Resources, model.XdsLogDetails, error) {

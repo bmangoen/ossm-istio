@@ -117,6 +117,20 @@ func TestGetNodeMetaData(t *testing.T) {
 	g.Expect(node.Metadata.Labels[model.LocalityLabel]).To(Equal("region/zone/subzone"))
 }
 
+func TestGetNodeMetaDataSecureMetricsPorts(t *testing.T) {
+	node, err := GetNodeMetaData(MetadataOptions{
+		ID:                           "test",
+		Envs:                         os.Environ(),
+		EnvoySecureMetricsPort:       15091,
+		EnvoySecureMergedMetricsPort: 15092,
+	})
+
+	g := NewWithT(t)
+	g.Expect(err).Should(BeNil())
+	g.Expect(node.Metadata.EnvoySecureMetricsPort).To(Equal(15091))
+	g.Expect(node.Metadata.EnvoySecureMergedMetricsPort).To(Equal(15092))
+}
+
 func TestSetIstioVersion(t *testing.T) {
 	test.SetForTest(t, &version.Info.Version, "binary")
 
@@ -198,5 +212,188 @@ func TestRequiredEnvoyStatsMatcherInclusionRegexes(t *testing.T) {
 	ok, _ := regexp.MatchString(requiredEnvoyStatsMatcherInclusionRegexes, "vhost.default.local:18000.route.routev1.upstream_rq_200")
 	if !ok {
 		t.Fatal("requiredEnvoyStatsMatcherInclusionRegexes doesn't match the route's stat_prefix")
+	}
+}
+
+func TestServiceClusterOrDefault(t *testing.T) {
+	tests := []struct {
+		name     string
+		input    string
+		metadata *model.BootstrapNodeMetadata
+		expected string
+	}{
+		{
+			name:  "non-empty name that is not istio-proxy",
+			input: "my-service",
+			metadata: &model.BootstrapNodeMetadata{
+				NodeMetadata: model.NodeMetadata{
+					Namespace: "default",
+					Labels:    map[string]string{"app": "test"},
+				},
+			},
+			expected: "my-service",
+		},
+		{
+			name:  "app label takes priority over workload name for backward compatibility",
+			input: "",
+			metadata: &model.BootstrapNodeMetadata{
+				NodeMetadata: model.NodeMetadata{
+					Namespace:    "default",
+					WorkloadName: "my-workload",
+					Labels: map[string]string{
+						"app.kubernetes.io/name": "k8s-app",
+						"app":                    "legacy-app",
+					},
+				},
+			},
+			expected: "legacy-app.default",
+		},
+		{
+			name:  "app label takes priority for backward compatibility",
+			input: "",
+			metadata: &model.BootstrapNodeMetadata{
+				NodeMetadata: model.NodeMetadata{
+					Namespace: "default",
+					Labels: map[string]string{
+						"app.kubernetes.io/name": "k8s-app",
+						"app":                    "legacy-app",
+					},
+				},
+			},
+			expected: "legacy-app.default",
+		},
+		{
+			name:  "app.kubernetes.io/name used when app not present",
+			input: "",
+			metadata: &model.BootstrapNodeMetadata{
+				NodeMetadata: model.NodeMetadata{
+					Namespace: "default",
+					Labels: map[string]string{
+						"app.kubernetes.io/name": "k8s-app",
+					},
+				},
+			},
+			expected: "k8s-app.default",
+		},
+		{
+			name:  "empty name with only app label",
+			input: "",
+			metadata: &model.BootstrapNodeMetadata{
+				NodeMetadata: model.NodeMetadata{
+					Namespace: "default",
+					Labels:    map[string]string{"app": "legacy-app"},
+				},
+			},
+			expected: "legacy-app.default",
+		},
+		{
+			name:  "canonical service label used as last fallback when no app labels",
+			input: "",
+			metadata: &model.BootstrapNodeMetadata{
+				NodeMetadata: model.NodeMetadata{
+					Namespace: "default",
+					Labels: map[string]string{
+						model.IstioCanonicalServiceLabelName: "canonical-name",
+					},
+				},
+			},
+			expected: "canonical-name.default",
+		},
+		{
+			name:  "istio-proxy name falls back to labels first then workload name",
+			input: "istio-proxy",
+			metadata: &model.BootstrapNodeMetadata{
+				NodeMetadata: model.NodeMetadata{
+					Namespace:    "default",
+					WorkloadName: "my-workload",
+					Labels:       map[string]string{"app.kubernetes.io/name": "k8s-app"},
+				},
+			},
+			expected: "k8s-app.default",
+		},
+		{
+			name:  "workload name used when no labels present",
+			input: "",
+			metadata: &model.BootstrapNodeMetadata{
+				NodeMetadata: model.NodeMetadata{
+					Namespace:    "default",
+					WorkloadName: "my-workload",
+				},
+			},
+			expected: "my-workload.default",
+		},
+		{
+			name:  "istio-proxy name falls back to labels when no workload name",
+			input: "istio-proxy",
+			metadata: &model.BootstrapNodeMetadata{
+				NodeMetadata: model.NodeMetadata{
+					Namespace: "default",
+					Labels:    map[string]string{"app.kubernetes.io/name": "k8s-app"},
+				},
+			},
+			expected: "k8s-app.default",
+		},
+		{
+			name:  "no labels and no workload name falls back to istio-proxy",
+			input: "",
+			metadata: &model.BootstrapNodeMetadata{
+				NodeMetadata: model.NodeMetadata{
+					Namespace: "default",
+				},
+			},
+			expected: "istio-proxy.default",
+		},
+		{
+			name:  "no namespace returns just istio-proxy",
+			input: "",
+			metadata: &model.BootstrapNodeMetadata{
+				NodeMetadata: model.NodeMetadata{},
+			},
+			expected: "istio-proxy",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := serviceClusterOrDefault(tt.input, tt.metadata)
+			if result != tt.expected {
+				t.Errorf("serviceClusterOrDefault() = %v, want %v", result, tt.expected)
+			}
+		})
+	}
+}
+
+func TestZoneAwareRoutingTemplateParam(t *testing.T) {
+	cases := []struct {
+		name   string
+		envVal string
+		want   bool
+	}{
+		{"disabled", "", false},
+		{"enabled", "true", true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			envs := os.Environ()
+			if tc.envVal != "" {
+				envs = append(envs, "ISTIO_META_ENABLE_SELF_DISCOVERY="+tc.envVal)
+			}
+			node, err := GetNodeMetaData(MetadataOptions{
+				ID:          "sidecar~1.2.3.4~foo~bar",
+				Envs:        envs,
+				ProxyConfig: &v1alpha1.ProxyConfig{},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			params, err := (Config{Node: node}).toTemplateParams()
+			if err != nil {
+				t.Fatal(err)
+			}
+			got, _ := params["enable_self_discovery"].(bool)
+			if got != tc.want {
+				t.Errorf("enable_self_discovery = %v, want %v", got, tc.want)
+			}
+		})
 	}
 }

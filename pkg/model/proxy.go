@@ -25,6 +25,7 @@ import (
 	matcher "github.com/envoyproxy/go-control-plane/envoy/type/matcher/v3"
 	"google.golang.org/protobuf/types/known/structpb"
 
+	apilabel "istio.io/api/label"
 	meshconfig "istio.io/api/mesh/v1alpha1"
 	"istio.io/istio/pilot/pkg/serviceregistry/util/label"
 	networkutil "istio.io/istio/pilot/pkg/util/network"
@@ -283,6 +284,10 @@ type NodeMetadata struct {
 	// Generator indicates the client wants to use a custom Generator plugin.
 	Generator string `json:"GENERATOR,omitempty"`
 
+	// EnableSelfDiscovery indicates that the proxy should configure a local_cluster static cluster
+	// in its bootstrap for zone-aware load balancing. Set via ISTIO_META_ENABLE_SELF_DISCOVERY.
+	EnableSelfDiscovery StringBool `json:"ENABLE_SELF_DISCOVERY,omitempty"`
+
 	// DNSCapture indicates whether the workload has enabled dns capture
 	DNSCapture StringBool `json:"DNS_CAPTURE,omitempty"`
 
@@ -291,8 +296,12 @@ type NodeMetadata struct {
 	// This depends on DNSCapture.
 	DNSAutoAllocate StringBool `json:"DNS_AUTO_ALLOCATE,omitempty"`
 
+	// DNSProxyAddr is the host:port where istio-agent listens for DNS (DNS_PROXY_ADDR). Populated from bootstrap
+	// so Pilot can point Envoy dynamic forward proxy at the same address.
+	DNSProxyAddr string `json:"DNS_PROXY_ADDR,omitempty"`
+
 	// EnableHBONE, if set, will enable generation of HBONE listener config.
-	// Note: this only impacts sidecars; ztunnel and waypoint proxy unconditionally use HBONE.
+	// Note: this only impacts sidecars and gateways; ztunnel and waypoint proxy unconditionally use HBONE.
 	EnableHBONE StringBool `json:"ENABLE_HBONE,omitempty"`
 
 	// DisableHBONESend, will disable sending HBONE.
@@ -329,6 +338,12 @@ type NodeMetadata struct {
 	// Envoy prometheus port redirecting to admin port prometheus endpoint.
 	EnvoyPrometheusPort int `json:"ENVOY_PROMETHEUS_PORT,omitempty"`
 
+	// EnvoySecureMetricsPort, when non-zero, adds an mTLS listener for Envoy-only stats on this port.
+	EnvoySecureMetricsPort int `json:"ENVOY_SECURE_METRICS_PORT,omitempty"`
+
+	// EnvoySecureMergedMetricsPort, when non-zero, adds an mTLS listener for merged metrics (Envoy + app + agent) on this port.
+	EnvoySecureMergedMetricsPort int `json:"ENVOY_SECURE_MERGED_METRICS_PORT,omitempty"`
+
 	// ExitOnZeroActiveConnections terminates Envoy if there are no active connections if set.
 	ExitOnZeroActiveConnections StringBool `json:"EXIT_ON_ZERO_ACTIVE_CONNECTIONS,omitempty"`
 
@@ -344,7 +359,13 @@ type NodeMetadata struct {
 	CloudrunAddr string `json:"CLOUDRUN_ADDR,omitempty"`
 
 	// Metadata discovery service enablement
-	MetadataDiscovery StringBool `json:"METADATA_DISCOVERY,omitempty"`
+	MetadataDiscovery *StringBool `json:"METADATA_DISCOVERY,omitempty"`
+
+	// Envoy command line to option to control deprecates=d logs behavior.
+	EnvoySkipDeprecatedLogs StringBool `json:"ENVOY_SKIP_DEPRECATED_LOGS,omitempty"`
+
+	// Name of the socket file which will be used for workload SDS.
+	WorkloadIdentitySocketFile string `json:"WORKLOAD_IDENTITY_SOCKET_FILE,omitempty"`
 
 	// Contains a copy of the raw metadata. This is needed to lookup arbitrary values.
 	// If a value is known ahead of time it should be added to the struct rather than reading from here,
@@ -412,9 +433,28 @@ const (
 	k8sSeparator = "."
 )
 
-// GetLocalityLabel returns the locality from the supplied label. Because Kubernetes
+// GetLocalityLabel returns the locality label from the labels map.
+// It checks labels in the following priority order
+// 1. topology.istio.io/locality
+// 2. istio-locality (legacy label for backwards compatibility)
+// returns empty string if no locality label is found.
+func GetLocalityLabel(labels map[string]string) string {
+	// "topology.istio.io/locality" take first
+	if loc, ok := labels[apilabel.TopologyLocality.Name]; ok {
+		return loc
+	}
+
+	// check the old label(istio-locality)
+	if loc, ok := labels[LocalityLabel]; ok {
+		return loc
+	}
+
+	return ""
+}
+
+// SanitizeLocalityLabel returns the locality from the supplied label. Because Kubernetes
 // labels don't support `/`, we replace "." with "/" in the supplied label as a workaround.
-func GetLocalityLabel(label string) string {
+func SanitizeLocalityLabel(label string) string {
 	if len(label) > 0 {
 		// if there are /'s present we don't need to replace
 		if strings.Contains(label, "/") {
@@ -484,12 +524,15 @@ const (
 
 	// Ztunnel type is used for node proxies (ztunnel)
 	Ztunnel NodeType = "ztunnel"
+
+	// Agentgateway type is used for Agentgateway
+	Agentgateway NodeType = "agentgateway"
 )
 
 // IsApplicationNodeType verifies that the NodeType is one of the declared constants in the model
 func IsApplicationNodeType(nType NodeType) bool {
 	switch nType {
-	case SidecarProxy, Router, Waypoint, Ztunnel:
+	case SidecarProxy, Router, Waypoint, Ztunnel, Agentgateway:
 		return true
 	default:
 		return false

@@ -181,7 +181,7 @@ func TestGenerator_GenerateHTTP(t *testing.T) {
 			name:       "custom-bad-multiple-providers",
 			meshConfig: meshConfigHTTP,
 			input:      "custom-bad-multiple-providers-in.yaml",
-			want:       []string{"custom-bad-out.yaml"},
+			want:       []string{"custom-bad-multiple-providers-out1.yaml", "custom-bad-multiple-providers-out2.yaml"},
 		},
 		{
 			name:       "custom-bad-invalid-config",
@@ -247,6 +247,11 @@ func TestGenerator_GenerateHTTP(t *testing.T) {
 			tdBundle: trustdomain.NewBundle("new-td", []string{"old-td", "some-trustdomain"}),
 			input:    "td-aliases-source-principal-in.yaml",
 			want:     []string{"td-aliases-source-principal-out.yaml"},
+		},
+		{
+			name:  "trust-domains-field",
+			input: "trust-domains-in.yaml",
+			want:  []string{"trust-domains-out.yaml"},
 		},
 	}
 

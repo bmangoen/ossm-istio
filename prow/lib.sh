@@ -52,7 +52,8 @@ function trace() {
   tracing::run "$1" "${@:2}"
 
   { set +x; } 2>/dev/null
-  elapsed=$(date_cmd +%s.%N --date="$start seconds ago" )
+  end="$(date_cmd -u +%s.%N)"
+  elapsed=$(awk "BEGIN {printf \"%.9f\", $end - $start}")
   log "Command '${1}' complete in ${elapsed}s"
   # Write to YAML file as well for easy reading by tooling
   echo "'${1}': $elapsed" >> "${ARTIFACTS}/trace.yaml"
@@ -115,7 +116,7 @@ function build_images() {
   SELECT_TEST="${1}"
 
   # Build just the images needed for tests
-  targets="docker.pilot docker.proxyv2 "
+  targets="docker.pilot docker.proxyv2 docker.agentgateway "
 
   # use ubuntu:jammy to test vms by default
   nonDistrolessTargets="docker.app docker.app_sidecar_ubuntu_noble docker.ext-authz "
@@ -147,7 +148,7 @@ function setup_kind_registry() {
   if [[ "${running}" != 'true' ]]; then
       docker run \
         -d --restart=always -p "${KIND_REGISTRY_PORT}:5000" --name "${KIND_REGISTRY_NAME}" \
-        gcr.io/istio-testing/registry:2
+        registry.istio.io/testing/registry:2
 
     # Allow kind nodes to reach the registry
     docker network connect "kind" "${KIND_REGISTRY_NAME}"
@@ -156,10 +157,32 @@ function setup_kind_registry() {
   # https://docs.tilt.dev/choosing_clusters.html#discovering-the-registry
   for cluster in $(kind get clusters); do
     # TODO get context/config from existing variables
-    kind export kubeconfig --name="${cluster}"
+    if [[ "${DEVCONTAINER}" ]]; then
+      kind export kubeconfig --name="${cluster}" --internal
+    else
+      kind export kubeconfig --name="${cluster}"
+    fi
     for node in $(kind get nodes --name="${cluster}"); do
-      kubectl annotate node "${node}" "kind.x-k8s.io/registry=localhost:${KIND_REGISTRY_PORT}" --overwrite;
+      docker exec "${node}" mkdir -p "${KIND_REGISTRY_DIR}"
+      cat <<EOF | docker exec -i "${node}" cp /dev/stdin "${KIND_REGISTRY_DIR}/hosts.toml"
+[host."http://${KIND_REGISTRY_NAME}:5000"]
+EOF
+    
+      kubectl annotate node "${node}" "kind.x-k8s.io/registry=kind-registry:${KIND_REGISTRY_PORT}" --overwrite;
     done
+
+    # Document the local registry
+    cat <<EOF | kubectl apply -f -
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: local-registry-hosting
+  namespace: kube-public
+data:
+  localRegistryHosting.v1: |
+    host: "localhost:${KIND_REGISTRY_PORT}"
+    help: "https://kind.sigs.k8s.io/docs/user/local-registry/"
+EOF
   done
 }
 

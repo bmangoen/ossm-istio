@@ -20,12 +20,15 @@ import (
 	accesslog "github.com/envoyproxy/go-control-plane/envoy/config/accesslog/v3"
 	core "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
 	listener "github.com/envoyproxy/go-control-plane/envoy/config/listener/v3"
+	route "github.com/envoyproxy/go-control-plane/envoy/config/route/v3"
 	hcm "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/network/http_connection_manager/v3"
 	tcp "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/network/tcp_proxy/v3"
 	"google.golang.org/protobuf/types/known/durationpb"
 	wrappers "google.golang.org/protobuf/types/known/wrapperspb"
+	"k8s.io/apimachinery/pkg/types"
 
 	extensions "istio.io/api/extensions/v1alpha1"
+	"istio.io/api/label"
 	meshconfig "istio.io/api/mesh/v1alpha1"
 	networking "istio.io/api/networking/v1alpha3"
 	"istio.io/istio/pilot/pkg/features"
@@ -61,7 +64,11 @@ type ListenerBuilder struct {
 	virtualOutboundListener *listener.Listener
 	virtualInboundListener  *listener.Listener
 
-	envoyFilterWrapper *model.EnvoyFilterWrapper
+	envoyFilterWrapper *model.MergedEnvoyFilterWrapper
+
+	// connectionSettings caches the resolved ProxyConfig ConnectionSettings for this proxy,
+	// with EDGE profile defaults applied for Router proxies. Computed once in NewListenerBuilder.
+	connectionSettings *meshconfig.ProxyConfig_ConnectionSettings
 
 	// authnBuilder provides access to authn (mTLS) configuration for the given proxy.
 	authnBuilder *authn.Builder
@@ -79,13 +86,21 @@ type enabledInspector struct {
 
 func NewListenerBuilder(node *model.Proxy, push *model.PushContext) *ListenerBuilder {
 	builder := &ListenerBuilder{
-		node: node,
-		push: push,
+		node:               node,
+		push:               push,
+		connectionSettings: resolveConnectionSettings(node, push),
 	}
 	builder.authnBuilder = authn.NewBuilder(push, node)
 	builder.authzBuilder = authz.NewBuilder(authz.Local, push, node, node.Type == model.Waypoint)
 	builder.authzCustomBuilder = authz.NewBuilder(authz.Custom, push, node, node.Type == model.Waypoint)
 	return builder
+}
+
+func maxConnectionsToAcceptPerSocketEvent() *wrappers.UInt32Value {
+	if features.MaxConnectionsToAcceptPerSocketEvent > 0 {
+		return &wrappers.UInt32Value{Value: uint32(features.MaxConnectionsToAcceptPerSocketEvent)}
+	}
+	return nil
 }
 
 func (lb *ListenerBuilder) appendSidecarInboundListeners() *ListenerBuilder {
@@ -122,17 +137,18 @@ func (lb *ListenerBuilder) buildVirtualOutboundListener() *ListenerBuilder {
 		isTransparentProxy = proto.BoolTrue
 	}
 
-	filterChains := buildOutboundCatchAllNetworkFilterChains(lb.node, lb.push)
+	filterChains := lb.buildOutboundCatchAllNetworkFilterChains()
 
 	actualWildcards, _ := getWildcardsAndLocalHost(lb.node.GetIPMode())
 	// add an extra listener that binds to the port that is the recipient of the iptables redirect
 	ipTablesListener := &listener.Listener{
-		Name:             model.VirtualOutboundListenerName,
-		Address:          util.BuildAddress(actualWildcards[0], uint32(lb.push.Mesh.ProxyListenPort)),
-		Transparent:      isTransparentProxy,
-		UseOriginalDst:   proto.BoolTrue,
-		FilterChains:     filterChains,
-		TrafficDirection: core.TrafficDirection_OUTBOUND,
+		Name:                                 model.VirtualOutboundListenerName,
+		Address:                              util.BuildAddress(actualWildcards[0], uint32(lb.push.Mesh.ProxyListenPort)),
+		Transparent:                          isTransparentProxy,
+		UseOriginalDst:                       proto.BoolTrue,
+		FilterChains:                         filterChains,
+		TrafficDirection:                     core.TrafficDirection_OUTBOUND,
+		MaxConnectionsToAcceptPerSocketEvent: maxConnectionsToAcceptPerSocketEvent(),
 	}
 	// add extra addresses for the listener
 	if features.EnableDualStack && len(actualWildcards) > 1 {
@@ -141,6 +157,11 @@ func (lb *ListenerBuilder) buildVirtualOutboundListener() *ListenerBuilder {
 		// add an additional IPv4 outbound listener for IPv6 only clusters
 		ipv4Wildcards, _ := getWildcardsAndLocalHost(model.IPv4) // get the IPv4 based wildcards
 		ipTablesListener.AdditionalAddresses = util.BuildAdditionalAddresses(ipv4Wildcards[0:], uint32(lb.push.Mesh.ProxyListenPort))
+	}
+
+	if util.IsAllowAnyDynamicDNSOutbound(lb.node) {
+		// HTTP inspector detects plaintext HTTP ALPNs for routing to the DFP chain.
+		ipTablesListener.ListenerFilters = append(ipTablesListener.ListenerFilters, xdsfilters.HTTPInspector)
 	}
 
 	class := model.OutboundListenerClass(lb.node.Type)
@@ -217,10 +238,13 @@ func (lb *ListenerBuilder) getListeners() []*listener.Listener {
 	return listeners
 }
 
+// buildOutboundCatchAllNetworkFiltersOnly builds the fallthrough (DefaultFilterChain) filter stack
+// for per-port outbound listeners. Both ALLOW_ANY and ALLOW_ANY_DYNAMIC_DNS use PassthroughCluster
+// as the fallthrough target; non-HTTP traffic is not eligible for DFP resolution.
 func buildOutboundCatchAllNetworkFiltersOnly(push *model.PushContext, node *model.Proxy) []*listener.Filter {
 	var egressCluster string
 
-	if util.IsAllowAnyOutbound(node) {
+	if util.IsAllowAnyDynamicDNSOutbound(node) || util.IsAllowAnyOutbound(node) {
 		// We need a passthrough filter to fill in the filter stack for orig_dst listener
 		egressCluster = util.PassthroughCluster
 
@@ -266,14 +290,69 @@ func parseDuration(s string) *durationpb.Duration {
 // with TLS blocks and build the appropriate filter chain matches and routes here. And then finally
 // evaluate the left over unmatched TLS traffic using allow_any or registry_only.
 // See https://github.com/istio/istio/issues/21170
-func buildOutboundCatchAllNetworkFilterChains(node *model.Proxy, push *model.PushContext) []*listener.FilterChain {
-	filterStack := buildOutboundCatchAllNetworkFiltersOnly(push, node)
-	chains := make([]*listener.FilterChain, 0, 2)
-	chains = append(chains, blackholeFilterChain(push, node), &listener.FilterChain{
+func (lb *ListenerBuilder) buildOutboundCatchAllNetworkFilterChains() []*listener.FilterChain {
+	node := lb.node
+	push := lb.push
+	chains := []*listener.FilterChain{blackholeFilterChain(push, node)}
+
+	if util.IsAllowAnyDynamicDNSOutbound(node) {
+		// Plaintext HTTP: HTTP inspector detects HTTP traffic → HCM with DFP filter → AllowAnyDynamicDNSCluster.
+		chains = append(chains, lb.buildAllowAnyDynamicDNSHTTPFilterChain())
+	}
+	// Everything else (TLS, plain TCP): PassthroughCluster (or EgressProxy) for ALLOW_ANY/ALLOW_ANY_DYNAMIC_DNS,
+	// BlackHoleCluster for REGISTRY_ONLY.
+	chains = append(chains, &listener.FilterChain{
 		Name:    model.VirtualOutboundCatchAllTCPFilterChainName,
-		Filters: filterStack,
+		Filters: buildOutboundCatchAllNetworkFiltersOnly(push, node),
 	})
+
 	return chains
+}
+
+// buildAllowAnyDynamicDNSHTTPFilterChain builds an HTTP filter chain for the virtual outbound
+// listener that handles plaintext HTTP traffic (detected by the HTTP inspector). The HCM
+// includes the DFP HTTP filter and an inline route config with the allow_any_dynamic_dns
+// catch-all route, so unknown HTTP requests are forwarded via the DFP cluster.
+func (lb *ListenerBuilder) buildAllowAnyDynamicDNSHTTPFilterChain() *listener.FilterChain {
+	ph := util.GetProxyHeaders(lb.node, lb.push, istionetworking.ListenerClassSidecarOutbound)
+	routeConfig := &route.RouteConfiguration{
+		Name:                           util.AllowAnyDynamicDNS,
+		VirtualHosts:                   []*route.VirtualHost{buildCatchAllVirtualHost(lb.node, ph.IncludeRequestAttemptCount, ph.XForwardedHost)},
+		ValidateClusters:               proto.BoolFalse,
+		MaxDirectResponseBodySizeBytes: istio_route.DefaultMaxDirectResponseBodySizeBytes,
+		IgnorePortInHostMatching:       true,
+	}
+	httpOpts := &httpListenerOpts{
+		useRemoteAddress: features.UseRemoteAddress,
+		connectionManager: &hcm.HttpConnectionManager{
+			ServerName:                 ph.ServerName,
+			ServerHeaderTransformation: ph.ServerHeaderTransformation,
+			GenerateRequestId:          ph.GenerateRequestID,
+		},
+		suppressEnvoyDebugHeaders: ph.SuppressDebugHeaders,
+		skipIstioMXHeaders:        ph.SkipIstioMXHeaders,
+		class:                     istionetworking.ListenerClassSidecarOutbound,
+		protocol:                  protocol.HTTP,
+		routeConfig:               routeConfig,
+		statPrefix:                util.DelimitedStatsPrefix("outbound_" + model.VirtualOutboundListenerName + "_allow_any_dynamic_dns"),
+	}
+	if features.HTTP10 || enableHTTP10(lb.node.Metadata.HTTP10) {
+		httpOpts.connectionManager.HttpProtocolOptions = &core.Http1ProtocolOptions{
+			AcceptHttp_10: true,
+		}
+	}
+	connMgr := lb.buildHTTPConnectionManager(httpOpts)
+	hcmFilter := &listener.Filter{
+		Name:       wellknown.HTTPConnectionManager,
+		ConfigType: &listener.Filter_TypedConfig{TypedConfig: protoconv.MessageToAny(connMgr)},
+	}
+	return &listener.FilterChain{
+		Name: model.VirtualOutboundCatchAllTCPFilterChainName + "-http",
+		FilterChainMatch: &listener.FilterChainMatch{
+			ApplicationProtocols: plaintextHTTPALPNs,
+		},
+		Filters: []*listener.Filter{hcmFilter},
+	}
 }
 
 func blackholeFilterChain(push *model.PushContext, node *model.Proxy) *listener.FilterChain {
@@ -310,8 +389,21 @@ func (lb *ListenerBuilder) buildHTTPConnectionManager(httpOpts *httpListenerOpts
 	} else {
 		connectionManager.CodecType = hcm.HttpConnectionManager_AUTO
 	}
+
+	ph := lb.node.Metadata.ProxyConfigOrDefault(lb.push.Mesh.GetDefaultConfig()).GetProxyHeaders()
+
+	// Preserve HTTP/1.x traffic header case
+	if shouldPreserveHeaderCase(lb.node.Metadata, lb.push) {
+		// This value only affects HTTP/1.x traffic
+		if connectionManager.HttpProtocolOptions == nil {
+			connectionManager.HttpProtocolOptions = &core.Http1ProtocolOptions{}
+		}
+		connectionManager.HttpProtocolOptions.HeaderKeyFormat = preserveCaseFormatterConfig.HeaderKeyFormat
+	}
+
 	connectionManager.AccessLog = []*accesslog.AccessLog{}
 	connectionManager.StatPrefix = httpOpts.statPrefix
+	connectionManager.AppendXForwardedPort = ph.GetXForwardedPort().GetEnabled().GetValue()
 
 	// Setup normalization
 	connectionManager.PathWithEscapedSlashesAction = hcm.HttpConnectionManager_KEEP_UNCHANGED
@@ -347,6 +439,11 @@ func (lb *ListenerBuilder) buildHTTPConnectionManager(httpOpts *httpListenerOpts
 
 	connectionManager.StreamIdleTimeout = durationpb.New(0 * time.Second)
 
+	// Apply resolved ConnectionSettings (see resolveConnectionSettings; EDGE defaulting
+	// happens there). Explicit values override MeshConfig path normalization and the
+	// default StreamIdleTimeout above.
+	applyConnectionSettingsToHCM(connectionManager, lb.connectionSettings)
+
 	if httpOpts.rds != "" {
 		rds := &hcm.HttpConnectionManager_Rds{
 			Rds: &hcm.Rds{
@@ -371,23 +468,29 @@ func (lb *ListenerBuilder) buildHTTPConnectionManager(httpOpts *httpListenerOpts
 
 	filters := []*hcm.HttpFilter{}
 	if !httpOpts.isWaypoint {
-		wasm := lb.push.WasmPluginsByListenerInfo(lb.node, model.WasmPluginListenerInfo{
+		trafficExtensions := lb.push.TrafficExtensionsByListenerInfo(lb.node, model.ListenerInfo{
 			Port:  httpOpts.port,
 			Class: httpOpts.class,
-		}, model.WasmPluginTypeHTTP)
+		}, model.FilterChainTypeHTTP)
 
 		// Metadata exchange filter needs to be added before any other HTTP filters are added. This is done to
 		// ensure that mx filter comes before HTTP RBAC filter. This is related to https://github.com/istio/istio/issues/41066
 		filters = appendMxFilter(httpOpts, filters)
 		// TODO: how to deal with ext-authz? It will be in the ordering twice
 		filters = append(filters, lb.authzCustomBuilder.BuildHTTP(httpOpts.class)...)
-		filters = extension.PopAppendHTTP(filters, wasm, extensions.PluginPhase_AUTHN)
+		filters = extension.PopAppendHTTPTrafficExtension(filters, trafficExtensions, extensions.TrafficExtension_AUTHN)
 		filters = append(filters, lb.authnBuilder.BuildHTTP(httpOpts.class)...)
-		filters = extension.PopAppendHTTP(filters, wasm, extensions.PluginPhase_AUTHZ)
+		filters = extension.PopAppendHTTPTrafficExtension(filters, trafficExtensions, extensions.TrafficExtension_AUTHZ)
 		filters = append(filters, lb.authzBuilder.BuildHTTP(httpOpts.class)...)
 		// TODO: these feel like the wrong place to insert, but this retains backwards compatibility with the original implementation
-		filters = extension.PopAppendHTTP(filters, wasm, extensions.PluginPhase_STATS)
-		filters = extension.PopAppendHTTP(filters, wasm, extensions.PluginPhase_UNSPECIFIED_PHASE)
+		filters = extension.PopAppendHTTPTrafficExtension(filters, trafficExtensions, extensions.TrafficExtension_STATS)
+		filters = extension.PopAppendHTTPTrafficExtension(filters, trafficExtensions, extensions.TrafficExtension_UNSPECIFIED)
+		// Add ExtProc per listener only if the Gateway has any inferencePool attached to it
+		if kubeGwName, ok := lb.node.Labels[label.IoK8sNetworkingGatewayGatewayName.Name]; ok {
+			if lb.push.GatewayAPIController.HasInferencePool(types.NamespacedName{Name: kubeGwName, Namespace: lb.node.GetNamespace()}) {
+				filters = append(filters, xdsfilters.InferencePoolExtProc)
+			}
+		}
 	}
 
 	if httpOpts.protocol == protocol.GRPCWeb {
@@ -414,6 +517,33 @@ func (lb *ListenerBuilder) buildHTTPConnectionManager(httpOpts *httpListenerOpts
 	if features.EnablePersistentSessionFilter.Load() && httpOpts.class != istionetworking.ListenerClassSidecarInbound {
 		filters = append(filters, xdsfilters.EmptySessionFilter)
 	}
+
+	// Create DFP filter for wildcard hosts in waypoint inbound for ambient mode
+	if httpOpts.policySvc != nil && httpOpts.policySvc.Hostname.IsWildCarded() && httpOpts.class == istionetworking.ListenerClassSidecarInbound {
+		dfpCacheName := model.BuildDNSCacheName(httpOpts.policySvc.Hostname)
+		filters = append(filters, xdsfilters.BuildWaypointInboundDFPFilter(dfpCacheName, util.SelectDNSLookupFamily(lb.node.IPAddresses)))
+	}
+
+	// Create DFP filter for wildcard hosts in sidecar outbound for DYNAMIC_DNS ServiceEntries
+	if httpOpts.policySvc != nil &&
+		httpOpts.policySvc.Hostname.IsWildCarded() &&
+		httpOpts.policySvc.Resolution == model.DynamicDNS &&
+		httpOpts.class == istionetworking.ListenerClassSidecarOutbound {
+		dfpCacheName := model.BuildDNSCacheName(httpOpts.policySvc.Hostname)
+		filters = append(filters, xdsfilters.BuildSidecarOutboundDynamicForwardProxyFilter(dfpCacheName, util.SelectDNSLookupFamily(lb.node.IPAddresses)))
+	}
+
+	// DFP HTTP filter for ALLOW_ANY_DYNAMIC_DNS mode: enables the DFP cluster to resolve
+	// hostnames from the Host/:authority header. This is required on every sidecar outbound
+	// HCM (not just the virtual outbound catch-all chain) because buildCatchAllVirtualHost
+	// appends the allow_any_dynamic_dns catch-all virtual host -- which routes unknown hosts
+	// to the DFP cluster -- to every per-service outbound HTTP route config as well.
+	if httpOpts.class == istionetworking.ListenerClassSidecarOutbound &&
+		util.IsAllowAnyDynamicDNSOutbound(lb.node) {
+		filters = append(filters, buildAllowAnyDynamicDNSHTTPForwardProxyFilter(lb.node.Metadata))
+	}
+
+	// Router filter must be last
 	filters = append(filters, xdsfilters.BuildRouterFilter(xdsfilters.RouterFilterContext{
 		SuppressDebugHeaders: httpOpts.suppressEnvoyDebugHeaders,
 	}))
@@ -421,9 +551,11 @@ func (lb *ListenerBuilder) buildHTTPConnectionManager(httpOpts *httpListenerOpts
 	connectionManager.HttpFilters = filters
 	connectionManager.RequestIdExtension = requestidextension.BuildUUIDRequestIDExtension(reqIDExtensionCtx)
 
-	// If UseRemoteAddress is set, we must set the internal address config in preparation for envoy
-	// internal addresses defaulting to empty set. Currently, the internal addresses defaulted to
-	// all private IPs but this will change in the future.
+	// If UseRemoteAddress is set, we must set the internal address config to preserve internal headers.
+	// As of Envoy 1.33, the default internalAddressConfig is set to an empty set. In previous versions
+	// the default was all private IPs. To preserve internal headers when useRemoteAddress is set, we must
+	// explicitly set MeshNetworks to configure Envoy's internal_address_config.
+	// MeshNetwork configuration docs can be found here: https://istio.io/latest/docs/reference/config/istio.mesh.v1alpha1/#MeshNetworks
 	if (features.EnableHCMInternalNetworks || httpOpts.useRemoteAddress) && lb.push.Networks != nil {
 		connectionManager.InternalAddressConfig = util.MeshNetworksToEnvoyInternalAddressConfig(lb.push.Networks)
 	}

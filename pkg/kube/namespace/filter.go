@@ -15,16 +15,15 @@
 package namespace
 
 import (
-	"fmt"
 	"sync"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
-	"k8s.io/apimachinery/pkg/selection"
 
 	meshapi "istio.io/api/mesh/v1alpha1"
 	"istio.io/istio/pkg/config/mesh"
+	"istio.io/istio/pkg/config/mesh/labelselector"
 	"istio.io/istio/pkg/kube"
 	"istio.io/istio/pkg/kube/controllers"
 	"istio.io/istio/pkg/kube/kclient"
@@ -36,6 +35,8 @@ import (
 
 type DiscoveryFilter func(obj any) bool
 
+type ManualSyncWaiter func(stop <-chan struct{})
+
 type discoveryNamespacesFilter struct {
 	lock                sync.RWMutex
 	namespaces          kclient.Client[*corev1.Namespace]
@@ -44,19 +45,26 @@ type discoveryNamespacesFilter struct {
 	handlers            []func(added, removed sets.String)
 }
 
-func NewDiscoveryNamespacesFilter(
+func newDiscoveryNamespacesFilter(
 	namespaces kclient.Client[*corev1.Namespace],
 	mesh mesh.Watcher,
 	stop <-chan struct{},
-) kubetypes.DynamicObjectFilter {
+	wait bool,
+) *discoveryNamespacesFilter {
 	// convert LabelSelectors to Selectors
 	f := &discoveryNamespacesFilter{
 		namespaces:          namespaces,
 		discoveryNamespaces: sets.New[string](),
 	}
-	mesh.AddMeshHandler(func() {
+	reg := mesh.AddMeshHandler(func() {
 		f.selectorsChanged(mesh.Mesh().GetDiscoverySelectors(), true)
 	})
+
+	// Clean up mesh handler on stop
+	go func() {
+		<-stop
+		mesh.DeleteMeshHandler(reg)
+	}()
 
 	namespaces.AddEventHandler(controllers.EventHandler[*corev1.Namespace]{
 		AddFunc: func(ns *corev1.Namespace) {
@@ -69,12 +77,12 @@ func NewDiscoveryNamespacesFilter(
 				f.notifyHandlers(sets.New(ns.Name), nil)
 			}
 		},
-		UpdateFunc: func(old, new *corev1.Namespace) {
+		UpdateFunc: func(oldObj, newObj *corev1.Namespace) {
 			f.lock.Lock()
-			membershipChanged, namespaceAdded := f.namespaceUpdatedLocked(old.ObjectMeta, new.ObjectMeta)
+			membershipChanged, namespaceAdded := f.namespaceUpdatedLocked(oldObj.ObjectMeta, newObj.ObjectMeta)
 			f.lock.Unlock()
 			if membershipChanged {
-				added := sets.New(new.Name)
+				added := sets.New(newObj.Name)
 				var removed sets.String
 				if !namespaceAdded {
 					removed = added
@@ -95,9 +103,33 @@ func NewDiscoveryNamespacesFilter(
 	})
 	// Start namespaces and wait for it to be ready now. This is required for subsequent users, so we want to block
 	namespaces.Start(stop)
-	kube.WaitForCacheSync("discovery filter", stop, namespaces.HasSynced)
-	f.selectorsChanged(mesh.Mesh().GetDiscoverySelectors(), false)
+	if wait {
+		kube.WaitForCacheSync("discovery filter", stop, namespaces.HasSynced)
+		f.selectorsChanged(mesh.Mesh().GetDiscoverySelectors(), false)
+	}
 	return f
+}
+
+func NewDiscoveryNamespacesFilter(
+	namespaces kclient.Client[*corev1.Namespace],
+	mesh mesh.Watcher,
+	stop <-chan struct{},
+) kubetypes.DynamicObjectFilter {
+	return newDiscoveryNamespacesFilter(namespaces, mesh, stop, true)
+}
+
+// NewNonBlockingDiscoveryNamespacesFilter creates the filter without blocking to wait on the initial sync.
+// Use the returned ManualSyncWaiter to wait for the initial sync when desired.
+func NewNonBlockingDiscoveryNamespacesFilter(
+	namespaces kclient.Client[*corev1.Namespace],
+	mesh mesh.Watcher,
+	stop <-chan struct{},
+) (kubetypes.DynamicObjectFilter, ManualSyncWaiter) {
+	f := newDiscoveryNamespacesFilter(namespaces, mesh, stop, false)
+	return f, func(stop <-chan struct{}) {
+		kube.WaitForCacheSync("discovery filter", stop, namespaces.HasSynced)
+		f.selectorsChanged(mesh.Mesh().GetDiscoverySelectors(), false)
+	}
 }
 
 func (d *discoveryNamespacesFilter) notifyHandlers(added sets.Set[string], removed sets.String) {
@@ -149,46 +181,6 @@ func extractObjectNamespace(obj any) (string, bool) {
 	return object.GetNamespace(), true
 }
 
-func LabelSelectorAsSelector(ps *meshapi.LabelSelector) (labels.Selector, error) {
-	if ps == nil {
-		return labels.Nothing(), nil
-	}
-	if len(ps.MatchLabels)+len(ps.MatchExpressions) == 0 {
-		return labels.Everything(), nil
-	}
-	requirements := make([]labels.Requirement, 0, len(ps.MatchLabels)+len(ps.MatchExpressions))
-	for k, v := range ps.MatchLabels {
-		r, err := labels.NewRequirement(k, selection.Equals, []string{v})
-		if err != nil {
-			return nil, err
-		}
-		requirements = append(requirements, *r)
-	}
-	for _, expr := range ps.MatchExpressions {
-		var op selection.Operator
-		switch metav1.LabelSelectorOperator(expr.Operator) {
-		case metav1.LabelSelectorOpIn:
-			op = selection.In
-		case metav1.LabelSelectorOpNotIn:
-			op = selection.NotIn
-		case metav1.LabelSelectorOpExists:
-			op = selection.Exists
-		case metav1.LabelSelectorOpDoesNotExist:
-			op = selection.DoesNotExist
-		default:
-			return nil, fmt.Errorf("%q is not a valid label selector operator", expr.Operator)
-		}
-		r, err := labels.NewRequirement(expr.Key, op, append([]string(nil), expr.Values...))
-		if err != nil {
-			return nil, err
-		}
-		requirements = append(requirements, *r)
-	}
-	selector := labels.NewSelector()
-	selector = selector.Add(requirements...)
-	return selector, nil
-}
-
 // SelectorsChanged initializes the discovery filter state with the discovery selectors and selected namespaces
 func (d *discoveryNamespacesFilter) selectorsChanged(
 	discoverySelectors []*meshapi.LabelSelector,
@@ -205,7 +197,7 @@ func (d *discoveryNamespacesFilter) selectorsChanged(
 
 		// convert LabelSelectors to Selectors
 		for _, selector := range discoverySelectors {
-			ls, err := LabelSelectorAsSelector(selector)
+			ls, err := labelselector.LabelSelectorAsSelector(selector)
 			if err != nil {
 				log.Errorf("error initializing discovery namespaces filter, invalid discovery selector: %v", err)
 				return nil, nil

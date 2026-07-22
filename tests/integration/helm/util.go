@@ -1,5 +1,4 @@
 //go:build integ
-// +build integ
 
 // Copyright Istio Authors
 //
@@ -19,13 +18,14 @@ package helm
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"time"
 
+	"github.com/Masterminds/semver/v3"
 	"golang.org/x/sync/errgroup"
+	admissionregistrationv1 "k8s.io/api/admissionregistration/v1"
 	v1 "k8s.io/api/core/v1"
 	kerrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -46,7 +46,6 @@ import (
 	"istio.io/istio/pkg/test/helm"
 	kubetest "istio.io/istio/pkg/test/kube"
 	"istio.io/istio/pkg/test/scopes"
-	"istio.io/istio/pkg/test/shell"
 	"istio.io/istio/pkg/test/util/retry"
 )
 
@@ -163,7 +162,7 @@ spec:
 // ManifestsChartPath is path of local Helm charts used for testing.
 var ManifestsChartPath = filepath.Join(env.IstioSrc, "manifests/charts")
 
-// getValuesOverrides returns the values file created to pass into Helm override default values
+// GetValuesOverrides returns the values file created to pass into Helm override default values
 // for the hub and tag.
 //
 // Tag can be the empty string, which means the values file will not have a
@@ -200,8 +199,6 @@ func GetValuesOverrides(ctx framework.TestContext, hub, tag, variant, revision s
 	// Handle Ambient profile override if set
 	if isAmbient {
 		values["profile"] = "ambient"
-		// Remove revision for ambient profile
-		delete(values, "revision")
 	}
 
 	// Marshal the map to a YAML string
@@ -213,6 +210,54 @@ func GetValuesOverrides(ctx framework.TestContext, hub, tag, variant, revision s
 	overrideValuesFile := filepath.Join(workDir, "values.yaml")
 	if err := os.WriteFile(overrideValuesFile, overrideValues, os.ModePerm); err != nil {
 		ctx.Fatalf("failed to write iop cr file: %v", err)
+	}
+
+	return overrideValuesFile
+}
+
+// GetValuesOverridesWithBase is like GetValuesOverrides but also merges in extra base chart values
+// (e.g. base.validationFailurePolicy).
+func GetValuesOverridesWithBase(ctx framework.TestContext, hub, tag, variant, revision string, isAmbient bool,
+	baseValues map[string]interface{},
+) string {
+	workDir := ctx.CreateTmpDirectoryOrFail("helm")
+
+	values := map[string]interface{}{
+		"global": map[string]interface{}{
+			"hub":     hub,
+			"variant": variant,
+		},
+		"revision": revision,
+	}
+
+	globalValues := values["global"].(map[string]interface{})
+	if tag != "" {
+		globalValues["tag"] = tag
+	}
+
+	if ctx.Settings().OpenShift {
+		globalValues["platform"] = "openshift"
+		values["platform"] = "openshift"
+	} else {
+		globalValues["platform"] = ""
+	}
+
+	if isAmbient {
+		values["profile"] = "ambient"
+	}
+
+	if baseValues != nil {
+		values["base"] = baseValues
+	}
+
+	overrideValues, err := yaml.Marshal(values)
+	if err != nil {
+		ctx.Fatalf("failed to marshal override values to YAML: %v", err)
+	}
+
+	overrideValuesFile := filepath.Join(workDir, "values.yaml")
+	if err := os.WriteFile(overrideValuesFile, overrideValues, os.ModePerm); err != nil {
+		ctx.Fatalf("failed to write values override file: %v", err)
 	}
 
 	return overrideValuesFile
@@ -296,7 +341,37 @@ func InstallIstio(t framework.TestContext, cs cluster.Cluster, h *helm.Helm, ove
 	}
 
 	if installGateway {
-		err = h.InstallChart(IngressReleaseName, gatewayChartPath, nsConfig.Get(IngressReleaseName), gatewayOverrideValuesFile, Timeout, versionArgs)
+		// Why we skip schema validation when installing old gateway charts
+		//
+		// Context:
+		// - With newer Helm versions, validation against values.schema.json is stricter. Older
+		//   gateway chart schemas (the “previous minor” we install from the Helm repo here) have
+		//   additionalProperties=false at the root and do not list newer top-level keys we include
+		//   in our test overrides (e.g., global, revision, profile, _internal_defaults_do_not_set,
+		//   platform). Newer Helm enforces this more strictly, causing the install to fail before
+		//   rendering.
+		// - This is not just a “test-only” mismatch; new Helm + old charts can fail validation in
+		//   some user scenarios as well. Backports are being prepared/applied to the older charts
+		//   to address this at the source.
+		//
+		// Why this is safe (and temporary):
+		// - In this test we only skip schema validation for the legacy gateway install (when
+		//   version != "") to unblock the upgrade flow. We continue to fully validate installs
+		//   and upgrades of the charts under test (master).
+		// - This does not weaken the validation of current charts, and it avoids upgrade test
+		//   failures rooted in old chart schemas plus stricter Helm behavior.
+		// - Once the backported schema fixes are published in the Helm repo for the previous
+		//   minor, we can remove this flag.
+		//
+		// TODO(istio/istio#57507): remove --skip-schema-validation once the gateway chart
+		// for the previous minor has the backported schema updates.
+		gwArgs := versionArgs
+		if version != "" {
+			gwArgs += " --skip-schema-validation"
+		}
+		err = h.InstallChart(
+			IngressReleaseName, gatewayChartPath, nsConfig.Get(IngressReleaseName),
+			gatewayOverrideValuesFile, Timeout, gwArgs)
 		if err != nil {
 			t.Fatalf("failed to install istio %s chart: %v", GatewayChartsDir, err)
 		}
@@ -476,11 +551,19 @@ func VerifyInstallation(ctx framework.TestContext, cs cluster.Cluster, nsConfig 
 func SetRevisionTagWithVersion(ctx framework.TestContext, h *helm.Helm, revision, revisionTag, version string) {
 	scopes.Framework.Infof("=== setting revision tag with version === ")
 	// Prepend ~ to the version, so that we can refer to the latest patch version of a minor version
+	sv, err := semver.NewVersion(version)
+	if err != nil {
+		ctx.Fatalf("failed to parse version %s: %v", version, err)
+	}
+	tagTemplate := "templates/revision-tags.yaml"
+	if sv.Major() == 1 && sv.Minor() >= 28 {
+		tagTemplate = "templates/revision-tags-mwc.yaml"
+	}
 	template, err := h.Template(IstiodReleaseName+"-"+revision, RepoDiscoveryChartPath,
-		IstioNamespace, "templates/revision-tags.yaml", Timeout, "--version", "~"+version, "--repo", ctx.Settings().HelmRepo, "--set",
+		IstioNamespace, tagTemplate, Timeout, "--version", "~"+version, "--repo", ctx.Settings().HelmRepo, "--set",
 		fmt.Sprintf("revision=%s", revision), "--set", fmt.Sprintf("revisionTags={%s}", revisionTag))
 	if err != nil {
-		ctx.Fatalf("failed to install istio %s chart", DiscoveryChartsDir)
+		ctx.Fatalf("failed to template istio %s chart", DiscoveryChartsDir)
 	}
 
 	err = ctx.ConfigIstio().YAML(IstioNamespace, template).Apply()
@@ -494,7 +577,7 @@ func SetRevisionTagWithVersion(ctx framework.TestContext, h *helm.Helm, revision
 func SetRevisionTag(ctx framework.TestContext, h *helm.Helm, fileSuffix, revision, revisionTag, relPath, version string) {
 	scopes.Framework.Infof("=== setting revision tag === ")
 	template, err := h.Template(IstiodReleaseName+"-"+revision, filepath.Join(relPath, version, ControlChartsDir, DiscoveryChartsDir)+fileSuffix,
-		IstioNamespace, "templates/revision-tags.yaml", Timeout, "--set",
+		IstioNamespace, "templates/revision-tags-mwc.yaml", Timeout, "--set",
 		fmt.Sprintf("revision=%s", revision), "--set", fmt.Sprintf("revisionTags={%s}", revisionTag))
 	if err != nil {
 		ctx.Fatalf("failed to install istio %s chart", DiscoveryChartsDir)
@@ -528,6 +611,35 @@ func VerifyValidatingWebhookConfigurations(ctx framework.TestContext, cs cluster
 	scopes.Framework.Infof("=== succeeded ===")
 }
 
+// VerifyValidatingWebhookFailurePolicy verifies that the named validating webhook has the expected failurePolicy.
+func VerifyValidatingWebhookFailurePolicy(ctx framework.TestContext, cs cluster.Cluster, webhookName string,
+	expected admissionregistrationv1.FailurePolicyType,
+) {
+	ctx.Helper()
+	scopes.Framework.Infof("=== verifying failurePolicy on %s === ", webhookName)
+	retry.UntilSuccessOrFail(ctx, func() error {
+		vwc, err := cs.Kube().AdmissionregistrationV1().ValidatingWebhookConfigurations().Get(
+			context.TODO(), webhookName, metav1.GetOptions{})
+		if err != nil {
+			return fmt.Errorf("failed to get ValidatingWebhookConfiguration %s: %v", webhookName, err)
+		}
+		if len(vwc.Webhooks) == 0 {
+			return fmt.Errorf("no webhooks found in ValidatingWebhookConfiguration %s", webhookName)
+		}
+		for _, wh := range vwc.Webhooks {
+			if wh.FailurePolicy == nil {
+				return fmt.Errorf("webhook %s in %s has nil failurePolicy, expected %s", wh.Name, webhookName, expected)
+			}
+			if *wh.FailurePolicy != expected {
+				return fmt.Errorf("webhook %s in %s has failurePolicy %s, expected %s",
+					wh.Name, webhookName, *wh.FailurePolicy, expected)
+			}
+		}
+		scopes.Framework.Infof("=== succeeded ===")
+		return nil
+	}, retry.Timeout(2*time.Minute))
+}
+
 // verifyValidation verifies that Istio resource validation is active on the cluster.
 func verifyValidation(ctx framework.TestContext, revision string) {
 	ctx.Helper()
@@ -551,33 +663,4 @@ func verifyValidation(ctx framework.TestContext, revision string) {
 		rejected := err != nil
 		return rejected
 	})
-}
-
-// TODO BML this relabeling/reannotating is only required if the previous release is =< 1.23,
-// and should be dropped once 1.24 is released.
-func AdoptPre123CRDResourcesIfNeeded() {
-	requiredAdoptionLabels := []string{"app.kubernetes.io/managed-by=Helm"}
-	requiredAdoptionAnnos := []string{"meta.helm.sh/release-name=istio-base", "meta.helm.sh/release-namespace=istio-system"}
-
-	for _, labelToAdd := range requiredAdoptionLabels {
-		// We have wildly inconsistent existing labeling pre-1.24, so have to cover all possible cases.
-		execCmd1 := fmt.Sprintf("kubectl label crds -l chart=istio %v", labelToAdd)
-		execCmd2 := fmt.Sprintf("kubectl label crds -l app.kubernetes.io/part-of=istio %v", labelToAdd)
-		_, err1 := shell.Execute(false, execCmd1)
-		_, err2 := shell.Execute(false, execCmd2)
-		if errors.Join(err1, err2) != nil {
-			scopes.Framework.Infof("couldn't relabel CRDs for Helm adoption: %s. Likely not needed for this release", labelToAdd)
-		}
-	}
-
-	for _, annoToAdd := range requiredAdoptionAnnos {
-		// We have wildly inconsistent existing labeling pre-1.24, so have to cover all possible cases.
-		execCmd1 := fmt.Sprintf("kubectl annotate crds -l chart=istio %v", annoToAdd)
-		execCmd2 := fmt.Sprintf("kubectl annotate crds -l app.kubernetes.io/part-of=istio %v", annoToAdd)
-		_, err1 := shell.Execute(false, execCmd1)
-		_, err2 := shell.Execute(false, execCmd2)
-		if errors.Join(err1, err2) != nil {
-			scopes.Framework.Infof("couldn't reannotate CRDs for Helm adoption: %s. Likely not needed for this release", annoToAdd)
-		}
-	}
 }

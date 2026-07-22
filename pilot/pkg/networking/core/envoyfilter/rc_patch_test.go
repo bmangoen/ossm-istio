@@ -94,6 +94,129 @@ func Test_virtualHostMatch(t *testing.T) {
 			},
 			want: false,
 		},
+		{
+			name: "domain name match",
+			args: args{
+				vh: &route.VirtualHost{
+					Domains: []string{
+						"*.scooby",
+						"*.com",
+					},
+					Name: "scoobydoo",
+				},
+				cp: &model.EnvoyFilterConfigPatchWrapper{
+					Match: &networking.EnvoyFilter_EnvoyConfigObjectMatch{
+						ObjectTypes: &networking.EnvoyFilter_EnvoyConfigObjectMatch_RouteConfiguration{
+							RouteConfiguration: &networking.EnvoyFilter_RouteConfigurationMatch{
+								Vhost: &networking.EnvoyFilter_RouteConfigurationMatch_VirtualHostMatch{
+									DomainName: "*.scooby",
+								},
+							},
+						},
+					},
+				},
+			},
+			want: true,
+		},
+		{
+			name: "vhost name match and domain name match",
+			args: args{
+				vh: &route.VirtualHost{
+					Domains: []string{
+						"*.scooby",
+						"*.com",
+					},
+					Name: "scoobydoo",
+				},
+				cp: &model.EnvoyFilterConfigPatchWrapper{
+					Match: &networking.EnvoyFilter_EnvoyConfigObjectMatch{
+						ObjectTypes: &networking.EnvoyFilter_EnvoyConfigObjectMatch_RouteConfiguration{
+							RouteConfiguration: &networking.EnvoyFilter_RouteConfigurationMatch{
+								Vhost: &networking.EnvoyFilter_RouteConfigurationMatch_VirtualHostMatch{
+									DomainName: "*.scooby",
+									Name:       "scoobydoo",
+								},
+							},
+						},
+					},
+				},
+			},
+			want: true,
+		},
+		{
+			name: "domain name mismatch",
+			args: args{
+				vh: &route.VirtualHost{
+					Domains: []string{
+						"*.scooby",
+						"*.com",
+					},
+					Name: "scoobydoo",
+				},
+				cp: &model.EnvoyFilterConfigPatchWrapper{
+					Match: &networking.EnvoyFilter_EnvoyConfigObjectMatch{
+						ObjectTypes: &networking.EnvoyFilter_EnvoyConfigObjectMatch_RouteConfiguration{
+							RouteConfiguration: &networking.EnvoyFilter_RouteConfigurationMatch{
+								Vhost: &networking.EnvoyFilter_RouteConfigurationMatch_VirtualHostMatch{
+									DomainName: "*.in",
+								},
+							},
+						},
+					},
+				},
+			},
+			want: false,
+		},
+		{
+			name: "vhost name mismatch and domain name match",
+			args: args{
+				vh: &route.VirtualHost{
+					Domains: []string{
+						"*.scooby",
+						"*.com",
+					},
+					Name: "scoobydoo",
+				},
+				cp: &model.EnvoyFilterConfigPatchWrapper{
+					Match: &networking.EnvoyFilter_EnvoyConfigObjectMatch{
+						ObjectTypes: &networking.EnvoyFilter_EnvoyConfigObjectMatch_RouteConfiguration{
+							RouteConfiguration: &networking.EnvoyFilter_RouteConfigurationMatch{
+								Vhost: &networking.EnvoyFilter_RouteConfigurationMatch_VirtualHostMatch{
+									DomainName: "*.scooby",
+									Name:       "scooby",
+								},
+							},
+						},
+					},
+				},
+			},
+			want: false,
+		},
+		{
+			name: "vhost name match but domain name mismatch",
+			args: args{
+				vh: &route.VirtualHost{
+					Domains: []string{
+						"*.scooby",
+						"*.com",
+					},
+					Name: "scoobydoo",
+				},
+				cp: &model.EnvoyFilterConfigPatchWrapper{
+					Match: &networking.EnvoyFilter_EnvoyConfigObjectMatch{
+						ObjectTypes: &networking.EnvoyFilter_EnvoyConfigObjectMatch_RouteConfiguration{
+							RouteConfiguration: &networking.EnvoyFilter_RouteConfigurationMatch{
+								Vhost: &networking.EnvoyFilter_RouteConfigurationMatch_VirtualHostMatch{
+									DomainName: "*.in",
+									Name:       "scoobydoo",
+								},
+							},
+						},
+					},
+				},
+			},
+			want: false,
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -656,7 +779,7 @@ func TestApplyRouteConfigurationPatches(t *testing.T) {
 	}
 
 	serviceDiscovery := memory.NewServiceDiscovery()
-	env := newTestEnvironment(serviceDiscovery, testMesh, buildEnvoyFilterConfigStore(configPatches))
+	env := newTestEnvironment(t, serviceDiscovery, testMesh, buildEnvoyFilterConfigStore(configPatches))
 	push := model.NewPushContext()
 	push.InitContext(env, nil, nil)
 
@@ -807,7 +930,7 @@ func TestReplaceVhost(t *testing.T) {
 	}
 
 	serviceDiscovery := memory.NewServiceDiscovery()
-	env := newTestEnvironment(serviceDiscovery, testMesh, buildEnvoyFilterConfigStore(configPatches))
+	env := newTestEnvironment(t, serviceDiscovery, testMesh, buildEnvoyFilterConfigStore(configPatches))
 	push := model.NewPushContext()
 	push.InitContext(env, nil, nil)
 
@@ -843,6 +966,89 @@ func TestReplaceVhost(t *testing.T) {
 				efw, tt.args.routeConfiguration)
 			if diff := cmp.Diff(tt.want, got, protocmp.Transform()); diff != "" {
 				t.Errorf("ReplaceVhost(): %s mismatch (-want +got):\n%s", tt.name, diff)
+			}
+		})
+	}
+}
+
+// TestMergeAndReplaceListVhost contrasts the list-handling of MERGE (append) and
+// MERGE_AND_REPLACE_LIST (replace) on a virtual host's repeated `domains` field.
+func TestMergeAndReplaceListVhost(t *testing.T) {
+	vhostPatch := func(op networking.EnvoyFilter_Patch_Operation) []*networking.EnvoyFilter_EnvoyConfigObjectPatch {
+		return []*networking.EnvoyFilter_EnvoyConfigObjectPatch{
+			{
+				ApplyTo: networking.EnvoyFilter_VIRTUAL_HOST,
+				Match: &networking.EnvoyFilter_EnvoyConfigObjectMatch{
+					Context: networking.EnvoyFilter_SIDECAR_INBOUND,
+					ObjectTypes: &networking.EnvoyFilter_EnvoyConfigObjectMatch_RouteConfiguration{
+						RouteConfiguration: &networking.EnvoyFilter_RouteConfigurationMatch{
+							Vhost: &networking.EnvoyFilter_RouteConfigurationMatch_VirtualHostMatch{
+								Name: "vhost1",
+							},
+						},
+					},
+				},
+				Patch: &networking.EnvoyFilter_Patch{
+					Operation: op,
+					Value:     buildPatchStruct(`{"domains":["patched.com"]}`),
+				},
+			},
+		}
+	}
+
+	inputRC := func() *route.RouteConfiguration {
+		return &route.RouteConfiguration{
+			Name: "inbound|http|80",
+			VirtualHosts: []*route.VirtualHost{
+				{
+					Name:    "vhost1",
+					Domains: []string{"original.com"},
+				},
+			},
+		}
+	}
+	wantRC := func(domains ...string) *route.RouteConfiguration {
+		return &route.RouteConfiguration{
+			Name: "inbound|http|80",
+			VirtualHosts: []*route.VirtualHost{
+				{
+					Name:    "vhost1",
+					Domains: domains,
+				},
+			},
+		}
+	}
+
+	sidecarNode := &model.Proxy{Type: model.SidecarProxy, ConfigNamespace: "not-default"}
+
+	tests := []struct {
+		name      string
+		operation networking.EnvoyFilter_Patch_Operation
+		want      *route.RouteConfiguration
+	}{
+		{
+			name:      "MERGE appends to domains list",
+			operation: networking.EnvoyFilter_Patch_MERGE,
+			want:      wantRC("original.com", "patched.com"),
+		},
+		{
+			name:      "MERGE_AND_REPLACE_LIST replaces domains list",
+			operation: networking.EnvoyFilter_Patch_MERGE_AND_REPLACE_LIST,
+			want:      wantRC("patched.com"),
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			serviceDiscovery := memory.NewServiceDiscovery()
+			env := newTestEnvironment(t, serviceDiscovery, testMesh, buildEnvoyFilterConfigStore(vhostPatch(tt.operation)))
+			push := model.NewPushContext()
+			push.InitContext(env, nil, nil)
+
+			efw := push.EnvoyFilters(sidecarNode)
+			got := ApplyRouteConfigurationPatches(networking.EnvoyFilter_SIDECAR_INBOUND, sidecarNode, efw, inputRC())
+			if diff := cmp.Diff(tt.want, got, protocmp.Transform()); diff != "" {
+				t.Errorf("%s mismatch (-want +got):\n%s", tt.name, diff)
 			}
 		})
 	}
@@ -920,7 +1126,7 @@ func Test_routeMatch(t *testing.T) {
 			want: true,
 		},
 		{
-			name: "mis match by action",
+			name: "mismatch by action",
 			args: args{
 				httpRoute: &route.Route{
 					Action: &route.Route_Redirect{Redirect: &route.RedirectAction{}},

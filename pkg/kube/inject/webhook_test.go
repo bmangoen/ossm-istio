@@ -24,6 +24,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -47,14 +48,19 @@ import (
 	v1beta12 "istio.io/api/networking/v1beta1"
 	"istio.io/istio/operator/pkg/render"
 	"istio.io/istio/pilot/cmd/pilot-agent/status"
+	"istio.io/istio/pilot/pkg/features"
 	"istio.io/istio/pilot/pkg/model"
 	"istio.io/istio/pilot/test/util"
 	"istio.io/istio/pkg/config"
+	"istio.io/istio/pkg/config/constants"
 	"istio.io/istio/pkg/config/mesh"
+	"istio.io/istio/pkg/config/mesh/meshwatcher"
 	"istio.io/istio/pkg/config/schema/gvk"
+	"istio.io/istio/pkg/kube"
+	"istio.io/istio/pkg/kube/kclient"
+	"istio.io/istio/pkg/kube/multicluster"
 	"istio.io/istio/pkg/monitoring/monitortest"
 	"istio.io/istio/pkg/test"
-	"istio.io/istio/pkg/test/util/file"
 )
 
 const yamlSeparator = "\n---"
@@ -188,6 +194,42 @@ func TestInjectRequired(t *testing.T) {
 				Annotations: map[string]string{annotation.SidecarInject.Name: "false"},
 			},
 			want: false,
+		},
+		{
+			config: &Config{
+				Policy: InjectionPolicyEnabled,
+			},
+			podSpec: podSpec,
+			meta: metav1.ObjectMeta{
+				Name:        "invalid-inject-value-yes",
+				Namespace:   "test-namespace",
+				Annotations: map[string]string{annotation.SidecarInject.Name: "yes"},
+			},
+			want: true,
+		},
+		{
+			config: &Config{
+				Policy: InjectionPolicyDisabled,
+			},
+			podSpec: podSpec,
+			meta: metav1.ObjectMeta{
+				Name:        "invalid-inject-value-on",
+				Namespace:   "test-namespace",
+				Annotations: map[string]string{annotation.SidecarInject.Name: "on"},
+			},
+			want: false,
+		},
+		{
+			config: &Config{
+				Policy: InjectionPolicyEnabled,
+			},
+			podSpec: podSpec,
+			meta: metav1.ObjectMeta{
+				Name:      "invalid-inject-value-random",
+				Namespace: "test-namespace",
+				Labels:    map[string]string{label.SidecarInject.Name: "random"},
+			},
+			want: true,
 		},
 		{
 			config: &Config{
@@ -583,43 +625,9 @@ func objectToPod(t testing.TB, obj runtime.Object) *corev1.Pod {
 	return nil
 }
 
-func readInjectionSettings(t testing.TB, fname string) (*Config, ValuesConfig, *meshconfig.MeshConfig) {
-	values := file.AsStringOrFail(t, filepath.Join("testdata", "inputs", fname+".values.gen.yaml"))
-	template := file.AsBytesOrFail(t, filepath.Join("testdata", "inputs", fname+".template.gen.yaml"))
-	meshc := file.AsStringOrFail(t, filepath.Join("testdata", "inputs", fname+".mesh.gen.yaml"))
-
-	vc, err := NewValuesConfig(values)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	cfg, err := UnmarshalConfig(template)
-	if err != nil {
-		t.Fatalf("failed to unmarshal injectionConfig: %v", err)
-	}
-	meshConfig, err := mesh.ApplyMeshConfig(meshc, mesh.DefaultMeshConfig())
-	if err != nil {
-		t.Fatalf("failed to unmarshal meshconfig: %v", err)
-	}
-
-	return &cfg, vc, meshConfig
-}
-
-func cleanupOldFiles(t testing.TB) {
-	files, err := filepath.Glob(filepath.Join("testdata", "inputs", "*.yaml"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, f := range files {
-		if err := os.Remove(f); err != nil {
-			t.Fatal(err)
-		}
-	}
-}
-
 // loadInjectionSettings will render the charts using the operator, with given yaml overrides.
 // This allows us to fully simulate what will actually happen at run time.
-func writeInjectionSettings(t testing.TB, fname string, setFlags []string, inFilePath string) {
+func getInjectionSettings(t testing.TB, setFlags []string, inFilePath string) (config *Config, valuesConfig ValuesConfig, meshConfig *meshconfig.MeshConfig) {
 	// add --set installPackagePath=<path to charts snapshot>
 	setFlags = append(setFlags, "installPackagePath="+defaultInstallPackageDir(), "profile=empty", "components.pilot.enabled=true")
 	var inFilenames []string
@@ -638,7 +646,7 @@ func writeInjectionSettings(t testing.TB, fname string, setFlags []string, inFil
 				if !ok {
 					t.Fatalf("failed to convert %v", o)
 				}
-				config, ok := data["config"].(string)
+				rawConfig, ok := data["config"].(string)
 				if !ok {
 					t.Fatalf("failed to config %v", data)
 				}
@@ -646,12 +654,18 @@ func writeInjectionSettings(t testing.TB, fname string, setFlags []string, inFil
 				if !ok {
 					t.Fatalf("failed to config %v", data)
 				}
-				if err := os.WriteFile(filepath.Join("testdata", "inputs", fname+".values.gen.yaml"), []byte(vs), 0o644); err != nil {
+				vc, err := NewValuesConfig(vs)
+				if err != nil {
 					t.Fatal(err)
 				}
-				if err := os.WriteFile(filepath.Join("testdata", "inputs", fname+".template.gen.yaml"), []byte(config), 0o644); err != nil {
-					t.Fatal(err)
+				valuesConfig = vc
+
+				cfg, err := UnmarshalConfig([]byte(rawConfig))
+				if err != nil {
+					t.Fatalf("failed to unmarshal injectionConfig: %v", err)
 				}
+
+				config = &cfg
 			} else if o.GetName() == "istio" && o.GetKind() == gvk.ConfigMap.Kind {
 				data, ok := o.Object["data"].(map[string]any)
 				if !ok {
@@ -661,12 +675,15 @@ func writeInjectionSettings(t testing.TB, fname string, setFlags []string, inFil
 				if !ok {
 					t.Fatalf("failed to get meshconfig %v", data)
 				}
-				if err := os.WriteFile(filepath.Join("testdata", "inputs", fname+".mesh.gen.yaml"), []byte(meshdata), 0o644); err != nil {
-					t.Fatal(err)
+				mcfg, err := mesh.ApplyMeshConfig(meshdata, mesh.DefaultMeshConfig())
+				if err != nil {
+					t.Fatalf("failed to unmarshal meshconfig: %v", err)
 				}
+				meshConfig = mcfg
 			}
 		}
 	}
+	return config, valuesConfig, meshConfig
 }
 
 func splitYamlFile(yamlFile string, t *testing.T) [][]byte {
@@ -871,7 +888,7 @@ func createWebhook(t testing.TB, cfg *Config, pcResources int) *Webhook {
 	if err != nil {
 		t.Fatalf("Could not marshal test injection config: %v", err)
 	}
-	_, values, _ := readInjectionSettings(t, "default")
+	_, values, _ := getInjectionSettings(t, nil, "")
 	var (
 		configFile = filepath.Join(dir, "config-file.yaml")
 		valuesFile = filepath.Join(dir, "values-file.yaml")
@@ -899,7 +916,7 @@ func createWebhook(t testing.TB, cfg *Config, pcResources int) *Webhook {
 	}
 	pcs := model.GetProxyConfigs(store, m)
 	env := model.Environment{
-		Watcher:     mesh.NewFixedWatcher(m),
+		Watcher:     meshwatcher.NewTestWatcher(m),
 		ConfigStore: store,
 	}
 	env.SetPushContext(&model.PushContext{
@@ -909,11 +926,13 @@ func createWebhook(t testing.TB, cfg *Config, pcResources int) *Webhook {
 	if err != nil {
 		t.Fatalf("NewFileWatcher() failed: %v", err)
 	}
+
 	wh, err := NewWebhook(WebhookParameters{
-		Watcher: watcher,
-		Port:    port,
-		Env:     &env,
-		Mux:     http.NewServeMux(),
+		Watcher:      watcher,
+		Port:         port,
+		Env:          &env,
+		Mux:          http.NewServeMux(),
+		MultiCluster: multicluster.NewFakeController(),
 	})
 	if err != nil {
 		t.Fatalf("NewWebhook() failed: %v", err)
@@ -922,9 +941,14 @@ func createWebhook(t testing.TB, cfg *Config, pcResources int) *Webhook {
 }
 
 func TestRunAndServe(t *testing.T) {
+	multi := multicluster.NewFakeController()
+	client := kube.NewFakeClient()
+	stop := test.NewStop(t)
+	multi.Add(constants.DefaultClusterName, client, stop)
+	client.RunAndWait(stop)
 	// TODO: adjust the test to match prod defaults instead of fake defaults.
 	wh := createWebhook(t, minimalSidecarTemplate, 0)
-	stop := make(chan struct{})
+	stop = make(chan struct{})
 	defer func() { close(stop) }()
 	wh.Run(stop)
 
@@ -1037,7 +1061,7 @@ func testSideCarInjectorMetrics(mt *monitortest.MetricsTest) {
 }
 
 func benchmarkInjectServe(pcs int, b *testing.B) {
-	sidecarTemplate, _, _ := readInjectionSettings(b, "default")
+	sidecarTemplate, _, _ := getInjectionSettings(b, nil, "")
 	wh := createWebhook(b, sidecarTemplate, pcs)
 
 	stop := make(chan struct{})
@@ -1273,6 +1297,36 @@ func TestMergeOrAppendProbers(t *testing.T) {
 				},
 			},
 		},
+		{
+			// this is to test previously injected without probe rewrites
+			name:               "Merge Prober with absent of KubeAppProberEnv",
+			perviouslyInjected: true,
+			in: []corev1.EnvVar{
+				{
+					Name:  "TEST_ENV_VAR1",
+					Value: "value1",
+				},
+				{
+					Name:  "TEST_ENV_VAR2",
+					Value: "value2",
+				},
+			},
+			probers: `{"/app-health/bar/livez":{"httpGet":{"path":"/","port":9000,"scheme":"HTTP"}}}`,
+			want: []corev1.EnvVar{
+				{
+					Name:  "TEST_ENV_VAR1",
+					Value: "value1",
+				},
+				{
+					Name:  "TEST_ENV_VAR2",
+					Value: "value2",
+				},
+				{
+					Name:  status.KubeAppProberEnvName,
+					Value: `{"/app-health/bar/livez":{"httpGet":{"path":"/","port":9000,"scheme":"HTTP"}}}`,
+				},
+			},
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -1376,4 +1430,431 @@ func defaultInstallPackageDir() string {
 		panic(err)
 	}
 	return filepath.Join(wd, "../../../manifests/")
+}
+
+func TestNewWebhookConfigParsingError(t *testing.T) {
+	// Create a watcher that returns valid sidecarConfig but invalid valuesConfig
+	faultyWatcher := &FaultyWatcher{
+		sidecarConfig: &Config{},
+		valuesConfig:  "invalid: values: config",
+	}
+
+	whParams := WebhookParameters{
+		Watcher:      faultyWatcher,
+		Port:         0,
+		Env:          &model.Environment{},
+		Mux:          http.NewServeMux(),
+		MultiCluster: multicluster.NewFakeController(),
+	}
+
+	_, err := NewWebhook(whParams)
+	if err == nil || !strings.Contains(err.Error(), "failed to process webhook config") {
+		t.Fatalf("Expected error when creating webhook with faulty valuesConfig, but got: %v", err)
+	}
+}
+
+// FaultyWatcher is a mock Watcher that returns predefined sidecarConfig and valuesConfig
+type FaultyWatcher struct {
+	sidecarConfig *Config
+	valuesConfig  string
+}
+
+func (fw *FaultyWatcher) Run(stop <-chan struct{}) {}
+
+func (fw *FaultyWatcher) Get() (*Config, string, error) {
+	return fw.sidecarConfig, fw.valuesConfig, nil
+}
+
+func (fw *FaultyWatcher) SetHandler(handler func(*Config, string) error) {}
+
+func TestNewWebhookConfigParsingSuccess(t *testing.T) {
+	// Create a watcher that returns valid sidecarConfig and valid valuesConfig
+	validValuesConfig := `
+global:
+  proxy:
+    image: proxyv2
+`
+	faultyWatcher := &FaultyWatcher{
+		sidecarConfig: &Config{},
+		valuesConfig:  validValuesConfig,
+	}
+
+	whParams := WebhookParameters{
+		Watcher: faultyWatcher,
+		Port:    0,
+		Env: &model.Environment{
+			Watcher: meshwatcher.NewTestWatcher(&meshconfig.MeshConfig{}),
+		},
+		Mux:          http.NewServeMux(),
+		MultiCluster: multicluster.NewFakeController(),
+	}
+
+	wh, err := NewWebhook(whParams)
+	if err != nil {
+		t.Fatalf("Expected no error when creating webhook with valid valuesConfig, but got: %v", err)
+	}
+
+	if wh.valuesConfig.raw != validValuesConfig {
+		t.Fatalf("Expected valuesConfig to be set correctly, but got: %v", wh.valuesConfig.raw)
+	}
+}
+
+func TestDetectNativeSidecar(t *testing.T) {
+	cases := []struct {
+		name  string
+		setup func(t test.Failer)
+		nodes []*corev1.Node
+		want  bool
+	}{
+		{
+			name: "env disabled should be always disabled",
+			nodes: []*corev1.Node{
+				{Status: corev1.NodeStatus{NodeInfo: corev1.NodeSystemInfo{KubeletVersion: "1.33.0"}}},
+				{Status: corev1.NodeStatus{NodeInfo: corev1.NodeSystemInfo{KubeletVersion: "1.34.0"}}},
+			},
+			setup: func(t test.Failer) {
+				test.SetForTest(t, &features.EnableNativeSidecars, features.NativeSidecarModeDisabled)
+			},
+			want: false,
+		},
+		{
+			name: "kube versions greater than 1.33 with env auto should enable native sidecar",
+			nodes: []*corev1.Node{
+				{Status: corev1.NodeStatus{NodeInfo: corev1.NodeSystemInfo{KubeletVersion: "1.33.0"}}},
+				{Status: corev1.NodeStatus{NodeInfo: corev1.NodeSystemInfo{KubeletVersion: "1.34.0"}}},
+			},
+			setup: func(t test.Failer) {
+				test.SetForTest(t, &features.EnableNativeSidecars, features.NativeSidecarModeAuto)
+			},
+			want: true,
+		},
+		{
+			name: "kube versions less than 1.33 with env auto should disable native sidecar",
+			nodes: []*corev1.Node{
+				{Status: corev1.NodeStatus{NodeInfo: corev1.NodeSystemInfo{KubeletVersion: "1.28.0"}}},
+				{Status: corev1.NodeStatus{NodeInfo: corev1.NodeSystemInfo{KubeletVersion: "1.29.0"}}},
+			},
+			setup: func(t test.Failer) {
+				test.SetForTest(t, &features.EnableNativeSidecars, features.NativeSidecarModeAuto)
+			},
+			want: false,
+		},
+		{
+			name: "clusters with at least one node on unsupported version should disable native sidecar",
+			nodes: []*corev1.Node{
+				{Status: corev1.NodeStatus{NodeInfo: corev1.NodeSystemInfo{KubeletVersion: "1.33.0"}}},
+				{Status: corev1.NodeStatus{NodeInfo: corev1.NodeSystemInfo{KubeletVersion: "1.28.0"}}},
+			},
+			setup: func(t test.Failer) {
+				test.SetForTest(t, &features.EnableNativeSidecars, features.NativeSidecarModeAuto)
+			},
+			want: false,
+		},
+		{
+			name:  "no nodes should disable native sidecar",
+			nodes: []*corev1.Node{{}},
+			setup: func(t test.Failer) {
+				test.SetForTest(t, &features.EnableNativeSidecars, features.NativeSidecarModeAuto)
+			},
+			want: false,
+		},
+		{
+			name: "clusters with at least one node on unsupported version should enable native sidecar if explicitly enabled",
+			nodes: []*corev1.Node{
+				{Status: corev1.NodeStatus{NodeInfo: corev1.NodeSystemInfo{KubeletVersion: "1.33.0"}}},
+				{Status: corev1.NodeStatus{NodeInfo: corev1.NodeSystemInfo{KubeletVersion: "1.28.0"}}},
+			},
+			setup: func(t test.Failer) {
+				test.SetForTest(t, &features.EnableNativeSidecars, features.NativeSidecarModeEnabled)
+			},
+			want: true,
+		},
+	}
+
+	for _, tt := range cases {
+		t.Run(tt.name, func(t *testing.T) {
+			tt.setup(t)
+			var objects []runtime.Object
+			for i, n := range tt.nodes {
+				nodeCopy := n.DeepCopy()
+				nodeCopy.Name = fmt.Sprintf("node-%d", i+1)
+				objects = append(objects, nodeCopy)
+			}
+			kubeClient := kube.NewFakeClient(objects...)
+			nodes := kclient.New[*corev1.Node](kubeClient)
+			kubeClient.RunAndWait(test.NewStop(t))
+			kube.WaitForCacheSync("test", test.NewStop(t), nodes.HasSynced)
+
+			if got := DetectNativeSidecar(nodes, ""); got != tt.want {
+				t.Errorf("detectNativeSidecar() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestGetPrometheusScrapeConfigurationMultiTarget(t *testing.T) {
+	cases := []struct {
+		name        string
+		annotations map[string]string
+		wantPort    string
+		wantPath    string
+		wantTargets []status.ScrapeTarget
+	}{
+		{
+			name: "scrape-targets only",
+			annotations: map[string]string{
+				"prometheus.istio.io/scrape-targets": "8080:/metrics,9100:/custom",
+			},
+			wantTargets: []status.ScrapeTarget{
+				{Port: "8080", Path: "/metrics"},
+				{Port: "9100", Path: "/custom"},
+			},
+		},
+		{
+			name: "scrape-targets with legacy port annotation",
+			annotations: map[string]string{
+				"prometheus.io/port":                 "8080",
+				"prometheus.io/path":                 "/metrics",
+				"prometheus.istio.io/scrape-targets": "8080:/metrics,9100:/custom",
+			},
+			wantPort: "8080",
+			wantPath: "/metrics",
+			wantTargets: []status.ScrapeTarget{
+				{Port: "8080", Path: "/metrics"},
+				{Port: "9100", Path: "/custom"},
+			},
+		},
+		{
+			name: "legacy only, no targets",
+			annotations: map[string]string{
+				"prometheus.io/port": "8080",
+				"prometheus.io/path": "/health",
+			},
+			wantPort:    "8080",
+			wantPath:    "/health",
+			wantTargets: nil,
+		},
+		{
+			name: "whitespace trimmed in scrape-targets",
+			annotations: map[string]string{
+				"prometheus.istio.io/scrape-targets": " 8080:/metrics , 9100:/custom ",
+			},
+			wantTargets: []status.ScrapeTarget{
+				{Port: "8080", Path: "/metrics"},
+				{Port: "9100", Path: "/custom"},
+			},
+		},
+		{
+			name: "malformed scrape-targets is logged and Targets left nil",
+			annotations: map[string]string{
+				"prometheus.istio.io/scrape-targets": ":/metrics",
+			},
+			wantTargets: nil,
+		},
+	}
+	for _, tt := range cases {
+		t.Run(tt.name, func(t *testing.T) {
+			pod := &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Annotations: tt.annotations,
+				},
+			}
+			got := getPrometheusScrapeConfiguration(pod)
+			if got.Port != tt.wantPort {
+				t.Errorf("Port = %q, want %q", got.Port, tt.wantPort)
+			}
+			if got.Path != tt.wantPath {
+				t.Errorf("Path = %q, want %q", got.Path, tt.wantPath)
+			}
+			if !reflect.DeepEqual(got.Targets, tt.wantTargets) {
+				t.Errorf("Targets = %v, want %v", got.Targets, tt.wantTargets)
+			}
+		})
+	}
+}
+
+// TestApplyPrometheusMergeScrapeTargets covers the two webhook-side changes for
+// multi-port metrics merging: rejecting reserved Istio ports and stripping the
+// new prometheus.istio.io/scrape-targets annotation from the injected pod.
+func TestApplyPrometheusMergeScrapeTargets(t *testing.T) {
+	meshCfg := mesh.DefaultMeshConfig()
+	meshCfg.EnablePrometheusMerge = &wrapperspb.BoolValue{Value: true}
+
+	newPod := func(ann map[string]string) *corev1.Pod {
+		return &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{Annotations: ann},
+			Spec: corev1.PodSpec{
+				Containers: []corev1.Container{
+					{Name: "app"},
+					{Name: "istio-proxy"},
+				},
+			},
+		}
+	}
+
+	t.Run("reserved port rejected at injection time", func(t *testing.T) {
+		pod := newPod(map[string]string{
+			"prometheus.io/scrape":               "true",
+			"prometheus.istio.io/scrape-targets": "8080:/metrics,15000:/metrics",
+		})
+		err := applyPrometheusMerge(pod, meshCfg)
+		if err == nil {
+			t.Fatal("expected error for reserved port 15000, got nil")
+		}
+		if !strings.Contains(err.Error(), "15000") || !strings.Contains(err.Error(), "reserved for Istio") {
+			t.Errorf("error = %v, want one mentioning port 15000 and Istio-reserved", err)
+		}
+	})
+
+	t.Run("agent port rejected independently of reserved check", func(t *testing.T) {
+		pod := newPod(map[string]string{
+			"prometheus.io/scrape":               "true",
+			"prometheus.istio.io/scrape-targets": "15020:/metrics",
+		})
+		err := applyPrometheusMerge(pod, meshCfg)
+		if err == nil {
+			t.Fatal("expected error for target == agent port, got nil")
+		}
+	})
+
+	t.Run("legacy port equal to agent port triggers no-op via early-return guard", func(t *testing.T) {
+		// When prometheus.io/port already points at the agent (15020), applyPrometheusMerge treats
+		// the pod as already-injected and returns nil without rewriting annotations. This is the
+		// existing re-injection guard; no error is expected or desired.
+		agentPort := strconv.Itoa(int(meshCfg.GetDefaultConfig().GetStatusPort()))
+		pod := newPod(map[string]string{
+			"prometheus.io/scrape": "true",
+			"prometheus.io/port":   agentPort,
+		})
+		err := applyPrometheusMerge(pod, meshCfg)
+		if err != nil {
+			t.Fatalf("expected nil (no-op early return), got %v", err)
+		}
+		// Pod annotations must NOT be rewritten by the merge.
+		if got := pod.Annotations["prometheus.io/port"]; got != agentPort {
+			t.Errorf("prometheus.io/port = %q, want %q (unchanged)", got, agentPort)
+		}
+	})
+
+	t.Run("legacy reserved port rejected at injection time", func(t *testing.T) {
+		pod := newPod(map[string]string{
+			"prometheus.io/scrape": "true",
+			"prometheus.io/port":   "15000",
+		})
+		err := applyPrometheusMerge(pod, meshCfg)
+		if err == nil {
+			t.Fatal("expected error for reserved port 15000 in legacy annotation, got nil")
+		}
+		if !strings.Contains(err.Error(), "15000") || !strings.Contains(err.Error(), "reserved for Istio") {
+			t.Errorf("error = %v, want one mentioning port 15000 and Istio-reserved", err)
+		}
+	})
+
+	t.Run("happy path strips prometheus.istio.io/scrape-targets annotation", func(t *testing.T) {
+		pod := newPod(map[string]string{
+			"prometheus.io/scrape":               "true",
+			"prometheus.istio.io/scrape-targets": "8080:/metrics,9100:/custom",
+		})
+		if err := applyPrometheusMerge(pod, meshCfg); err != nil {
+			t.Fatalf("applyPrometheusMerge returned %v, want nil", err)
+		}
+		if _, ok := pod.Annotations["prometheus.istio.io/scrape-targets"]; ok {
+			t.Error("prometheus.istio.io/scrape-targets must be stripped after injection, but is still present")
+		}
+		// Legacy annotations must be rewritten to point at the agent.
+		if got := pod.Annotations["prometheus.io/port"]; got != strconv.Itoa(int(meshCfg.GetDefaultConfig().GetStatusPort())) {
+			t.Errorf("prometheus.io/port = %q, want agent status port", got)
+		}
+		if got := pod.Annotations["prometheus.io/path"]; got != "/stats/prometheus" {
+			t.Errorf("prometheus.io/path = %q, want /stats/prometheus", got)
+		}
+	})
+}
+
+// TestApplySecurePrometheusAnnotation verifies that applySecurePrometheusAnnotation
+// automatically sets "prometheus.istio.io/secure-port" when ENVOY_SECURE_MERGED_METRICS_PORT
+// is present on the istio-proxy container.
+func TestApplySecurePrometheusAnnotation(t *testing.T) {
+	newPod := func(proxyEnv []corev1.EnvVar, existingAnnotations map[string]string) *corev1.Pod {
+		pod := &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{Annotations: existingAnnotations},
+			Spec: corev1.PodSpec{
+				Containers: []corev1.Container{
+					{Name: "app"},
+					{Name: "istio-proxy", Env: proxyEnv},
+				},
+			},
+		}
+		if pod.Annotations == nil {
+			pod.Annotations = map[string]string{}
+		}
+		return pod
+	}
+
+	t.Run("sidecar: auto-annotates from ENVOY_SECURE_MERGED_METRICS_PORT", func(t *testing.T) {
+		pod := newPod([]corev1.EnvVar{
+			{Name: "ENVOY_SECURE_METRICS_PORT", Value: "15091"},
+			{Name: "ENVOY_SECURE_MERGED_METRICS_PORT", Value: "15092"},
+		}, nil)
+		applySecurePrometheusAnnotation(pod)
+		if got := pod.Annotations["prometheus.istio.io/secure-port"]; got != "15092" {
+			t.Errorf("prometheus.istio.io/secure-port = %q, want 15092", got)
+		}
+	})
+
+	t.Run("gateway: direct env var is picked up (no proxyMetadata annotation needed)", func(t *testing.T) {
+		// Simulates a gateway pod where env is set directly on the container.
+		pod := newPod([]corev1.EnvVar{
+			{Name: "ENVOY_SECURE_MERGED_METRICS_PORT", Value: "15092"},
+		}, nil)
+		applySecurePrometheusAnnotation(pod)
+		if got := pod.Annotations["prometheus.istio.io/secure-port"]; got != "15092" {
+			t.Errorf("prometheus.istio.io/secure-port = %q, want 15092", got)
+		}
+	})
+
+	t.Run("user-set annotation is not overwritten", func(t *testing.T) {
+		pod := newPod([]corev1.EnvVar{
+			{Name: "ENVOY_SECURE_MERGED_METRICS_PORT", Value: "15092"},
+		}, map[string]string{
+			"prometheus.istio.io/secure-port": "19999",
+		})
+		applySecurePrometheusAnnotation(pod)
+		if got := pod.Annotations["prometheus.istio.io/secure-port"]; got != "19999" {
+			t.Errorf("user annotation overwritten: got %q, want 19999", got)
+		}
+	})
+
+	t.Run("disabled (port=0) does not annotate", func(t *testing.T) {
+		pod := newPod([]corev1.EnvVar{
+			{Name: "ENVOY_SECURE_MERGED_METRICS_PORT", Value: "0"},
+		}, nil)
+		applySecurePrometheusAnnotation(pod)
+		if _, ok := pod.Annotations["prometheus.istio.io/secure-port"]; ok {
+			t.Error("expected no annotation when port is 0, but one was set")
+		}
+	})
+
+	t.Run("no env var: no annotation", func(t *testing.T) {
+		pod := newPod([]corev1.EnvVar{
+			{Name: "SOME_OTHER_VAR", Value: "value"},
+		}, nil)
+		applySecurePrometheusAnnotation(pod)
+		if _, ok := pod.Annotations["prometheus.istio.io/secure-port"]; ok {
+			t.Error("expected no annotation when ENVOY_SECURE_MERGED_METRICS_PORT is absent")
+		}
+	})
+
+	t.Run("no istio-proxy container: no annotation", func(t *testing.T) {
+		pod := &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{Annotations: map[string]string{}},
+			Spec: corev1.PodSpec{
+				Containers: []corev1.Container{{Name: "app"}},
+			},
+		}
+		applySecurePrometheusAnnotation(pod)
+		if _, ok := pod.Annotations["prometheus.istio.io/secure-port"]; ok {
+			t.Error("expected no annotation without istio-proxy container")
+		}
+	})
 }

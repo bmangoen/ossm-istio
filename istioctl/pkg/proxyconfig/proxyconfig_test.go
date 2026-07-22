@@ -16,10 +16,17 @@ package proxyconfig
 
 import (
 	"bytes"
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/pem"
 	"fmt"
+	"math/big"
 	"net/http"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/spf13/cobra"
 	"k8s.io/cli-runtime/pkg/resource"
@@ -207,6 +214,25 @@ func verifyExecTestOutput(t *testing.T, cmd *cobra.Command, c execTestCase) {
 	}
 }
 
+func TestPrintProxyConfigSummaryWithHeaders(t *testing.T) {
+	cmd := ProxyConfig(cli.NewFakeContext(&cli.NewFakeContextOption{
+		Namespace: "default",
+	}))
+	cmd.SetArgs([]string{
+		"all",
+		"-f", "testdata/config_dump.json",
+		"--with-headers",
+	})
+	out := bytes.Buffer{}
+	cmd.SetOut(&out)
+	assert.NoError(t, cmd.Execute())
+	expected := util.ReadFile(t, "testdata/config_dump_summary_withheaders.txt")
+
+	if err := assert.Compare(out.String(), string(expected)); err != nil {
+		t.Fatalf("Unexpected output for 'istioctl proxy-config all --with-headers'\n got: %q\nwant: %q", out.String(), expected)
+	}
+}
+
 func TestPrintProxyConfigSummary(t *testing.T) {
 	cmd := ProxyConfig(cli.NewFakeContext(&cli.NewFakeContextOption{
 		Namespace: "default",
@@ -225,6 +251,88 @@ func TestPrintProxyConfigSummary(t *testing.T) {
 	}
 }
 
+func TestMatchRootCACerts(t *testing.T) {
+	certA, _ := createTestCertificate("A")
+	certB, _ := createTestCertificate("B")
+
+	pemCertA := createPEMCert(certA)
+	pemCertB := createPEMCert(certB)
+
+	pemCertAPlusB := append(pemCertA, pemCertB...)
+
+	tests := []struct {
+		name           string
+		rootCAPod1Data []byte
+		rootCAPod2Data []byte
+		expectedMatch  bool
+		expectedError  string
+	}{
+		{
+			name:           "Matching Certificates - both rootCA identical",
+			rootCAPod1Data: pemCertA,
+			rootCAPod2Data: pemCertA,
+			expectedMatch:  true,
+		},
+		{
+			name:           "Non-Matching Certificates",
+			rootCAPod1Data: pemCertA,
+			rootCAPod2Data: pemCertB,
+			expectedMatch:  false,
+		},
+		{
+			name:           "Subset of Certificates",
+			rootCAPod1Data: pemCertAPlusB,
+			rootCAPod2Data: pemCertB,
+			expectedMatch:  true,
+		},
+		{
+			name:           "Invalid Certificate Data",
+			rootCAPod1Data: []byte("invalid data"),
+			rootCAPod2Data: pemCertA,
+			expectedMatch:  false,
+			expectedError:  "failed to parse certificates: invalid data",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			match, err := checkRootCACertMatchExist(tt.rootCAPod1Data, tt.rootCAPod2Data)
+
+			if tt.expectedError != "" {
+				if err == nil || tt.expectedError != err.Error() {
+					t.Errorf("expected error: %v, got: %v", tt.expectedError, err)
+				}
+			}
+
+			if match != tt.expectedMatch {
+				t.Errorf("expected match: %v, got: %v", tt.expectedMatch, match)
+			}
+		})
+	}
+}
+
+// Helper functions to create test certificates
+func createPEMCert(cert *x509.Certificate) []byte {
+	pemBlock := &pem.Block{
+		Type:  "CERTIFICATE",
+		Bytes: cert.Raw,
+	}
+	return pem.EncodeToMemory(pemBlock)
+}
+
+func createTestCertificate(commonName string) (*x509.Certificate, error) {
+	template := &x509.Certificate{
+		SerialNumber: big.NewInt(1),
+		Subject:      pkix.Name{CommonName: commonName},
+		NotBefore:    time.Now(),
+		NotAfter:     time.Now().AddDate(1, 0, 0),
+		KeyUsage:     x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature,
+	}
+	privKey, _ := rsa.GenerateKey(rand.Reader, 2048)
+	certBytes, _ := x509.CreateCertificate(rand.Reader, template, template, &privKey.PublicKey, privKey)
+	return x509.ParseCertificate(certBytes)
+}
+
 func init() {
 	cli.MakeKubeFactory = func(k kube.CLIClient) cmdutil.Factory {
 		tf := cmdtesting.NewTestFactory()
@@ -239,5 +347,111 @@ func init() {
 			},
 		}
 		return tf
+	}
+}
+
+func TestWriteMulticlusterStatus(t *testing.T) {
+	tests := []struct {
+		name              string
+		input             map[string][]byte
+		istiodRevisionMap map[string]string
+		expectedOutput    string
+		expectError       bool
+	}{
+		{
+			name: "single cluster with revision",
+			input: map[string][]byte{
+				"istiod-6d8f97c8d9-abc123": []byte(`[{"id":"cluster-1","secretName":"cluster-1-secret","syncStatus":"SYNCED"}]`),
+			},
+			istiodRevisionMap: map[string]string{
+				"istiod-6d8f97c8d9-abc123": "default",
+			},
+			expectedOutput: "NAME          SECRET               STATUS     ISTIOD                       REVISION\n" +
+				"cluster-1     cluster-1-secret     SYNCED     istiod-6d8f97c8d9-abc123     default\n",
+			expectError: false,
+		},
+		{
+			name: "multiple clusters with different revisions",
+			input: map[string][]byte{
+				"istiod-canary-abc123":  []byte(`[{"id":"cluster-1","secretName":"cluster-1-secret","syncStatus":"SYNCED"}]`),
+				"istiod-default-def456": []byte(`[{"id":"cluster-2","secretName":"cluster-2-secret","syncStatus":"SYNCED"}]`),
+			},
+			istiodRevisionMap: map[string]string{
+				"istiod-default-def456": "default",
+				"istiod-canary-abc123":  "canary",
+			},
+			expectedOutput: "NAME          SECRET               STATUS     ISTIOD                    REVISION\n" +
+				"cluster-1     cluster-1-secret     SYNCED     istiod-canary-abc123      canary\n" +
+				"cluster-2     cluster-2-secret     SYNCED     istiod-default-def456     default\n",
+			expectError: false,
+		},
+		{
+			name: "cluster without revision label",
+			input: map[string][]byte{
+				"istiod-6d8f97c8d9-abc123": []byte(`[{"id":"cluster-1","secretName":"cluster-1-secret","syncStatus":"SYNCED"}]`),
+			},
+			istiodRevisionMap: map[string]string{},
+			expectedOutput: "NAME          SECRET               STATUS     ISTIOD                       REVISION\n" +
+				"cluster-1     cluster-1-secret     SYNCED     istiod-6d8f97c8d9-abc123     \n",
+			expectError: false,
+		},
+		{
+			name: "multiple clusters per istiod",
+			input: map[string][]byte{
+				// nolint: lll
+				"istiod-6d8f97c8d9-abc123": []byte(`[{"id":"cluster-1","secretName":"cluster-1-secret","syncStatus":"SYNCED"},{"id":"cluster-2","secretName":"cluster-2-secret","syncStatus":"SYNCED"}]`),
+			},
+			istiodRevisionMap: map[string]string{
+				"istiod-6d8f97c8d9-abc123": "stable",
+			},
+			expectedOutput: "NAME          SECRET               STATUS     ISTIOD                       REVISION\n" +
+				"cluster-1     cluster-1-secret     SYNCED     istiod-6d8f97c8d9-abc123     stable\n" +
+				"cluster-2     cluster-2-secret     SYNCED     istiod-6d8f97c8d9-abc123     stable\n",
+			expectError: false,
+		},
+		{
+			name: "invalid JSON input",
+			input: map[string][]byte{
+				"istiod-6d8f97c8d9-abc123": []byte(`invalid json`),
+			},
+			istiodRevisionMap: map[string]string{
+				"istiod-6d8f97c8d9-abc123": "default",
+			},
+			expectedOutput: "",
+			expectError:    true,
+		},
+		{
+			name:              "empty input",
+			input:             map[string][]byte{},
+			istiodRevisionMap: map[string]string{},
+			expectedOutput:    "NAME     SECRET     STATUS     ISTIOD     REVISION\n",
+			expectError:       false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var out bytes.Buffer
+			err := writeMulticlusterStatus(&out, tt.input, tt.istiodRevisionMap)
+
+			if tt.expectError {
+				if err == nil {
+					t.Errorf("expected error but got none")
+				}
+				return
+			}
+
+			if err != nil {
+				t.Errorf("unexpected error: %v", err)
+				return
+			}
+
+			actualOutput := out.String()
+			expectedOutput := tt.expectedOutput
+
+			if actualOutput != expectedOutput {
+				t.Errorf("output mismatch:\n got:\n%s\n\nwant:\n%s", actualOutput, expectedOutput)
+			}
+		})
 	}
 }

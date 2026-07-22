@@ -5,6 +5,15 @@ _internal_defaults_do_not_set:
     # Used to locate istiod.
     istioNamespace: "istio-system"
 
+    # If true, install istio-reader service account and associated cluster role/binding,
+    # which are used for multicluster remote-secret workflows.
+    enableReaderRBAC: true
+    # Optionally specify a custom service account to bind to the istio-reader ClusterRole.
+    # When set, the default istio-reader-service-account is not created.
+    # readerServiceAccount:
+    #   name: custom-reader-sa
+    #   namespace: custom-namespace
+
   base:
     # Validation webhook configuration url
     # For example: https://$remotePilotAddress:15017/validate

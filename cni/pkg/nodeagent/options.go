@@ -17,18 +17,22 @@ package nodeagent
 import (
 	"net/netip"
 
+	"istio.io/istio/cni/pkg/util"
 	"istio.io/istio/pkg/config/constants"
 	"istio.io/istio/pkg/env"
 )
 
 var (
-	PodNamespace      = env.RegisterStringVar("POD_NAMESPACE", "", "pod's namespace").Get()
-	SystemNamespace   = env.RegisterStringVar("SYSTEM_NAMESPACE", constants.IstioSystemNamespace, "istio system namespace").Get()
-	PodName           = env.RegisterStringVar("POD_NAME", "", "").Get()
-	NodeName          = env.RegisterStringVar("NODE_NAME", "", "").Get()
-	Revision          = env.RegisterStringVar("REVISION", "", "").Get()
-	HostProbeSNATIP   = netip.MustParseAddr(env.RegisterStringVar("HOST_PROBE_SNAT_IP", DefaultHostProbeSNATIP, "").Get())
-	HostProbeSNATIPV6 = netip.MustParseAddr(env.RegisterStringVar("HOST_PROBE_SNAT_IPV6", DefaultHostProbeSNATIPV6, "").Get())
+	PodNamespace                   = env.RegisterStringVar("POD_NAMESPACE", "", "pod's namespace").Get()
+	SystemNamespace                = env.RegisterStringVar("SYSTEM_NAMESPACE", constants.IstioSystemNamespace, "istio system namespace").Get()
+	PodName                        = env.RegisterStringVar("POD_NAME", "", "").Get()
+	NodeName                       = env.RegisterStringVar("NODE_NAME", "", "").Get()
+	Revision                       = env.RegisterStringVar("REVISION", "", "").Get()
+	HostProbeSNATIP                = netip.MustParseAddr(env.RegisterStringVar("HOST_PROBE_SNAT_IP", DefaultHostProbeSNATIP, "").Get())
+	HostProbeSNATIPV6              = netip.MustParseAddr(env.RegisterStringVar("HOST_PROBE_SNAT_IPV6", DefaultHostProbeSNATIPV6, "").Get())
+	UseScopedIptablesLegacyLocking = env.RegisterBoolVar("AMBIENT_USE_SCOPED_XTABLES_LOCKING", true, "").Get()
+	EnableAWSBranchENIProbe        = env.RegisterBoolVar("AMBIENT_ENABLE_AWS_BRANCH_ENI_PROBE", true,
+		"If true, detect AWS VPC CNI branch ENI pods and add ip rules to route probe traffic via veth").Get()
 )
 
 const (
@@ -44,10 +48,15 @@ const (
 )
 
 type AmbientArgs struct {
-	SystemNamespace string
-	Revision        string
-	KubeConfig      string
-	ServerSocket    string
-	DNSCapture      bool
-	EnableIPv6      bool
+	SystemNamespace            string
+	Revision                   string
+	KubeConfig                 string
+	ServerSocket               string
+	EnablementSelector         *util.CompiledEnablementSelectors
+	ExcludeNamespaces          []string
+	DNSCapture                 bool
+	EnableIPv6                 bool
+	ReconcilePodRulesOnStartup bool
+	NativeNftables             bool
+	ForceIptablesBinary        string
 }

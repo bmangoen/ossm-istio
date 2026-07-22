@@ -22,7 +22,8 @@ import (
 )
 
 func TestStaticCollection(t *testing.T) {
-	c := krt.NewStaticCollection[Named]([]Named{{"ns", "a"}})
+	opts := testOptions(t)
+	c := krt.NewStaticCollection[Named](nil, []Named{{"ns", "a"}}, opts.WithName("c")...)
 	assert.Equal(t, c.Synced().HasSynced(), true, "should start synced")
 	assert.Equal(t, c.List(), []Named{{"ns", "a"}})
 

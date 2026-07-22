@@ -25,7 +25,6 @@ import (
 	"path"
 	"path/filepath"
 	"reflect"
-	"regexp"
 	"strings"
 	"testing"
 
@@ -38,6 +37,7 @@ import (
 
 	"istio.io/istio/operator/pkg/manifest"
 	"istio.io/istio/operator/pkg/render"
+	operatortest "istio.io/istio/operator/pkg/test"
 	uninstall2 "istio.io/istio/operator/pkg/uninstall"
 	"istio.io/istio/operator/pkg/util/testhelpers"
 	tutil "istio.io/istio/pilot/test/util"
@@ -45,11 +45,9 @@ import (
 	"istio.io/istio/pkg/file"
 	"istio.io/istio/pkg/kube"
 	"istio.io/istio/pkg/kube/kclient/clienttest"
-	"istio.io/istio/pkg/slices"
 	"istio.io/istio/pkg/test"
 	"istio.io/istio/pkg/test/env"
 	"istio.io/istio/pkg/test/util/assert"
-	"istio.io/istio/pkg/test/util/yml"
 	"istio.io/istio/pkg/version"
 )
 
@@ -82,7 +80,7 @@ var (
 		}
 		return chartSourceType(filepath.Join(d, "manifests"))
 	}()
-	// Compiled in charts come from assets.gen.go
+	// Run operator/scripts/run_update_golden_snapshots.sh to update the snapshot charts tarball.
 	compiledInCharts chartSourceType = "COMPILED"
 	_                                = compiledInCharts
 	// Live charts come from manifests/
@@ -239,12 +237,31 @@ func TestManifestGenerateComponentHubTag(t *testing.T) {
 	}
 }
 
+func TestSetGatewayCustomTagsAndNoLabels(t *testing.T) {
+	g := NewWithT(t)
+
+	objss := runManifestCommands(t, "gateways-with-custom-tags-and-no-labels", "", liveCharts, nil)
+
+	for _, objs := range objss {
+		{
+			dobj := mustGetDeployment(g, objs, "istio-ingressgateway")
+			c := getContainer(dobj, "istio-proxy")
+			g.Expect(c).Should(HavePathValueMatchRegex(PathValue{"image", "^.*:special-tag$"}))
+		}
+		{
+			dobj := mustGetDeployment(g, objs, "istio-egressgateway")
+			c := getContainer(dobj, "istio-proxy")
+			g.Expect(c).Should(HavePathValueMatchRegex(PathValue{"image", "^.*:special-tag2$"}))
+		}
+	}
+}
+
 func TestManifestGenerateGateways(t *testing.T) {
 	g := NewWithT(t)
 
 	flags := "-s components.ingressGateways.[0].k8s.resources.requests.memory=999Mi " +
-		"-s components.ingressGateways.[name:user-ingressgateway].k8s.resources.requests.cpu=555m"
-
+		"-s components.ingressGateways.[name:user-ingressgateway].k8s.resources.requests.cpu=555m " +
+		"-s values.gateways.istio-ingressgateway.autoscaleMin=2"
 	objss := runManifestCommands(t, "gateways", flags, liveCharts, nil)
 
 	for _, objs := range objss {
@@ -284,12 +301,39 @@ func TestManifestGenerateGateways(t *testing.T) {
 
 		for _, o := range objs.kind(manifest.HorizontalPodAutoscaler).objSlice {
 			ou := o.Unstructured.Object
-			g.Expect(ou).Should(HavePathValueEqual(PathValue{"spec.minReplicas", int64(1)}))
+			g.Expect(ou).Should(HavePathValueEqual(PathValue{"spec.minReplicas", int64(2)}))
 			g.Expect(ou).Should(HavePathValueEqual(PathValue{"spec.maxReplicas", int64(5)}))
 		}
 
 		checkRoleBindingsReferenceRoles(g, objs)
 	}
+
+	runTestGroup(t, testGroup{
+		{
+			desc:       "ingressgateway_k8s_settings",
+			diffSelect: "Deployment:*:istio-ingressgateway, Service:*:istio-ingressgateway",
+		},
+	})
+}
+
+// TestManifestGenerateHPAPDB verifies that setting k8s.hpaSpec.minReplicas causes
+// a PodDisruptionBudget to be generated without requiring the user to also set the
+// component's autoscaleMin Helm value directly.
+func TestManifestGenerateHPAPDB(t *testing.T) {
+	runTestGroup(t, testGroup{
+		{
+			desc:        "gateway_hpa_pdb",
+			diffSelect:  "HorizontalPodAutoscaler:*:istio-ingressgateway,PodDisruptionBudget:*:istio-ingressgateway",
+			fileSelect:  []string{"templates/autoscale.yaml", "templates/poddisruptionbudget.yaml"},
+			chartSource: liveCharts,
+		},
+		{
+			desc:        "pilot_hpa_pdb",
+			diffSelect:  "HorizontalPodAutoscaler:*:istiod,PodDisruptionBudget:*:istiod",
+			fileSelect:  []string{"templates/autoscale.yaml", "templates/poddisruptionbudget.yaml"},
+			chartSource: liveCharts,
+		},
+	})
 }
 
 func TestManifestGenerateWithDuplicateMutatingWebhookConfig(t *testing.T) {
@@ -370,7 +414,7 @@ func runRevisionedWebhookTest(t *testing.T, testResourceFile, whSource string) {
 func TestManifestGenerateIstiodRemote(t *testing.T) {
 	g := NewWithT(t)
 
-	const istiodServiceName = "istiod"
+	const primarySVCName = "istiod"
 	objss := runManifestCommands(t, "istiod_remote", "", liveCharts, nil)
 
 	for _, objs := range objss {
@@ -383,18 +427,230 @@ func TestManifestGenerateIstiodRemote(t *testing.T) {
 		g.Expect(objs.kind(gvk.CustomResourceDefinition.Kind).nameEquals("authorizationpolicies.security.istio.io")).Should(Not(BeNil()))
 
 		g.Expect(objs.kind(gvk.ConfigMap.Kind).nameEquals("istio-sidecar-injector")).Should(Not(BeNil()))
-		g.Expect(objs.kind(gvk.Service.Kind).nameEquals(istiodServiceName)).Should(Not(BeNil()))
+		g.Expect(objs.kind(gvk.Service.Kind).nameEquals(primarySVCName)).Should(Not(BeNil()))
 		g.Expect(objs.kind(gvk.ServiceAccount.Kind).nameEquals("istio-reader-service-account")).Should(Not(BeNil()))
 
 		mwc := mustGetMutatingWebhookConfiguration(g, objs, "istio-sidecar-injector").Unstructured.Object
 		g.Expect(mwc).Should(HavePathValueEqual(PathValue{"webhooks.[0].clientConfig.url", "https://xxx:15017/inject"}))
 
-		ep := mustGetEndpoint(g, objs, istiodServiceName).Unstructured.Object
-		g.Expect(ep).Should(HavePathValueEqual(PathValue{"subsets.[0].addresses.[0]", endpointSubsetAddressVal("", "169.10.112.88", "")}))
-		g.Expect(ep).Should(HavePathValueContain(PathValue{"subsets.[0].ports.[0]", portVal("tcp-istiod", 15012, -1)}))
+		ep := mustGetEndpointSlice(g, objs, primarySVCName).Unstructured.Object
+		g.Expect(ep).Should(HavePathValueEqual(PathValue{"endpoints.[0].addresses.[0]", "169.10.112.88"}))
+		g.Expect(ep).Should(HavePathValueContain(PathValue{"ports.[0]", portVal("tcp-istiod", 15012, -1)}))
 
 		checkClusterRoleBindingsReferenceRoles(g, objs)
 	}
+}
+
+func TestManifestGenerateIstiodRemoteIPv6(t *testing.T) {
+	g := NewWithT(t)
+
+	const primarySVCName = "istiod"
+	objss := runManifestCommands(t, "istiod_remote_ipv6", "", liveCharts, nil)
+
+	for _, objs := range objss {
+		// check core CRDs exists
+		g.Expect(objs.kind(gvk.CustomResourceDefinition.Kind).nameEquals("destinationrules.networking.istio.io")).Should(Not(BeNil()))
+		g.Expect(objs.kind(gvk.CustomResourceDefinition.Kind).nameEquals("gateways.networking.istio.io")).Should(Not(BeNil()))
+		g.Expect(objs.kind(gvk.CustomResourceDefinition.Kind).nameEquals("sidecars.networking.istio.io")).Should(Not(BeNil()))
+		g.Expect(objs.kind(gvk.CustomResourceDefinition.Kind).nameEquals("virtualservices.networking.istio.io")).Should(Not(BeNil()))
+		g.Expect(objs.kind(gvk.CustomResourceDefinition.Kind).nameEquals("adapters.config.istio.io")).Should(BeNil())
+		g.Expect(objs.kind(gvk.CustomResourceDefinition.Kind).nameEquals("authorizationpolicies.security.istio.io")).Should(Not(BeNil()))
+
+		// Verify EndpointSlice is correctly generated (IPv6 address should not be skipped)
+		ep := mustGetEndpointSlice(g, objs, primarySVCName).Unstructured.Object
+		// Verify addressType is IPv6
+		g.Expect(ep).Should(HavePathValueEqual(PathValue{"addressType", "IPv6"}))
+		// Verify endpoints contain the correct IPv6 address
+		g.Expect(ep).Should(HavePathValueEqual(PathValue{"endpoints.[0].addresses.[0]", "2001:db8::1"}))
+		g.Expect(ep).Should(HavePathValueContain(PathValue{"ports.[0]", portVal("tcp-istiod", 15012, -1)}))
+
+		// Verify Service exists and is not ExternalName type (IPv6 address should not be treated as a hostname)
+		svc := mustGetService(g, objs, primarySVCName).Unstructured.Object
+		svcSpec, ok := svc["spec"].(map[string]any)
+		g.Expect(ok).Should(BeTrue(), "Service should have a spec")
+		_, hasExternalName := svcSpec["externalName"]
+		g.Expect(hasExternalName).Should(BeFalse(), "IPv6 address should not result in ExternalName service")
+		_, hasType := svcSpec["type"]
+		g.Expect(hasType).Should(BeFalse(), "IPv6 address should not set service type to ExternalName")
+
+		mwc := mustGetMutatingWebhookConfiguration(g, objs, "istio-sidecar-injector").Unstructured.Object
+		g.Expect(mwc).Should(HavePathValueEqual(PathValue{"webhooks.[0].clientConfig.url", "https://xxx:15017/inject"}))
+
+		checkClusterRoleBindingsReferenceRoles(g, objs)
+	}
+}
+
+func TestManifestGenerateIstiodRemoteConfigCluster(t *testing.T) {
+	g := NewWithT(t)
+
+	const primarySVCName = "istiod"
+	objss := runManifestCommands(t, "istiod_remote_config", "", liveCharts, nil)
+
+	for _, objs := range objss {
+		// check core CRDs exists
+		g.Expect(objs.kind(gvk.CustomResourceDefinition.Kind).nameEquals("destinationrules.networking.istio.io")).Should(Not(BeNil()))
+		g.Expect(objs.kind(gvk.CustomResourceDefinition.Kind).nameEquals("gateways.networking.istio.io")).Should(Not(BeNil()))
+		g.Expect(objs.kind(gvk.CustomResourceDefinition.Kind).nameEquals("sidecars.networking.istio.io")).Should(Not(BeNil()))
+		g.Expect(objs.kind(gvk.CustomResourceDefinition.Kind).nameEquals("virtualservices.networking.istio.io")).Should(Not(BeNil()))
+		g.Expect(objs.kind(gvk.CustomResourceDefinition.Kind).nameEquals("adapters.config.istio.io")).Should(BeNil())
+		g.Expect(objs.kind(gvk.CustomResourceDefinition.Kind).nameEquals("authorizationpolicies.security.istio.io")).Should(Not(BeNil()))
+
+		g.Expect(objs.kind(gvk.ConfigMap.Kind).nameEquals("istio-sidecar-injector")).Should(Not(BeNil()))
+		g.Expect(objs.kind(gvk.Service.Kind).nameEquals(primarySVCName)).Should(Not(BeNil()))
+		g.Expect(objs.kind(gvk.ServiceAccount.Kind).nameEquals("istio-reader-service-account")).Should(Not(BeNil()))
+
+		mwc := mustGetMutatingWebhookConfiguration(g, objs, "istio-sidecar-injector").Unstructured.Object
+		g.Expect(mwc).Should(HavePathValueEqual(PathValue{"webhooks.[0].clientConfig.service.name", primarySVCName}))
+
+		g.Expect(objs.kind(gvk.Service.Kind).nameEquals(primarySVCName)).Should(Not(BeNil()))
+		ep := mustGetEndpointSlice(g, objs, primarySVCName).Unstructured.Object
+
+		g.Expect(ep).Should(HavePathValueEqual(PathValue{"endpoints.[0].addresses.[0]", "169.10.112.88"}))
+		g.Expect(ep).Should(HavePathValueContain(PathValue{"ports.[0]", portVal("tcp-istiod", 15012, -1)}))
+
+		// validation webhook
+		vwc := mustGetValidatingWebhookConfiguration(g, objs, "istio-validator-istio-system").Unstructured.Object
+		g.Expect(vwc).Should(HavePathValueEqual(PathValue{"webhooks.[0].clientConfig.url", "https://xxx:15017/validate"}))
+
+		checkClusterRoleBindingsReferenceRoles(g, objs)
+	}
+}
+
+func TestManifestGenerateIstiodRemoteLocalInjection(t *testing.T) {
+	g := NewWithT(t)
+
+	const istiodPrimaryXDSServiceName = "istiod-remote"
+	const istiodInjectionServiceName = "istiod"
+	objss := runManifestCommands(t, "istiod_remote_local", "", liveCharts, nil)
+
+	for _, objs := range objss {
+		// check core CRDs exists
+		g.Expect(objs.kind(gvk.CustomResourceDefinition.Kind).nameEquals("destinationrules.networking.istio.io")).Should(Not(BeNil()))
+		g.Expect(objs.kind(gvk.CustomResourceDefinition.Kind).nameEquals("gateways.networking.istio.io")).Should(Not(BeNil()))
+		g.Expect(objs.kind(gvk.CustomResourceDefinition.Kind).nameEquals("sidecars.networking.istio.io")).Should(Not(BeNil()))
+		g.Expect(objs.kind(gvk.CustomResourceDefinition.Kind).nameEquals("virtualservices.networking.istio.io")).Should(Not(BeNil()))
+		g.Expect(objs.kind(gvk.CustomResourceDefinition.Kind).nameEquals("adapters.config.istio.io")).Should(BeNil())
+		g.Expect(objs.kind(gvk.CustomResourceDefinition.Kind).nameEquals("authorizationpolicies.security.istio.io")).Should(Not(BeNil()))
+
+		g.Expect(objs.kind(gvk.ConfigMap.Kind).nameEquals("istio-sidecar-injector")).Should(Not(BeNil()))
+		g.Expect(objs.kind(gvk.Service.Kind).nameEquals(istiodInjectionServiceName)).Should(Not(BeNil()))
+		// injection istiod service & deployment
+		g.Expect(objs.kind(gvk.Service.Kind).nameEquals(istiodInjectionServiceName)).Should(Not(BeNil()))
+		g.Expect(objs.kind(gvk.Deployment.Kind).nameEquals(istiodInjectionServiceName)).Should(Not(BeNil()))
+
+		g.Expect(objs.kind(gvk.ServiceAccount.Kind).nameEquals("istio-reader-service-account")).Should(Not(BeNil()))
+
+		mwc := mustGetMutatingWebhookConfiguration(g, objs, "istio-sidecar-injector").Unstructured.Object
+		g.Expect(mwc).Should(HavePathValueEqual(PathValue{"webhooks.[0].clientConfig.service.name", istiodInjectionServiceName}))
+
+		ep := mustGetEndpointSlice(g, objs, istiodPrimaryXDSServiceName).Unstructured.Object
+		g.Expect(objs.kind(gvk.Service.Kind).nameEquals(istiodPrimaryXDSServiceName)).Should(Not(BeNil()))
+		g.Expect(ep).Should(HavePathValueEqual(PathValue{"endpoints.[0].addresses.[0]", "169.10.112.88"}))
+		g.Expect(ep).Should(HavePathValueContain(PathValue{"ports.[0]", portVal("tcp-istiod", 15012, -1)}))
+
+		// validation webhook
+		vwc := mustGetValidatingWebhookConfiguration(g, objs, "istio-validator-istio-system").Unstructured.Object
+		g.Expect(vwc).Should(HavePathValueEqual(PathValue{"webhooks.[0].clientConfig.service.name", istiodInjectionServiceName}))
+
+		checkClusterRoleBindingsReferenceRoles(g, objs)
+	}
+}
+
+func TestManifestGenerateReaderRBACEnableFlag(t *testing.T) {
+	g := NewWithT(t)
+	const (
+		readerSAName = "istio-reader-service-account"
+		namespace    = "istio-system"
+		revision     = "canary"
+	)
+	readerRBACName := func(rev string) string {
+		return fmt.Sprintf("istio-reader-clusterrole(-%s)?-%s", rev, namespace)
+	}
+
+	t.Run("enabled by default", func(t *testing.T) {
+		flags := fmt.Sprintf("--set values.global.resourceScope=all --set values.global.istioNamespace=%s", namespace)
+		manifest := generateManifest(t, "default", flags, liveCharts, nil)
+		objs := parseObjectSetFromManifest(t, manifest)
+		g.Expect(objs.kind(gvk.ServiceAccount.Kind).nameEquals(readerSAName)).Should(Not(BeNil()))
+		g.Expect(manifest).Should(MatchRegexp("kind: ClusterRole[\\s\\S]*name: istio-reader-clusterrole-" + namespace))
+		g.Expect(manifest).Should(MatchRegexp("kind: ClusterRoleBinding[\\s\\S]*name: istio-reader-clusterrole-" + namespace))
+	})
+
+	t.Run("enabled by default on revisioned install", func(t *testing.T) {
+		flags := fmt.Sprintf("--set values.global.resourceScope=all --set values.global.istioNamespace=%s --set revision=%s", namespace, revision)
+		manifest := generateManifest(t, "default", flags, liveCharts, nil)
+		objs := parseObjectSetFromManifest(t, manifest)
+		g.Expect(objs.kind(gvk.ServiceAccount.Kind).nameEquals(readerSAName)).Should(Not(BeNil()))
+		g.Expect(manifest).Should(MatchRegexp("kind: ClusterRole[\\s\\S]*name: " + readerRBACName(revision)))
+		g.Expect(manifest).Should(MatchRegexp("kind: ClusterRoleBinding[\\s\\S]*name: " + readerRBACName(revision)))
+	})
+
+	t.Run("disabled explicitly on revisioned install", func(t *testing.T) {
+		flags := fmt.Sprintf(
+			"--set values.global.resourceScope=all --set values.global.istioNamespace=%s "+
+				"--set values.global.enableReaderRBAC=false --set revision=%s",
+			namespace,
+			revision,
+		)
+		manifest := generateManifest(t, "default", flags, liveCharts, nil)
+		objs := parseObjectSetFromManifest(t, manifest)
+		g.Expect(objs.kind(gvk.ServiceAccount.Kind).nameEquals(readerSAName)).Should(BeNil())
+		g.Expect(manifest).Should(Not(MatchRegexp("kind: ClusterRole[\\s\\S]*name: " + readerRBACName(revision))))
+		g.Expect(manifest).Should(Not(MatchRegexp("kind: ClusterRoleBinding[\\s\\S]*name: " + readerRBACName(revision))))
+	})
+
+	t.Run("disabled explicitly", func(t *testing.T) {
+		// Use default profile (includes both base and discovery charts) to verify that
+		// enableReaderRBAC=false suppresses the SA (from base) and the ClusterRole/Binding
+		// (from discovery) in a single consistent install.
+		flags := fmt.Sprintf("--set values.global.resourceScope=all --set values.global.istioNamespace=%s --set values.global.enableReaderRBAC=false", namespace)
+		manifest := generateManifest(t, "default", flags, liveCharts, nil)
+		objs := parseObjectSetFromManifest(t, manifest)
+		g.Expect(objs.kind(gvk.ServiceAccount.Kind).nameEquals(readerSAName)).Should(BeNil())
+		g.Expect(manifest).Should(Not(MatchRegexp("kind: ClusterRole[\\s\\S]*name: istio-reader-clusterrole-" + namespace)))
+		g.Expect(manifest).Should(Not(MatchRegexp("kind: ClusterRoleBinding[\\s\\S]*name: istio-reader-clusterrole-" + namespace)))
+	})
+
+	t.Run("disabled explicitly in base chart only", func(t *testing.T) {
+		flags := "--set values.global.resourceScope=all --set values.global.enableReaderRBAC=false"
+		manifest := generateManifest(t, "minimal", flags, liveCharts, []string{"templates/reader-serviceaccount.yaml"})
+		objs := parseObjectSetFromManifest(t, manifest)
+		g.Expect(objs.kind(gvk.ServiceAccount.Kind).nameEquals(readerSAName)).Should(BeNil())
+	})
+
+	t.Run("custom reader service account with enableReaderRBAC disabled", func(t *testing.T) {
+		flags := fmt.Sprintf(
+			"--set values.global.resourceScope=all --set values.global.istioNamespace=%s "+
+				"--set values.global.enableReaderRBAC=false "+
+				"--set values.global.readerServiceAccount.name=custom-reader "+
+				"--set values.global.readerServiceAccount.namespace=custom-ns",
+			namespace,
+		)
+		manifest := generateManifest(t, "default", flags, liveCharts, nil)
+		objs := parseObjectSetFromManifest(t, manifest)
+		g.Expect(objs.kind(gvk.ServiceAccount.Kind).nameEquals(readerSAName)).Should(BeNil())
+		g.Expect(objs.kind(gvk.ServiceAccount.Kind).nameEquals("custom-reader")).Should(BeNil())
+		g.Expect(manifest).Should(Not(MatchRegexp("kind: ClusterRole[\\s\\S]*name: istio-reader-clusterrole-" + namespace)))
+		g.Expect(manifest).Should(Not(MatchRegexp("kind: ClusterRoleBinding[\\s\\S]*name: istio-reader-clusterrole-" + namespace)))
+		g.Expect(manifest).Should(Not(ContainSubstring("name: custom-reader")))
+		g.Expect(manifest).Should(Not(ContainSubstring("namespace: custom-ns")))
+	})
+
+	t.Run("custom reader service account with enableReaderRBAC enabled", func(t *testing.T) {
+		flags := fmt.Sprintf(
+			"--set values.global.resourceScope=all --set values.global.istioNamespace=%s "+
+				"--set values.global.readerServiceAccount.name=custom-reader "+
+				"--set values.global.readerServiceAccount.namespace=custom-ns",
+			namespace,
+		)
+		manifest := generateManifest(t, "default", flags, liveCharts, nil)
+		objs := parseObjectSetFromManifest(t, manifest)
+		g.Expect(objs.kind(gvk.ServiceAccount.Kind).nameEquals(readerSAName)).Should(BeNil())
+		g.Expect(manifest).Should(MatchRegexp("kind: ClusterRole[\\s\\S]*name: istio-reader-clusterrole-" + namespace))
+		g.Expect(manifest).Should(MatchRegexp("kind: ClusterRoleBinding[\\s\\S]*name: istio-reader-clusterrole-" + namespace))
+		g.Expect(manifest).Should(ContainSubstring("name: custom-reader"))
+		g.Expect(manifest).Should(ContainSubstring("namespace: custom-ns"))
+	})
 }
 
 func TestPrune(t *testing.T) {
@@ -470,7 +726,7 @@ func TestManifestGenerateFlagsSetValues(t *testing.T) {
 	dobj := mustGetDeployment(g, objs, "istio-ingressgateway")
 
 	c := getContainer(dobj, "istio-proxy")
-	g.Expect(c).Should(HavePathValueEqual(PathValue{"image", "gcr.io/istio-testing/myproxy:latest"}))
+	g.Expect(c).Should(HavePathValueEqual(PathValue{"image", "registry.istio.io/testing/myproxy:latest"}))
 
 	cm := objs.kind("ConfigMap").nameEquals("istio-sidecar-injector").Unstructured.Object
 	// TODO: change values to some nicer format rather than text block.
@@ -517,8 +773,9 @@ func TestManifestGeneratePilot(t *testing.T) {
 			fileSelect: []string{"templates/deployment.yaml", "templates/autoscale.yaml"},
 		},
 		{
-			desc:       "pilot_override_kubernetes",
-			diffSelect: "Deployment:*:istiod, Service:*:istiod,MutatingWebhookConfiguration:*:istio-sidecar-injector,ServiceAccount:*:istio-reader-service-account",
+			desc: "pilot_override_kubernetes",
+			// nolint: lll
+			diffSelect: "Deployment:*:istiod, Service:*:istiod,PodDisruptionBudget:*:istiod,MutatingWebhookConfiguration:*:istio-sidecar-injector,ServiceAccount:*:istio-reader-service-account",
 			fileSelect: []string{
 				"templates/deployment.yaml", "templates/mutatingwebhook.yaml",
 				"templates/service.yaml", "templates/reader-serviceaccount.yaml",
@@ -545,14 +802,30 @@ func TestManifestGeneratePilot(t *testing.T) {
 			diffSelect: "HorizontalPodAutoscaler:*:istiod,HorizontalPodAutoscaler:*:istio-ingressgateway",
 			fileSelect: []string{"templates/autoscale.yaml"},
 		},
+		{
+			desc:        "pilot_env_var_from",
+			diffSelect:  "Deployment:*:istiod",
+			fileSelect:  []string{"templates/deployment.yaml"},
+			chartSource: liveCharts,
+		},
+		{
+			desc:        "networkpolicy_enabled",
+			diffSelect:  "NetworkPolicy:*:istiod",
+			fileSelect:  []string{"templates/networkpolicy.yaml"},
+			chartSource: liveCharts,
+		},
 	})
 }
 
-func TestManifestGenerateGateway(t *testing.T) {
+func TestManifestGenerateCni(t *testing.T) {
 	runTestGroup(t, testGroup{
 		{
-			desc:       "ingressgateway_k8s_settings",
-			diffSelect: "Deployment:*:istio-ingressgateway, Service:*:istio-ingressgateway",
+			desc:       "istio-cni",
+			diffSelect: "DaemonSet:*:istio-cni",
+		},
+		{
+			desc:       "istio-cni_tolerations",
+			diffSelect: "DaemonSet:*:istio-cni",
 		},
 	})
 }
@@ -561,6 +834,10 @@ func TestManifestGenerateZtunnel(t *testing.T) {
 	runTestGroup(t, testGroup{
 		{
 			desc:       "ztunnel",
+			diffSelect: "DaemonSet:*:ztunnel",
+		},
+		{
+			desc:       "ztunnel_tolerations",
 			diffSelect: "DaemonSet:*:ztunnel",
 		},
 	})
@@ -627,7 +904,7 @@ func TestMultiICPSFiles(t *testing.T) {
 		t.Fatal(err)
 	}
 	diffSelect := "Deployment:*:istio-egressgateway, Service:*:istio-egressgateway"
-	got = filterManifest(t, got, diffSelect)
+	got = operatortest.FilterManifest(t, got, diffSelect)
 	assert.Equal(t, got, want)
 }
 
@@ -661,6 +938,24 @@ func TestBogusControlPlaneSec(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+}
+
+func TestBadK8sSpec(t *testing.T) {
+	inPathBase := filepath.Join(testDataDir, "input/invalid-k8s.yaml")
+	_, err := runManifestGenerate([]string{inPathBase}, "", liveCharts, []string{"templates/deployment.yaml"})
+	if err == nil {
+		t.Fatal("expected error for invalid k8s spec")
+	}
+	assert.Equal(t, true, strings.Contains(err.Error(), "could not unmarshal"))
+}
+
+func TestBadK8sSpecValues(t *testing.T) {
+	inPathBase := filepath.Join(testDataDir, "input/invalid-k8s-values.yaml")
+	_, err := runManifestGenerate([]string{inPathBase}, "", liveCharts, []string{"templates/deployment.yaml"})
+	if err == nil {
+		t.Fatal("expected error for invalid k8s spec")
+	}
+	assert.Equal(t, true, strings.Contains(err.Error(), "invalid schema for"))
 }
 
 func TestInstallPackagePath(t *testing.T) {
@@ -726,12 +1021,16 @@ func TestConfigSelectors(t *testing.T) {
 		"templates/autoscale.yaml",
 		"templates/serviceaccount.yaml",
 	}
-	got, err := runManifestGenerate([]string{}, "--set values.gateways.istio-egressgateway.enabled=true", liveCharts, selectors)
+	flags := "--set values.gateways.istio-egressgateway.enabled=true " +
+		"--set values.gateways.istio-ingressgateway.autoscaleMin=2 " +
+		"--set values.gateways.istio-egressgateway.autoscaleMin=2 " +
+		"--set values.pilot.autoscaleMin=2"
+	got, err := runManifestGenerate([]string{}, flags, liveCharts, selectors)
 	if err != nil {
 		t.Fatal(err)
 	}
 	objs := parseObjectSetFromManifest(t, got).objSlice
-	gotRev, e := runManifestGenerate([]string{}, "--set revision=canary", liveCharts, selectors)
+	gotRev, e := runManifestGenerate([]string{}, fmt.Sprintf("%s %s", flags, "--set revision=canary"), liveCharts, selectors)
 	if e != nil {
 		t.Fatal(e)
 	}
@@ -817,6 +1116,18 @@ func TestLDFlags(t *testing.T) {
 	assert.Equal(t, vals.GetPathString("spec.tag"), version.DockerInfo.Tag)
 }
 
+// TestManifestGenerateStructure makes some basic assertions about the structure of GeneratedManifests output.
+// This is to ensure that we only generate a single ManifestSet per component-type (in this case ingress gateways).
+// prevent an `istioctl install` regression of https://github.com/istio/istio/issues/53875
+func TestManifestGenerateStructure(t *testing.T) {
+	multiGatewayFile := filepath.Join(testDataDir, "input/gateways.yaml")
+	sets, _, err := render.GenerateManifest([]string{multiGatewayFile}, []string{}, false, nil, nil)
+	assert.NoError(t, err)
+	assert.Equal(t, len(sets), 1) // if this produces more than 1 ManifestSet it will cause a deadlock during install
+	gateways := sets[0].Manifests
+	assert.Equal(t, len(gateways), 18) // 6 kube resources * 3 gateways
+}
+
 func runTestGroup(t *testing.T, tests testGroup) {
 	for _, tt := range tests {
 		t.Run(tt.desc, func(t *testing.T) {
@@ -843,16 +1154,12 @@ func runTestGroup(t *testing.T, tests testGroup) {
 			}
 
 			if tt.diffSelect != "" {
-				got = filterManifest(t, got, tt.diffSelect)
+				got = operatortest.FilterManifest(t, got, tt.diffSelect)
 			}
 
 			tutil.RefreshGoldenFile(t, []byte(got), outPath)
 
-			want, err := readFile(outPath)
-			if err != nil {
-				t.Fatal(err)
-			}
-
+			want := string(tutil.ReadFile(t, outPath))
 			if got != want {
 				t.Fatal(cmp.Diff(got, want))
 			}
@@ -1070,56 +1377,76 @@ func TestSidecarTemplate(t *testing.T) {
 	})
 }
 
-// FilterManifest selects and ignores subset from the manifest string
-func filterManifest(t test.Failer, ms string, selectResources string) string {
-	sm := getObjPathMap(selectResources)
-	parsed, err := manifest.ParseMultiple(ms)
+func TestManifestGenerateArgsString(t *testing.T) {
+	a := &ManifestGenerateArgs{
+		InFilenames:   []string{"a.yaml", "b.yaml"},
+		Set:           []string{"a=b", "c=d"},
+		Force:         true,
+		ManifestsPath: "/charts",
+		Revision:      "canary",
+		Output:        "/tmp/out.yaml",
+	}
+	got := a.String()
+	for _, w := range []string{"[a.yaml b.yaml]", "[a=b c=d]", "true", "/charts", "canary", "/tmp/out.yaml"} {
+		if !strings.Contains(got, w) {
+			t.Errorf("String() output missing %q:\n%s", w, got)
+		}
+	}
+}
+
+func TestManifestGenerateOutputFlagRegistered(t *testing.T) {
+	mgArgs := &ManifestGenerateArgs{}
+	cmd := ManifestGenerateCmd(nil, &RootArgs{}, mgArgs)
+	addManifestGenerateFlags(cmd, mgArgs)
+	f := cmd.Flag("output")
+	if f == nil {
+		t.Fatal("flag --output is not registered")
+	}
+	if f.Shorthand != "o" {
+		t.Errorf("flag --output: got shorthand %q, want %q", f.Shorthand, "o")
+	}
+}
+
+func TestManifestGenerateOutputFile(t *testing.T) {
+	outFile := filepath.Join(t.TempDir(), "istio.yaml")
+	stdout, err := runManifestGenerate([]string{}, "-o "+outFile, liveCharts, nil)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("unexpected error: %v: %s", err, stdout)
 	}
-	parsed = slices.FilterInPlace(parsed, func(manifest manifest.Manifest) bool {
-		for selected := range sm {
-			re, err := buildResourceRegexp(strings.TrimSpace(selected))
-			if err != nil {
-				t.Fatal(err)
-			}
-			if re.MatchString(manifest.Hash()) {
-				return true
-			}
-		}
-		return false
-	})
 
-	return yml.JoinString(slices.Map(parsed, func(e manifest.Manifest) string {
-		return e.Content
-	})...) + "\n"
+	// When -o is specified, the manifest must not be echoed to stdout.
+	if strings.Contains(stdout, "kind: CustomResourceDefinition") {
+		t.Errorf("expected no manifest on stdout when -o is set, got:\n%s", stdout)
+	}
+
+	data, err := os.ReadFile(outFile)
+	if err != nil {
+		t.Fatalf("read output file: %v", err)
+	}
+	objs := parseObjectSetFromManifest(t, string(data))
+	if len(objs.objSlice) == 0 {
+		t.Fatalf("expected at least one object in output file, got 0")
+	}
+	// The full manifest must include the Istio CRDs (the base component).
+	crds := objs.kind(gvk.CustomResourceDefinition.Kind)
+	if len(crds.objSlice) == 0 {
+		t.Fatalf("expected the output file to include CustomResourceDefinitions, got none")
+	}
+	g := NewWithT(t)
+	g.Expect(crds.nameEquals("gateways.networking.istio.io")).Should(Not(BeNil()))
+	g.Expect(crds.nameEquals("virtualservices.networking.istio.io")).Should(Not(BeNil()))
+	if !strings.HasSuffix(string(data), YAMLSeparator) {
+		t.Errorf("output file should end with YAML separator")
+	}
 }
 
-// buildResourceRegexp translates the resource indicator to regexp.
-func buildResourceRegexp(s string) (*regexp.Regexp, error) {
-	hash := strings.Split(s, ":")
-	for i, v := range hash {
-		if v == "" || v == "*" {
-			hash[i] = ".*"
-		}
+func TestManifestGenerateOutputFileWriteError(t *testing.T) {
+	bogus := filepath.Join(t.TempDir(), "nonexistent-subdir", "istio.yaml")
+	out, err := runManifestGenerate([]string{}, "-o "+bogus, liveCharts, nil)
+	if err == nil {
+		t.Fatalf("expected write error, got nil; stdout=%s", out)
 	}
-	return regexp.Compile(strings.Join(hash, ":"))
-}
-
-func getObjPathMap(rs string) map[string]string {
-	rm := make(map[string]string)
-	if len(rs) == 0 {
-		return rm
+	if !strings.Contains(err.Error(), "write manifest to") {
+		t.Errorf("expected error to mention 'write manifest to', got %v", err)
 	}
-	for _, r := range strings.Split(rs, ",") {
-		split := strings.Split(r, ":")
-		if len(split) < 4 {
-			rm[r] = ""
-			continue
-		}
-		kind, namespace, name, path := split[0], split[1], split[2], split[3]
-		obj := fmt.Sprintf("%v:%v:%v", kind, namespace, name)
-		rm[obj] = path
-	}
-	return rm
 }

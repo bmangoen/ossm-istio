@@ -34,6 +34,7 @@ import (
 	"istio.io/istio/pilot/pkg/networking/core/envoyfilter"
 	"istio.io/istio/pkg/cluster"
 	"istio.io/istio/pkg/config/schema/kind"
+	"istio.io/istio/pkg/kube/krt"
 	istiolog "istio.io/istio/pkg/log"
 	"istio.io/istio/pkg/maps"
 	"istio.io/istio/pkg/security"
@@ -72,9 +73,12 @@ type DiscoveryServer struct {
 	// Normal istio clients use the default generator - will not be impacted by this.
 	Generators map[string]model.XdsResourceGenerator
 
+	// Collections holds the KRT based collections when agentgateway is enabled
+	Collections map[string]CollectionGenerator
+
 	// ProxyNeedsPush is a function that determines whether a push can be completely skipped. Individual generators
 	// may also choose to not send any updates.
-	ProxyNeedsPush func(proxy *model.Proxy, req *model.PushRequest) bool
+	ProxyNeedsPush func(proxy *model.Proxy, req *model.PushRequest) (*model.PushRequest, bool)
 
 	// concurrentPushLimit is a semaphore that limits the amount of concurrent XDS pushes.
 	concurrentPushLimit chan struct{}
@@ -132,10 +136,15 @@ type DiscoveryServer struct {
 
 	// DiscoveryStartTime is the time since the binary started
 	DiscoveryStartTime time.Time
+
+	krtDebugger *krt.DebugHandler
+
+	// registrations is the list of collection registrations for agentgateway, used to initialize the Collections map.
+	registrations []CollectionRegistration
 }
 
 // NewDiscoveryServer creates DiscoveryServer that sources data from Pilot's internal mesh data structures
-func NewDiscoveryServer(env *model.Environment, clusterAliases map[string]string) *DiscoveryServer {
+func NewDiscoveryServer(env *model.Environment, clusterAliases map[string]string, debugger *krt.DebugHandler) *DiscoveryServer {
 	out := &DiscoveryServer{
 		Env:                 env,
 		Generators:          map[string]model.XdsResourceGenerator{},
@@ -148,6 +157,7 @@ func NewDiscoveryServer(env *model.Environment, clusterAliases map[string]string
 		pushQueue:           NewPushQueue(),
 		debugHandlers:       map[string]string{},
 		adsClients:          map[string]*Connection{},
+		krtDebugger:         debugger,
 		DebounceOptions: DebounceOptions{
 			DebounceAfter:     features.DebounceAfter,
 			debounceMax:       features.DebounceMax,
@@ -167,6 +177,17 @@ func NewDiscoveryServer(env *model.Environment, clusterAliases map[string]string
 	return out
 }
 
+func (s *DiscoveryServer) InitCollections(reg ...Registration) {
+	if s.Collections != nil {
+		log.Debug("skipping collection initialization since Collections is already set")
+		return
+	}
+	s.Collections = make(map[string]CollectionGenerator)
+	for _, r := range reg {
+		s.registrations = append(s.registrations, r(s.Collections, s.pushChannel))
+	}
+}
+
 // initJwkResolver initializes the JWT key resolver to be used.
 func (s *DiscoveryServer) initJwksResolver() {
 	if s.JwtKeyResolver != nil {
@@ -178,7 +199,7 @@ func (s *DiscoveryServer) initJwksResolver() {
 
 	// Flush cached discovery responses when detecting jwt public key change.
 	s.JwtKeyResolver.PushFunc = func() {
-		s.ConfigUpdate(&model.PushRequest{Full: true, Reason: model.NewReasonStats(model.UnknownTrigger)})
+		s.ConfigUpdate(&model.PushRequest{Reason: model.NewReasonStats(model.UnknownTrigger), Forced: true})
 	}
 }
 
@@ -204,6 +225,13 @@ func (s *DiscoveryServer) CachesSynced() {
 }
 
 func (s *DiscoveryServer) IsServerReady() bool {
+	if features.EnableAgentgateway {
+		for _, r := range s.registrations {
+			if !r.HasSynced() {
+				return false
+			}
+		}
+	}
 	return s.serverReady.Load()
 }
 
@@ -213,6 +241,12 @@ func (s *DiscoveryServer) Start(stopCh <-chan struct{}) {
 	go s.periodicRefreshMetrics(stopCh)
 	go s.sendPushes(stopCh)
 	go s.Cache.Run(stopCh)
+
+	if features.EnableAgentgateway {
+		for _, reg := range s.registrations {
+			go reg.Start(stopCh)
+		}
+	}
 }
 
 // Push metrics are updated periodically (10s default)
@@ -242,7 +276,7 @@ func (s *DiscoveryServer) periodicRefreshMetrics(stopCh <-chan struct{}) {
 // dropCacheForRequest clears the cache in response to a push request
 func (s *DiscoveryServer) dropCacheForRequest(req *model.PushRequest) {
 	// If we don't know what updated, cannot safely cache. Clear the whole cache
-	if len(req.ConfigsUpdated) == 0 {
+	if req.Forced {
 		s.Cache.ClearAll()
 	} else {
 		// Otherwise, just clear the updated configs
@@ -252,12 +286,6 @@ func (s *DiscoveryServer) dropCacheForRequest(req *model.PushRequest) {
 
 // Push is called to push changes on config updates using ADS.
 func (s *DiscoveryServer) Push(req *model.PushRequest) {
-	if !req.Full {
-		req.Push = s.globalPushContext()
-		s.dropCacheForRequest(req)
-		s.AdsPushAll(req)
-		return
-	}
 	// Reset the status during the push.
 	oldPushContext := s.globalPushContext()
 	if oldPushContext != nil {
@@ -269,10 +297,7 @@ func (s *DiscoveryServer) Push(req *model.PushRequest) {
 	// saved.
 	t0 := time.Now()
 	versionLocal := s.NextVersion()
-	push, err := s.initPushContext(req, oldPushContext, versionLocal)
-	if err != nil {
-		return
-	}
+	push := s.initPushContext(req, oldPushContext, versionLocal)
 	initContextTime := time.Since(t0)
 	log.Debugf("InitContext %v for push took %s", versionLocal, initContextTime)
 	pushContextInitTime.Record(initContextTime.Seconds())
@@ -292,7 +317,7 @@ func (s *DiscoveryServer) globalPushContext() *model.PushContext {
 	return s.Env.PushContext()
 }
 
-var fullPushLog = istiolog.RegisterScope("fullpush", "logs details about why Istio is triggering a full push")
+var pushLog = istiolog.RegisterScope("push", "logs details about why Istio is triggering a push")
 
 // ConfigUpdate implements ConfigUpdater interface, used to request pushes.
 func (s *DiscoveryServer) ConfigUpdate(req *model.PushRequest) {
@@ -309,10 +334,10 @@ func (s *DiscoveryServer) ConfigUpdate(req *model.PushRequest) {
 	}
 	inboundConfigUpdates.Increment()
 	s.InboundUpdates.Inc()
-	if req.Full && fullPushLog.DebugEnabled() {
+	if pushLog.DebugEnabled() && !model.OnlyHasConfigsOfKind(req.ConfigsUpdated, kind.Endpoints) {
 		configs := slices.Sort(slices.Map(req.ConfigsUpdated.UnsortedList(), model.ConfigKey.String))
 		reasons := maps.Keys(req.Reason)
-		fullPushLog.Debugf("full push triggered configs=%v reasons=%v", configs, reasons)
+		pushLog.Debugf("push triggered configs=%v reasons=%v", configs, reasons)
 	}
 	s.pushChannel <- req
 }
@@ -356,13 +381,13 @@ func debounce(ch chan *model.PushRequest, stopCh <-chan struct{}, opts DebounceO
 			if req != nil {
 				pushCounter++
 				if req.ConfigsUpdated == nil {
-					log.Infof("Push debounce stable[%d] %d for reason %s: %v since last change, %v since last push, full=%v",
+					log.Infof("Push debounce stable[%d] %d for reason %s: %v since last change, %v since last push, forced=%v",
 						pushCounter, debouncedEvents, reasonsUpdated(req),
-						quietTime, eventDelay, req.Full)
+						quietTime, eventDelay, req.Forced)
 				} else {
-					log.Infof("Push debounce stable[%d] %d for config %s: %v since last change, %v since last push, full=%v",
+					log.Infof("Push debounce stable[%d] %d for config %s: %v since last change, %v since last push, forced=%v",
 						pushCounter, debouncedEvents, configsUpdated(req),
-						quietTime, eventDelay, req.Full)
+						quietTime, eventDelay, req.Forced)
 				}
 				free = false
 				go push(req, debouncedEvents, startDebounce)
@@ -384,7 +409,7 @@ func debounce(ch chan *model.PushRequest, stopCh <-chan struct{}, opts DebounceO
 			if len(r.Reason) == 0 {
 				r.Reason = model.NewReasonStats(model.UnknownTrigger)
 			}
-			if !opts.enableEDSDebounce && !r.Full {
+			if !opts.enableEDSDebounce && model.OnlyHasConfigsOfKind(r.ConfigsUpdated, kind.Endpoints) {
 				// trigger push now, just for EDS
 				go func(req *model.PushRequest) {
 					pushFn(req)
@@ -418,7 +443,7 @@ func configsUpdated(req *model.PushRequest) string {
 		break
 	}
 	if len(req.ConfigsUpdated) > 1 {
-		more := fmt.Sprintf(" and %d more configs", len(req.ConfigsUpdated)-1)
+		more := " and " + strconv.Itoa(len(req.ConfigsUpdated)-1) + " more configs"
 		configs += more
 	}
 	return configs
@@ -494,6 +519,9 @@ func doSendPushes(stopCh <-chan struct{}, semaphore chan struct{}, queue *PushQu
 				case <-closed: // grpc stream was closed
 					doneFunc()
 					log.Infof("Client closed connection %v", client.ID())
+				case <-stopCh: // unblock goroutines already in-flight so outer loop can unblock and select on stopCh to exit
+					doneFunc()
+					log.Infof("Push to client %v aborted due to server shutdown", client.ID())
 				}
 			}()
 		}
@@ -504,21 +532,16 @@ func doSendPushes(stopCh <-chan struct{}, semaphore chan struct{}, queue *PushQu
 // method is technically thread safe (there are no data races), it should not be called in parallel;
 // if it is, then we may start two push context creations (say A, and B), but then write them in
 // reverse order, leaving us with a final version of A, which may be incomplete.
-func (s *DiscoveryServer) initPushContext(req *model.PushRequest, oldPushContext *model.PushContext, version string) (*model.PushContext, error) {
+func (s *DiscoveryServer) initPushContext(req *model.PushRequest, oldPushContext *model.PushContext, version string) *model.PushContext {
 	push := model.NewPushContext()
 	push.PushVersion = version
 	push.JwtKeyResolver = s.JwtKeyResolver
-	if err := push.InitContext(s.Env, oldPushContext, req); err != nil {
-		log.Errorf("XDS: failed to init push context: %v", err)
-		// We can't push if we can't read the data - stick with previous version.
-		pushContextErrors.Increment()
-		return nil, err
-	}
+	push.InitContext(s.Env, oldPushContext, req)
 
 	s.dropCacheForRequest(req)
 	s.Env.SetPushContext(push)
 
-	return push, nil
+	return push
 }
 
 func (s *DiscoveryServer) sendPushes(stopCh <-chan struct{}) {

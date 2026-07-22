@@ -36,6 +36,11 @@ type ResourceDelta struct {
 	Subscribed sets.String
 	// Unsubscribed indicates the client no longer requires these resources
 	Unsubscribed sets.String
+	// InitialResourceVersions, sent by a client on stream (re)establishment, maps the resources
+	// the client already retains to their versions. Generators that assign content-based versions
+	// (WDS) use it to skip re-sending resources the client already has. Every name in it is also
+	// present in Subscribed.
+	InitialResourceVersions map[string]string
 }
 
 var emptyResourceDelta = ResourceDelta{}
@@ -64,7 +69,7 @@ type WatchedResource struct {
 	// For LDS and CDS, all resources of the TypeUrl type are watched if it is empty.
 	// For endpoints the resource names will have list of clusters and for clusters it is empty.
 	// For Delta Xds, all resources of the TypeUrl that a client has subscribed to.
-	ResourceNames []string
+	ResourceNames sets.String
 
 	// Wildcard indicates the subscription is a wildcard subscription. This only applies to types that
 	// allow both wildcard and non-wildcard subscriptions.
@@ -89,10 +94,6 @@ type WatchedResource struct {
 
 	// LastError records the last error returned, if any. This is cleared on any successful ACK.
 	LastError string
-
-	// LastResources tracks the contents of the last push.
-	// This field is extremely expensive to maintain and is typically disabled
-	LastResources Resources
 }
 
 type Watcher interface {
@@ -400,14 +401,16 @@ func ShouldRespond(w Watcher, id string, request *discovery.DiscoveryRequest) (b
 	}
 
 	// If it comes here, that means nonce match.
-	var previousResources []string
+	var previousResources sets.String
+	var cur sets.String
 	var alwaysRespond bool
 	w.UpdateWatchedResource(request.TypeUrl, func(wr *WatchedResource) *WatchedResource {
 		// Clear last error, we got an ACK.
 		wr.LastError = ""
 		previousResources = wr.ResourceNames
 		wr.NonceAcked = request.ResponseNonce
-		wr.ResourceNames = request.ResourceNames
+		wr.ResourceNames = sets.New(request.ResourceNames...)
+		cur = wr.ResourceNames
 		alwaysRespond = wr.AlwaysRespond
 		wr.AlwaysRespond = false
 		return wr
@@ -415,10 +418,8 @@ func ShouldRespond(w Watcher, id string, request *discovery.DiscoveryRequest) (b
 
 	// Envoy can send two DiscoveryRequests with same version and nonce.
 	// when it detects a new resource. We should respond if they change.
-	prev := sets.New(previousResources...)
-	cur := sets.New(request.ResourceNames...)
-	removed := prev.Difference(cur)
-	added := cur.Difference(prev)
+	removed := previousResources.Difference(cur)
+	added := cur.Difference(previousResources)
 
 	// We should always respond "alwaysRespond" marked requests to let Envoy finish warming
 	// even though Nonce match and it looks like an ACK.

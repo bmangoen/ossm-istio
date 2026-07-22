@@ -27,7 +27,11 @@ import (
 	"strings"
 
 	"github.com/google/go-containerregistry/pkg/name"
+	"google.golang.org/protobuf/types/known/structpb"
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"sigs.k8s.io/yaml"
 
@@ -88,31 +92,62 @@ func environmentalDetection(client kube.Client, iop *apis.IstioOperator) (Warnin
 
 func detectCniIncompatibility(client kube.Client, cniEnabled bool, ztunnelEnabled bool) util.Errors {
 	var errs util.Errors
+	calicoResource := schema.GroupVersionResource{Group: "projectcalico.org", Version: "v3", Resource: "felixconfigurations"}
+	calico, err := client.Dynamic().Resource(calicoResource).Get(context.Background(), "default", metav1.GetOptions{})
+	if err == nil {
+		bpfConnectTimeLoadBalancing, found, _ := unstructured.NestedString(calico.Object, "spec", "bpfConnectTimeLoadBalancing")
+		if found && bpfConnectTimeLoadBalancing != "Disabled" {
+			// Need to disable Calico connect-time load balancing since it send traffic directly to the backend pod IP
+			// nolint: lll
+			errs = util.AppendErr(errs, fmt.Errorf("detected Calico CNI with 'bpfConnectTimeLoadBalancing=%s'; this must be set to 'bpfConnectTimeLoadBalancing=Disabled' in the Calico configuration", bpfConnectTimeLoadBalancing))
+		}
+		bpfConnectTimeLoadBalancingEnabled, found, _ := unstructured.NestedBool(calico.Object, "spec", "bpfConnectTimeLoadBalancingEnabled")
+		if found && bpfConnectTimeLoadBalancingEnabled {
+			// Same behavior as BpfconnectTimeLoadBalancing
+			// nolint: lll
+			errs = util.AppendErr(errs, fmt.Errorf("detected Calico CNI with 'bpfConnectTimeLoadBalancingEnabled=true'; this must be set to 'bpfConnectTimeLoadBalancingEnabled=false' in the Calico configuration"))
+		}
+	}
 	cilium, err := client.Kube().CoreV1().ConfigMaps("kube-system").Get(context.Background(), "cilium-config", metav1.GetOptions{})
-	if err != nil {
-		// Ignore errors, user may not be running Cilium at all
-		return nil
-	}
-	if cniEnabled && cilium.Data["cni-exclusive"] == "true" {
-		// Without this, Cilium will constantly overwrite our CNI config.
-		errs = util.AppendErr(errs,
-			fmt.Errorf("detected Cilium CNI with 'cni-exclusive=true'; this must be set to 'cni-exclusive=false' in the Cilium configuration"))
-	}
-	if ztunnelEnabled && cilium.Data["enable-bpf-masquerade"] == "true" {
-		// See https://github.com/istio/istio/issues/52208
-		errs = util.AppendErr(errs,
-			fmt.Errorf("detected Cilium CNI with 'enable-bpf-masquerade=true'; this must be set to 'false' when using ambient mode"))
-	}
-	bpfLbSocket := cilium.Data["bpf-lb-sock"] == "true"                 // Unset implies 'false', so this check is ok
-	bpfLbHostnsOnly := cilium.Data["bpf-lb-sock-hostns-only"] == "true" // Unset implies 'false', so this check is ok
-	if bpfLbSocket && !bpfLbHostnsOnly {
-		// See https://github.com/istio/istio/issues/27619
-		errs = util.AppendErr(errs,
-			errors.New("detected Cilium CNI with 'bpf-lb-sock=true'; this requires 'bpf-lb-sock-hostns-only=true' to be set"))
+	if err == nil {
+		if cniEnabled && cilium.Data["cni-exclusive"] == "true" {
+			// Without this, Cilium will constantly overwrite our CNI config.
+			errs = util.AppendErr(errs,
+				fmt.Errorf("detected Cilium CNI with 'cni-exclusive=true'; this must be set to 'cni-exclusive=false' in the Cilium configuration"))
+		}
+		if ztunnelEnabled && cilium.Data["enable-bpf-masquerade"] == "true" {
+			// See https://github.com/istio/istio/issues/52208
+			errs = util.AppendErr(errs,
+				fmt.Errorf("detected Cilium CNI with 'enable-bpf-masquerade=true'; this must be set to 'false' when using ambient mode"))
+		}
+		bpfLbSocket := cilium.Data["bpf-lb-sock"] == "true"                 // Unset implies 'false', so this check is ok
+		bpfLbHostnsOnly := cilium.Data["bpf-lb-sock-hostns-only"] == "true" // Unset implies 'false', so this check is ok
+		if bpfLbSocket && !bpfLbHostnsOnly {
+			// See https://github.com/istio/istio/issues/27619
+			errs = util.AppendErr(errs,
+				errors.New("detected Cilium CNI with 'bpf-lb-sock=true'; this requires 'bpf-lb-sock-hostns-only=true' to be set"))
+		}
+		// Cilium version differences:
+		// * Older versions of Cilium (<v0.16) used "kube-proxy-replacement=strict" and
+		//   defaulted to "bpf-lb-sock-hostns-only=false". This could cause compatibility
+		//   issues with Istio, as traffic might bypass the sidecar proxy.
+		//
+		// * Newer versions of Cilium (>=v0.16) no longer support "strict". Instead, they
+		//   use "kube-proxy-replacement=true/false", where the default behavior is
+		//   "bpf-lb-sock-hostns-only=true".
+		kpr := cilium.Data["kube-proxy-replacement"]
+		if kpr == "strict" {
+			if !bpfLbHostnsOnly {
+				errs = util.AppendErr(errs,
+					errors.New("detected Cilium CNI with 'kube-proxy-replacement=strict' and 'bpf-lb-sock-hostns-only=false'; "+
+						"please set 'bpf-lb-sock-hostns-only=true' to avoid conflicts with Istio"))
+			}
+		}
 	}
 	return errs
 }
 
+// nolint: staticcheck
 func validateValues(raw *apis.IstioOperator) (Warnings, util.Errors) {
 	values := &apis.Values{}
 	if err := yaml.Unmarshal(raw.Spec.Values, values); err != nil {
@@ -140,8 +175,76 @@ func validateValues(raw *apis.IstioOperator) (Warnings, util.Errors) {
 	run(values.GetGlobal().GetProxy().GetExcludeIPRanges(), validateIPRangesOrStar, "global.proxy.excludeIPRanges")
 	run(values.GetGlobal().GetProxy().GetIncludeInboundPorts(), validateStringList(validatePortNumberString), "global.proxy.includeInboundPorts")
 	run(values.GetGlobal().GetProxy().GetExcludeInboundPorts(), validateStringList(validatePortNumberString), "global.proxy.excludeInboundPorts")
-
+	runKube := func(a *structpb.Struct, b any, hint string) {
+		if a == nil {
+			return
+		}
+		if err := validateKubernetes(a, b); err != nil {
+			errs = util.AppendErr(errs, fmt.Errorf("invalid schema for %v: %v", hint, err))
+		}
+	}
+	runKubeList := func(a []*structpb.Struct, b any, hint string) {
+		for _, v := range a {
+			if err := validateKubernetes(v, b); err != nil {
+				errs = util.AppendErr(errs, fmt.Errorf("invalid schema for %v: %v", hint, err))
+			}
+		}
+	}
+	runKube(values.GetCni().GetAffinity(), &corev1.Affinity{}, "cni.affinity")
+	runKube(values.GetCni().GetSeccompProfile(), &corev1.SeccompProfile{}, "cni.seccompProfile")
+	runKubeList(values.GetGateways().GetIstioEgressgateway().GetPodAntiAffinityLabelSelector(), &metav1.LabelSelector{},
+		"gateways.istio-egressgateway.podAntiAffinityLabelSelector")
+	runKubeList(values.GetGateways().GetIstioEgressgateway().GetPodAntiAffinityTermLabelSelector(), &metav1.LabelSelector{},
+		"gateways.istio-egressgateway.podAntiAffinityTermLabelSelector")
+	runKubeList(values.GetGateways().GetIstioEgressgateway().GetTolerations(), &corev1.Toleration{},
+		"gateways.istio-egressgateway.tolerations")
+	runKubeList(values.GetGlobal().GetDefaultTolerations(), &corev1.Toleration{},
+		"global.defaultTolerations")
+	runKubeList(values.GetGateways().GetIstioIngressgateway().GetPodAntiAffinityLabelSelector(), &metav1.LabelSelector{},
+		"gateways.istio-ingressgateway.podAntiAffinityLabelSelector")
+	runKubeList(values.GetGateways().GetIstioIngressgateway().GetPodAntiAffinityTermLabelSelector(), &metav1.LabelSelector{},
+		"gateways.istio-ingressgateway.podAntiAffinityTermLabelSelector")
+	runKubeList(values.GetGateways().GetIstioIngressgateway().GetTolerations(), &corev1.Toleration{},
+		"gateways.istio-ingressgateway.tolerations")
+	runKubeList(values.GetPilot().GetTolerations(), &corev1.Toleration{},
+		"pilot.tolerations")
+	runKube(values.GetPilot().GetAffinity(), &corev1.Affinity{},
+		"pilot.affinity")
+	runKube(values.GetPilot().GetSeccompProfile(), &corev1.SeccompProfile{},
+		"pilot.seccompProfile")
+	runKubeList(values.GetPilot().GetTopologySpreadConstraints(), &corev1.TopologySpreadConstraint{},
+		"pilot.topologySpreadConstraints")
+	runKubeList(values.GetPilot().GetVolumeMounts(), &corev1.VolumeMount{},
+		"pilot.volumeMounts")
+	runKubeList(values.GetPilot().GetVolumes(), &corev1.Volume{},
+		"pilot.volumes")
+	runKube(values.GetGlobal().GetProxy().GetSeccompProfile(), &corev1.SeccompProfile{},
+		"global.proxy.seccompProfile")
+	runKube(values.GetGlobal().GetProxy().GetLifecycle(), &corev1.Lifecycle{},
+		"global.proxy.lifecycle")
+	runKubeList(values.GetSidecarInjectorWebhook().GetNeverInjectSelector(), &metav1.LabelSelector{},
+		"sidecarInjectorWebhook.neverInjectSelector")
+	runKubeList(values.GetSidecarInjectorWebhook().GetAlwaysInjectSelector(), &metav1.LabelSelector{},
+		"sidecarInjectorWebhook.alwaysInjectSelector")
+	runKube(values.GetGlobal().GetWaypoint().GetAffinity(), &corev1.Affinity{},
+		"global.waypoint.affinity")
+	runKubeList(values.GetGlobal().GetWaypoint().GetTopologySpreadConstraints(), &corev1.TopologySpreadConstraint{},
+		"global.waypoint.topologySpreadConstraints")
+	runKube(values.GetGlobal().GetWaypoint().GetNodeSelector(), &corev1.NodeSelector{}, "global.waypoint.nideSelector")
+	runKubeList(values.GetGlobal().GetWaypoint().GetToleration(), &corev1.Toleration{}, "global.waypoint.toleration")
 	return warnings, errs
+}
+
+func validateKubernetes(pb *structpb.Struct, c any) error {
+	j, err := protomarshal.Marshal(pb)
+	if err != nil {
+		return err
+	}
+
+	if err := yaml.UnmarshalStrict(j, c); err != nil {
+		return err
+	}
+	return nil
 }
 
 func validateMeshConfig(contents string) (Warnings, util.Errors) {

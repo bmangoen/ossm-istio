@@ -17,7 +17,6 @@ package model
 import (
 	"fmt"
 	"reflect"
-	"regexp"
 	"sort"
 	"sync"
 	"testing"
@@ -46,10 +45,14 @@ import (
 	"istio.io/istio/pkg/config/host"
 	"istio.io/istio/pkg/config/labels"
 	"istio.io/istio/pkg/config/mesh"
+	"istio.io/istio/pkg/config/mesh/meshwatcher"
 	"istio.io/istio/pkg/config/schema/gvk"
 	"istio.io/istio/pkg/config/schema/kind"
 	"istio.io/istio/pkg/config/visibility"
+	"istio.io/istio/pkg/kube"
+	"istio.io/istio/pkg/kube/krt"
 	"istio.io/istio/pkg/maps"
+	"istio.io/istio/pkg/model"
 	"istio.io/istio/pkg/slices"
 	"istio.io/istio/pkg/test"
 	"istio.io/istio/pkg/test/util/assert"
@@ -74,37 +77,36 @@ func TestMergeUpdateRequest(t *testing.T) {
 		{
 			"left nil",
 			nil,
-			&PushRequest{Full: true},
-			PushRequest{Full: true},
+			&PushRequest{Forced: true},
+			PushRequest{Forced: true},
 		},
 		{
 			"right nil",
-			&PushRequest{Full: true},
+			&PushRequest{Forced: true},
 			nil,
-			PushRequest{Full: true},
+			PushRequest{Forced: true},
 		},
 		{
 			"simple merge",
 			&PushRequest{
-				Full:  true,
 				Push:  push0,
 				Start: t0,
 				ConfigsUpdated: sets.Set[ConfigKey]{
 					{Kind: kind.Kind(1), Namespace: "ns1"}: {},
 				},
 				Reason: NewReasonStats(ServiceUpdate, ServiceUpdate),
+				Forced: true,
 			},
 			&PushRequest{
-				Full:  false,
 				Push:  push1,
 				Start: t1,
 				ConfigsUpdated: sets.Set[ConfigKey]{
 					{Kind: kind.Kind(2), Namespace: "ns2"}: {},
 				},
 				Reason: NewReasonStats(EndpointUpdate),
+				Forced: false,
 			},
 			PushRequest{
-				Full:  true,
 				Push:  push1,
 				Start: t0,
 				ConfigsUpdated: sets.Set[ConfigKey]{
@@ -112,15 +114,18 @@ func TestMergeUpdateRequest(t *testing.T) {
 					{Kind: kind.Kind(2), Namespace: "ns2"}: {},
 				},
 				Reason: NewReasonStats(ServiceUpdate, ServiceUpdate, EndpointUpdate),
+				Forced: true,
 			},
 		},
 		{
 			"skip config type merge: one empty",
-			&PushRequest{Full: true, ConfigsUpdated: nil},
-			&PushRequest{Full: true, ConfigsUpdated: sets.Set[ConfigKey]{{
+			&PushRequest{ConfigsUpdated: nil, Forced: true},
+			&PushRequest{ConfigsUpdated: sets.Set[ConfigKey]{{
 				Kind: kind.Kind(2),
 			}: {}}},
-			PushRequest{Full: true, ConfigsUpdated: nil, Reason: nil},
+			PushRequest{ConfigsUpdated: sets.Set[ConfigKey]{{
+				Kind: kind.Kind(2),
+			}: {}}, Reason: nil, Forced: true},
 		},
 	}
 
@@ -155,40 +160,132 @@ func TestConcurrentMerge(t *testing.T) {
 }
 
 func TestEnvoyFilters(t *testing.T) {
-	proxyVersionRegex := regexp.MustCompile(`1\.4.*`)
 	envoyFilters := []*EnvoyFilterWrapper{
-		{
-			Name:             "ef1",
-			workloadSelector: map[string]string{"app": "v1"},
-			Patches: map[networking.EnvoyFilter_ApplyTo][]*EnvoyFilterConfigPatchWrapper{
-				networking.EnvoyFilter_LISTENER: {
+		convertToEnvoyFilterWrapper(&config.Config{
+			Meta: config.Meta{
+				Name:      "ef1",
+				Namespace: "test-ns",
+			},
+			Spec: &networking.EnvoyFilter{
+				WorkloadSelector: &networking.WorkloadSelector{
+					Labels: map[string]string{"app": "v1"},
+				},
+				ConfigPatches: []*networking.EnvoyFilter_EnvoyConfigObjectPatch{
 					{
+						ApplyTo: networking.EnvoyFilter_LISTENER,
 						Match: &networking.EnvoyFilter_EnvoyConfigObjectMatch{
 							Proxy: &networking.EnvoyFilter_ProxyMatch{
 								ProxyVersion: "1\\.4.*",
 							},
 						},
-						ProxyVersionRegex: proxyVersionRegex,
+						// we don't care about the patch content in this test, but it must be non-nil
+						Patch: &networking.EnvoyFilter_Patch{},
 					},
 				},
 			},
-		},
-		{
-			Name:             "ef2",
-			workloadSelector: map[string]string{"app": "v1"},
-			Patches: map[networking.EnvoyFilter_ApplyTo][]*EnvoyFilterConfigPatchWrapper{
-				networking.EnvoyFilter_CLUSTER: {
+		}),
+		convertToEnvoyFilterWrapper(&config.Config{
+			Meta: config.Meta{
+				Name:      "ef2",
+				Namespace: "test-ns",
+			},
+			Spec: &networking.EnvoyFilter{
+				WorkloadSelector: &networking.WorkloadSelector{
+					Labels: map[string]string{"app": "v1"},
+				},
+				ConfigPatches: []*networking.EnvoyFilter_EnvoyConfigObjectPatch{
 					{
+						ApplyTo: networking.EnvoyFilter_CLUSTER,
 						Match: &networking.EnvoyFilter_EnvoyConfigObjectMatch{
 							Proxy: &networking.EnvoyFilter_ProxyMatch{
-								ProxyVersion: `1\\.4.*`,
+								ProxyVersion: "1\\.4.*",
 							},
 						},
-						ProxyVersionRegex: proxyVersionRegex,
+						// we don't care about the patch content in this test, but it must be non-nil
+						Patch: &networking.EnvoyFilter_Patch{},
 					},
 				},
 			},
-		},
+		}),
+		convertToEnvoyFilterWrapper(&config.Config{
+			Meta: config.Meta{
+				Name:      "ef-with-target-ref",
+				Namespace: "test-ns",
+			},
+			Spec: &networking.EnvoyFilter{
+				TargetRefs: []*selectorpb.PolicyTargetReference{
+					{
+						Group: "gateway.networking.k8s.io",
+						Kind:  "Gateway",
+						Name:  "gateway-1",
+					},
+				},
+				ConfigPatches: []*networking.EnvoyFilter_EnvoyConfigObjectPatch{
+					{
+						ApplyTo: networking.EnvoyFilter_CLUSTER,
+						Match: &networking.EnvoyFilter_EnvoyConfigObjectMatch{
+							Proxy: &networking.EnvoyFilter_ProxyMatch{
+								ProxyVersion: "1\\.4.*",
+							},
+						},
+						// we don't care about the patch content in this test, but it must be non-nil
+						Patch: &networking.EnvoyFilter_Patch{},
+					},
+				},
+			},
+		}),
+		convertToEnvoyFilterWrapper(&config.Config{
+			Meta: config.Meta{
+				Name:      "ef-for-waypoint",
+				Namespace: "test-ns",
+			},
+			Spec: &networking.EnvoyFilter{
+				TargetRefs: []*selectorpb.PolicyTargetReference{
+					{
+						Group: "gateway.networking.k8s.io",
+						Kind:  "Gateway",
+						Name:  "waypoint",
+					},
+				},
+				ConfigPatches: []*networking.EnvoyFilter_EnvoyConfigObjectPatch{
+					{
+						ApplyTo: networking.EnvoyFilter_CLUSTER,
+						// we don't care about the patch content in this test, but it must be non-nil
+						Patch: &networking.EnvoyFilter_Patch{},
+					},
+				},
+			},
+		}),
+	}
+
+	rootEnvoyFilters := []*EnvoyFilterWrapper{
+		convertToEnvoyFilterWrapper(&config.Config{
+			Meta: config.Meta{
+				Name:      "ef-gatewayclass-root",
+				Namespace: "istio-system",
+			},
+			Spec: &networking.EnvoyFilter{
+				TargetRefs: []*selectorpb.PolicyTargetReference{
+					{
+						Group: "gateway.networking.k8s.io",
+						Kind:  "GatewayClass",
+						Name:  "istio-waypoint",
+					},
+				},
+				ConfigPatches: []*networking.EnvoyFilter_EnvoyConfigObjectPatch{
+					{
+						ApplyTo: networking.EnvoyFilter_HTTP_FILTER,
+						Match: &networking.EnvoyFilter_EnvoyConfigObjectMatch{
+							Proxy: &networking.EnvoyFilter_ProxyMatch{
+								ProxyVersion: "1\\.4.*",
+							},
+						},
+						// we don't care about the patch content in this test, but it must be non-nil
+						Patch: &networking.EnvoyFilter_Patch{},
+					},
+				},
+			},
+		}),
 	}
 
 	push := &PushContext{
@@ -196,7 +293,7 @@ func TestEnvoyFilters(t *testing.T) {
 			RootNamespace: "istio-system",
 		},
 		envoyFiltersByNamespace: map[string][]*EnvoyFilterWrapper{
-			"istio-system": envoyFilters,
+			"istio-system": append(envoyFilters, rootEnvoyFilters...),
 			"test-ns":      envoyFilters,
 		},
 	}
@@ -209,10 +306,11 @@ func TestEnvoyFilters(t *testing.T) {
 	}
 
 	cases := []struct {
-		name                    string
-		proxy                   *Proxy
-		expectedListenerPatches int
-		expectedClusterPatches  int
+		name                      string
+		proxy                     *Proxy
+		expectedListenerPatches   int
+		expectedClusterPatches    int
+		expectedHTTPFilterPatches int
 	}{
 		{
 			name: "proxy matches two envoyfilters",
@@ -221,8 +319,9 @@ func TestEnvoyFilters(t *testing.T) {
 				Metadata:        &NodeMetadata{IstioVersion: "1.4.0", Labels: map[string]string{"app": "v1"}},
 				ConfigNamespace: "test-ns",
 			},
-			expectedListenerPatches: 2,
-			expectedClusterPatches:  2,
+			expectedListenerPatches:   2,
+			expectedClusterPatches:    2,
+			expectedHTTPFilterPatches: 0,
 		},
 		{
 			name: "proxy in root namespace matches an envoyfilter",
@@ -231,10 +330,10 @@ func TestEnvoyFilters(t *testing.T) {
 				Metadata:        &NodeMetadata{IstioVersion: "1.4.0", Labels: map[string]string{"app": "v1"}},
 				ConfigNamespace: "istio-system",
 			},
-			expectedListenerPatches: 1,
-			expectedClusterPatches:  1,
+			expectedListenerPatches:   1,
+			expectedClusterPatches:    1,
+			expectedHTTPFilterPatches: 0,
 		},
-
 		{
 			name: "proxy matches no envoyfilter",
 			proxy: &Proxy{
@@ -242,8 +341,9 @@ func TestEnvoyFilters(t *testing.T) {
 				Metadata:        &NodeMetadata{IstioVersion: "1.4.0", Labels: map[string]string{"app": "v2"}},
 				ConfigNamespace: "test-ns",
 			},
-			expectedListenerPatches: 0,
-			expectedClusterPatches:  0,
+			expectedListenerPatches:   0,
+			expectedClusterPatches:    0,
+			expectedHTTPFilterPatches: 0,
 		},
 		{
 			name: "proxy matches envoyfilter in root ns",
@@ -252,8 +352,9 @@ func TestEnvoyFilters(t *testing.T) {
 				Metadata:        &NodeMetadata{IstioVersion: "1.4.0", Labels: map[string]string{"app": "v1"}},
 				ConfigNamespace: "test-n2",
 			},
-			expectedListenerPatches: 1,
-			expectedClusterPatches:  1,
+			expectedListenerPatches:   1,
+			expectedClusterPatches:    1,
+			expectedHTTPFilterPatches: 0,
 		},
 		{
 			name: "proxy version matches no envoyfilters",
@@ -262,8 +363,44 @@ func TestEnvoyFilters(t *testing.T) {
 				Metadata:        &NodeMetadata{IstioVersion: "1.3.0", Labels: map[string]string{"app": "v1"}},
 				ConfigNamespace: "test-ns",
 			},
-			expectedListenerPatches: 0,
-			expectedClusterPatches:  0,
+			expectedListenerPatches:   0,
+			expectedClusterPatches:    0,
+			expectedHTTPFilterPatches: 0,
+		},
+		{
+			name: "proxy matched target ref",
+			proxy: &Proxy{
+				Labels:          map[string]string{"gateway.networking.k8s.io/gateway-name": "gateway-1"},
+				Metadata:        &NodeMetadata{IstioVersion: "1.4.0", Labels: map[string]string{"app": "v1"}},
+				ConfigNamespace: "test-ns",
+			},
+			expectedListenerPatches:   0,
+			expectedClusterPatches:    2,
+			expectedHTTPFilterPatches: 0,
+		},
+		{
+			name: "waypoint matched",
+			proxy: &Proxy{
+				Type:            model.Waypoint,
+				Labels:          map[string]string{"gateway.networking.k8s.io/gateway-name": "waypoint"},
+				Metadata:        &NodeMetadata{IstioVersion: "1.4.0", Labels: map[string]string{"app": "v1"}},
+				ConfigNamespace: "test-ns",
+			},
+			expectedListenerPatches:   0,
+			expectedClusterPatches:    2,
+			expectedHTTPFilterPatches: 1,
+		},
+		{
+			name: "waypoint matched gatewayclass in root namespace",
+			proxy: &Proxy{
+				Type:            model.Waypoint,
+				Labels:          map[string]string{"gateway.networking.k8s.io/gateway-name": "istio-waypoint"},
+				Metadata:        &NodeMetadata{IstioVersion: "1.4.0"},
+				ConfigNamespace: "test-ns",
+			},
+			expectedListenerPatches:   0,
+			expectedClusterPatches:    0,
+			expectedHTTPFilterPatches: 1,
 		},
 	}
 
@@ -271,7 +408,7 @@ func TestEnvoyFilters(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			filter := push.EnvoyFilters(tt.proxy)
 			if filter == nil {
-				if tt.expectedClusterPatches != 0 || tt.expectedListenerPatches != 0 {
+				if tt.expectedClusterPatches != 0 || tt.expectedListenerPatches != 0 || tt.expectedHTTPFilterPatches != 0 {
 					t.Errorf("Got no envoy filter")
 				}
 				return
@@ -281,6 +418,9 @@ func TestEnvoyFilters(t *testing.T) {
 			}
 			if len(filter.Patches[networking.EnvoyFilter_LISTENER]) != tt.expectedListenerPatches {
 				t.Errorf("Expect %d envoy filter listener patches, but got %d", tt.expectedListenerPatches, len(filter.Patches[networking.EnvoyFilter_LISTENER]))
+			}
+			if len(filter.Patches[networking.EnvoyFilter_HTTP_FILTER]) != tt.expectedHTTPFilterPatches {
+				t.Errorf("Expect %d envoy filter http filter patches, but got %d", tt.expectedHTTPFilterPatches, len(filter.Patches[networking.EnvoyFilter_HTTP_FILTER]))
 			}
 		})
 	}
@@ -445,7 +585,7 @@ func TestEnvoyFilterOrder(t *testing.T) {
 	}
 	env.ConfigStore = store
 	m := mesh.DefaultMeshConfig()
-	env.Watcher = mesh.NewFixedWatcher(m)
+	env.Watcher = meshwatcher.NewTestWatcher(m)
 	env.Init()
 
 	// Init a new push context
@@ -529,7 +669,7 @@ func TestEnvoyFilterOrderAcrossNamespaces(t *testing.T) {
 	env.ConfigStore = store
 	m := mesh.DefaultMeshConfig()
 	m.RootNamespace = "istio-system"
-	env.Watcher = mesh.NewFixedWatcher(m)
+	env.Watcher = meshwatcher.NewTestWatcher(m)
 	env.Init()
 
 	// Init a new push context
@@ -862,7 +1002,7 @@ func TestEnvoyFilterUpdate(t *testing.T) {
 			}
 			env.ConfigStore = store
 			m := mesh.DefaultMeshConfig()
-			env.Watcher = mesh.NewFixedWatcher(m)
+			env.Watcher = meshwatcher.NewTestWatcher(m)
 			env.Init()
 
 			// Init a new push context
@@ -893,9 +1033,12 @@ func TestEnvoyFilterUpdate(t *testing.T) {
 			createSet := sets.New(maps.Keys(creates)...)
 			updateSet := sets.New(maps.Keys(updates)...)
 			changes := deletes.Union(createSet).Union(updateSet)
+			changedKeys := sets.New(slices.Map(changes.UnsortedList(), func(key ConfigKey) types.NamespacedName {
+				return types.NamespacedName{Namespace: key.Namespace, Name: key.Name}
+			})...)
 
 			pc2 := NewPushContext()
-			pc2.initEnvoyFilters(env, changes, pc1.envoyFiltersByNamespace)
+			pc2.initEnvoyFilters(env, changedKeys, pc1.envoyFiltersByNamespace)
 
 			total2 := 0
 			for ns, envoyFilters := range pc2.envoyFiltersByNamespace {
@@ -977,116 +1120,141 @@ func TestEnvoyFilterUpdate(t *testing.T) {
 	}
 }
 
-func TestWasmPlugins(t *testing.T) {
+func TestTrafficExtensions(t *testing.T) {
 	env := &Environment{}
 	store := NewFakeStore()
 
-	wasmPlugins := map[string]config.Config{
+	trafficExtensions := map[string]config.Config{
 		"invalid-type": {
-			Meta: config.Meta{Name: "invalid-type", Namespace: constants.IstioSystemNamespace, GroupVersionKind: gvk.WasmPlugin},
+			Meta: config.Meta{Name: "invalid-type", Namespace: constants.IstioSystemNamespace, GroupVersionKind: gvk.TrafficExtension},
 			Spec: &networking.DestinationRule{},
 		},
-		"invalid-url": {
-			Meta: config.Meta{Name: "invalid-url", Namespace: constants.IstioSystemNamespace, GroupVersionKind: gvk.WasmPlugin},
-			Spec: &extensions.WasmPlugin{
-				Phase:    extensions.PluginPhase_AUTHN,
+		"both-wasm-and-lua": {
+			Meta: config.Meta{Name: "both-wasm-and-lua", Namespace: constants.IstioSystemNamespace, GroupVersionKind: gvk.TrafficExtension},
+			Spec: &extensions.TrafficExtension{
+				Phase:    extensions.TrafficExtension_AUTHN,
 				Priority: &wrapperspb.Int32Value{Value: 5},
-				Url:      "notavalid%%Url;",
+				// Note: oneof FilterConfig cannot hold both Wasm and Lua; use empty URL to test invalid config rejection
+				FilterConfig: &extensions.TrafficExtension_Wasm{Wasm: &extensions.WasmConfig{
+					Url: "", // Empty URL makes this invalid and should be rejected
+				}},
 			},
 		},
-		"authn-low-prio-all": {
-			Meta: config.Meta{Name: "authn-low-prio-all", Namespace: "testns-1", GroupVersionKind: gvk.WasmPlugin},
-			Spec: &extensions.WasmPlugin{
-				Phase:    extensions.PluginPhase_AUTHN,
+		"authn-lua-low-prio-all": {
+			Meta: config.Meta{Name: "authn-lua-low-prio-all", Namespace: "testns-1", GroupVersionKind: gvk.TrafficExtension},
+			Spec: &extensions.TrafficExtension{
+				Phase:    extensions.TrafficExtension_AUTHN,
 				Priority: &wrapperspb.Int32Value{Value: 10},
-				Url:      "file:///etc/istio/filters/authn.wasm",
-				PluginConfig: &structpb.Struct{
-					Fields: map[string]*structpb.Value{
-						"test": {
-							Kind: &structpb.Value_StringValue{StringValue: "test"},
+				FilterConfig: &extensions.TrafficExtension_Lua{Lua: &extensions.LuaConfig{
+					InlineCode: "function envoy_on_request(request_handle) end",
+				}},
+			},
+		},
+		"authn-wasm-low-prio-all": {
+			Meta: config.Meta{Name: "authn-wasm-low-prio-all", Namespace: "testns-1", GroupVersionKind: gvk.TrafficExtension},
+			Spec: &extensions.TrafficExtension{
+				Phase:    extensions.TrafficExtension_AUTHN,
+				Priority: &wrapperspb.Int32Value{Value: 10},
+				FilterConfig: &extensions.TrafficExtension_Wasm{Wasm: &extensions.WasmConfig{
+					Url: "file:///etc/istio/filters/authn.wasm",
+					PluginConfig: &structpb.Struct{
+						Fields: map[string]*structpb.Value{
+							"test": {
+								Kind: &structpb.Value_StringValue{StringValue: "test"},
+							},
 						},
 					},
-				},
-				Sha256: "f2ca1bb6c7e907d06dafe4687e579fce76b37e4e93b7605022da52e6ccc26fd2",
+					Sha256: "f2ca1bb6c7e907d06dafe4687e579fce76b37e4e93b7605022da52e6ccc26fd2",
+				}},
 			},
 		},
-		"authn-low-prio-all-network": {
-			Meta: config.Meta{Name: "authn-low-prio-all-network", Namespace: "testns-1", GroupVersionKind: gvk.WasmPlugin},
-			Spec: &extensions.WasmPlugin{
-				Type:     extensions.PluginType_NETWORK,
-				Phase:    extensions.PluginPhase_AUTHN,
+		"authn-wasm-low-prio-all-network": {
+			Meta: config.Meta{Name: "authn-wasm-low-prio-all-network", Namespace: "testns-1", GroupVersionKind: gvk.TrafficExtension},
+			Spec: &extensions.TrafficExtension{
+				Phase:    extensions.TrafficExtension_AUTHN,
 				Priority: &wrapperspb.Int32Value{Value: 10},
-				Url:      "file:///etc/istio/filters/authn.wasm",
-				PluginConfig: &structpb.Struct{
-					Fields: map[string]*structpb.Value{
-						"test": {
-							Kind: &structpb.Value_StringValue{StringValue: "test"},
-						},
-					},
-				},
-				Sha256: "f2ca1bb6c7e907d06dafe4687e579fce76b37e4e93b7605022da52e6ccc26fd2",
+				FilterConfig: &extensions.TrafficExtension_Wasm{Wasm: &extensions.WasmConfig{
+					Type:   extensions.PluginType_NETWORK,
+					Url:    "file:///etc/istio/filters/authn.wasm",
+					Sha256: "f2ca1bb6c7e907d06dafe4687e579fce76b37e4e93b7605022da52e6ccc26fd2",
+				}},
 			},
 		},
-		"global-authn-low-prio-ingress": {
-			Meta: config.Meta{Name: "global-authn-low-prio-ingress", Namespace: constants.IstioSystemNamespace, GroupVersionKind: gvk.WasmPlugin},
-			Spec: &extensions.WasmPlugin{
-				Phase:    extensions.PluginPhase_AUTHN,
+		"global-authn-lua-low-prio-ingress": {
+			Meta: config.Meta{Name: "global-authn-lua-low-prio-ingress", Namespace: constants.IstioSystemNamespace, GroupVersionKind: gvk.TrafficExtension},
+			Spec: &extensions.TrafficExtension{
+				Phase:    extensions.TrafficExtension_AUTHN,
 				Priority: &wrapperspb.Int32Value{Value: 5},
 				Selector: &selectorpb.WorkloadSelector{
 					MatchLabels: map[string]string{
 						"istio": "ingressgateway",
 					},
 				},
+				FilterConfig: &extensions.TrafficExtension_Lua{Lua: &extensions.LuaConfig{
+					InlineCode: "function envoy_on_request(request_handle) end",
+				}},
 			},
 		},
-		"authn-med-prio-all": {
-			Meta: config.Meta{Name: "authn-med-prio-all", Namespace: "testns-1", GroupVersionKind: gvk.WasmPlugin},
-			Spec: &extensions.WasmPlugin{
-				Phase:    extensions.PluginPhase_AUTHN,
+		"authn-lua-med-prio-all": {
+			Meta: config.Meta{Name: "authn-lua-med-prio-all", Namespace: "testns-1", GroupVersionKind: gvk.TrafficExtension},
+			Spec: &extensions.TrafficExtension{
+				Phase:    extensions.TrafficExtension_AUTHN,
 				Priority: &wrapperspb.Int32Value{Value: 50},
+				FilterConfig: &extensions.TrafficExtension_Lua{Lua: &extensions.LuaConfig{
+					InlineCode: "function envoy_on_request(request_handle) end",
+				}},
 			},
 		},
-		"global-authn-high-prio-app": {
-			Meta: config.Meta{Name: "global-authn-high-prio-app", Namespace: constants.IstioSystemNamespace, GroupVersionKind: gvk.WasmPlugin},
-			Spec: &extensions.WasmPlugin{
-				Phase:    extensions.PluginPhase_AUTHN,
+		"global-authn-wasm-high-prio-app": {
+			Meta: config.Meta{Name: "global-authn-wasm-high-prio-app", Namespace: constants.IstioSystemNamespace, GroupVersionKind: gvk.TrafficExtension},
+			Spec: &extensions.TrafficExtension{
+				Phase:    extensions.TrafficExtension_AUTHN,
 				Priority: &wrapperspb.Int32Value{Value: 1000},
 				Selector: &selectorpb.WorkloadSelector{
 					MatchLabels: map[string]string{
 						"app": "productpage",
 					},
 				},
-				Match: []*extensions.WasmPlugin_TrafficSelector{
+				Match: []*extensions.TrafficSelector{
 					{
 						Mode:  selectorpb.WorkloadMode_SERVER,
 						Ports: []*selectorpb.PortSelector{{Number: 1234}},
 					},
 				},
+				FilterConfig: &extensions.TrafficExtension_Wasm{Wasm: &extensions.WasmConfig{
+					Url: "oci://example.com/filter:v1",
+				}},
 			},
 		},
-		"global-authz-med-prio-app": {
-			Meta: config.Meta{Name: "global-authz-med-prio-app", Namespace: constants.IstioSystemNamespace, GroupVersionKind: gvk.WasmPlugin},
-			Spec: &extensions.WasmPlugin{
-				Phase:    extensions.PluginPhase_AUTHZ,
+		"global-authz-lua-med-prio-app": {
+			Meta: config.Meta{Name: "global-authz-lua-med-prio-app", Namespace: constants.IstioSystemNamespace, GroupVersionKind: gvk.TrafficExtension},
+			Spec: &extensions.TrafficExtension{
+				Phase:    extensions.TrafficExtension_AUTHZ,
 				Priority: &wrapperspb.Int32Value{Value: 50},
 				Selector: &selectorpb.WorkloadSelector{
 					MatchLabels: map[string]string{
 						"app": "productpage",
 					},
 				},
-				Match: []*extensions.WasmPlugin_TrafficSelector{
+				Match: []*extensions.TrafficSelector{
 					{
 						Mode:  selectorpb.WorkloadMode_SERVER,
 						Ports: []*selectorpb.PortSelector{{Number: 1235}},
 					},
 				},
+				FilterConfig: &extensions.TrafficExtension_Lua{Lua: &extensions.LuaConfig{
+					InlineCode: "function envoy_on_request(request_handle) end",
+				}},
 			},
 		},
-		"authz-high-prio-ingress": {
-			Meta: config.Meta{Name: "authz-high-prio-ingress", Namespace: "testns-2", GroupVersionKind: gvk.WasmPlugin},
-			Spec: &extensions.WasmPlugin{
-				Phase:    extensions.PluginPhase_AUTHZ,
+		"authz-wasm-high-prio-ingress": {
+			Meta: config.Meta{Name: "authz-wasm-high-prio-ingress", Namespace: "testns-2", GroupVersionKind: gvk.TrafficExtension},
+			Spec: &extensions.TrafficExtension{
+				Phase:    extensions.TrafficExtension_AUTHZ,
 				Priority: &wrapperspb.Int32Value{Value: 1000},
+				FilterConfig: &extensions.TrafficExtension_Wasm{Wasm: &extensions.WasmConfig{
+					Url: "oci://example.com/authz:v1",
+				}},
 			},
 		},
 	}
@@ -1094,15 +1262,15 @@ func TestWasmPlugins(t *testing.T) {
 	testCases := []struct {
 		name               string
 		node               *Proxy
-		listenerInfo       WasmPluginListenerInfo
-		pluginType         WasmPluginType
-		expectedExtensions map[extensions.PluginPhase][]*WasmPluginWrapper
+		listenerInfo       ListenerInfo
+		chainType          FilterChainType
+		expectedExtensions map[extensions.TrafficExtension_ExecutionPhase][]*TrafficExtensionWrapper
 	}{
 		{
 			name:               "nil proxy",
 			node:               nil,
-			listenerInfo:       anyListener,
-			pluginType:         WasmPluginTypeHTTP,
+			listenerInfo:       ListenerInfo{},
+			chainType:          FilterChainTypeHTTP,
 			expectedExtensions: nil,
 		},
 		{
@@ -1111,9 +1279,9 @@ func TestWasmPlugins(t *testing.T) {
 				ConfigNamespace: "other",
 				Metadata:        &NodeMetadata{},
 			},
-			listenerInfo:       anyListener,
-			pluginType:         WasmPluginTypeHTTP,
-			expectedExtensions: map[extensions.PluginPhase][]*WasmPluginWrapper{},
+			listenerInfo:       ListenerInfo{},
+			chainType:          FilterChainTypeHTTP,
+			expectedExtensions: map[extensions.TrafficExtension_ExecutionPhase][]*TrafficExtensionWrapper{},
 		},
 		{
 			name: "ingress",
@@ -1128,11 +1296,11 @@ func TestWasmPlugins(t *testing.T) {
 					},
 				},
 			},
-			listenerInfo: anyListener,
-			pluginType:   WasmPluginTypeHTTP,
-			expectedExtensions: map[extensions.PluginPhase][]*WasmPluginWrapper{
-				extensions.PluginPhase_AUTHN: {
-					convertToWasmPluginWrapper(wasmPlugins["global-authn-low-prio-ingress"]),
+			listenerInfo: ListenerInfo{},
+			chainType:    FilterChainTypeHTTP,
+			expectedExtensions: map[extensions.TrafficExtension_ExecutionPhase][]*TrafficExtensionWrapper{
+				extensions.TrafficExtension_AUTHN: {
+					convertToTrafficExtensionWrapper(trafficExtensions["global-authn-lua-low-prio-ingress"]),
 				},
 			},
 		},
@@ -1149,13 +1317,14 @@ func TestWasmPlugins(t *testing.T) {
 					},
 				},
 			},
-			listenerInfo: anyListener,
-			pluginType:   WasmPluginTypeHTTP,
-			expectedExtensions: map[extensions.PluginPhase][]*WasmPluginWrapper{
-				extensions.PluginPhase_AUTHN: {
-					convertToWasmPluginWrapper(wasmPlugins["authn-med-prio-all"]),
-					convertToWasmPluginWrapper(wasmPlugins["authn-low-prio-all"]),
-					convertToWasmPluginWrapper(wasmPlugins["global-authn-low-prio-ingress"]),
+			listenerInfo: ListenerInfo{},
+			chainType:    FilterChainTypeHTTP,
+			expectedExtensions: map[extensions.TrafficExtension_ExecutionPhase][]*TrafficExtensionWrapper{
+				extensions.TrafficExtension_AUTHN: {
+					convertToTrafficExtensionWrapper(trafficExtensions["authn-lua-med-prio-all"]),
+					convertToTrafficExtensionWrapper(trafficExtensions["authn-lua-low-prio-all"]),
+					convertToTrafficExtensionWrapper(trafficExtensions["authn-wasm-low-prio-all"]),
+					convertToTrafficExtensionWrapper(trafficExtensions["global-authn-lua-low-prio-ingress"]),
 				},
 			},
 		},
@@ -1172,11 +1341,11 @@ func TestWasmPlugins(t *testing.T) {
 					},
 				},
 			},
-			listenerInfo: anyListener,
-			pluginType:   WasmPluginTypeNetwork,
-			expectedExtensions: map[extensions.PluginPhase][]*WasmPluginWrapper{
-				extensions.PluginPhase_AUTHN: {
-					convertToWasmPluginWrapper(wasmPlugins["authn-low-prio-all-network"]),
+			listenerInfo: ListenerInfo{},
+			chainType:    FilterChainTypeNetwork,
+			expectedExtensions: map[extensions.TrafficExtension_ExecutionPhase][]*TrafficExtensionWrapper{
+				extensions.TrafficExtension_AUTHN: {
+					convertToTrafficExtensionWrapper(trafficExtensions["authn-wasm-low-prio-all-network"]),
 				},
 			},
 		},
@@ -1193,14 +1362,15 @@ func TestWasmPlugins(t *testing.T) {
 					},
 				},
 			},
-			listenerInfo: anyListener,
-			pluginType:   WasmPluginTypeAny,
-			expectedExtensions: map[extensions.PluginPhase][]*WasmPluginWrapper{
-				extensions.PluginPhase_AUTHN: {
-					convertToWasmPluginWrapper(wasmPlugins["authn-med-prio-all"]),
-					convertToWasmPluginWrapper(wasmPlugins["authn-low-prio-all"]),
-					convertToWasmPluginWrapper(wasmPlugins["authn-low-prio-all-network"]),
-					convertToWasmPluginWrapper(wasmPlugins["global-authn-low-prio-ingress"]),
+			listenerInfo: ListenerInfo{},
+			chainType:    FilterChainTypeAny,
+			expectedExtensions: map[extensions.TrafficExtension_ExecutionPhase][]*TrafficExtensionWrapper{
+				extensions.TrafficExtension_AUTHN: {
+					convertToTrafficExtensionWrapper(trafficExtensions["authn-lua-med-prio-all"]),
+					convertToTrafficExtensionWrapper(trafficExtensions["authn-lua-low-prio-all"]),
+					convertToTrafficExtensionWrapper(trafficExtensions["authn-wasm-low-prio-all"]),
+					convertToTrafficExtensionWrapper(trafficExtensions["authn-wasm-low-prio-all-network"]),
+					convertToTrafficExtensionWrapper(trafficExtensions["global-authn-lua-low-prio-ingress"]),
 				},
 			},
 		},
@@ -1217,25 +1387,25 @@ func TestWasmPlugins(t *testing.T) {
 					},
 				},
 			},
-			listenerInfo: anyListener,
-			pluginType:   WasmPluginTypeHTTP,
-			expectedExtensions: map[extensions.PluginPhase][]*WasmPluginWrapper{
-				extensions.PluginPhase_AUTHN: {
-					convertToWasmPluginWrapper(wasmPlugins["global-authn-high-prio-app"]),
+			listenerInfo: ListenerInfo{},
+			chainType:    FilterChainTypeHTTP,
+			expectedExtensions: map[extensions.TrafficExtension_ExecutionPhase][]*TrafficExtensionWrapper{
+				extensions.TrafficExtension_AUTHN: {
+					convertToTrafficExtensionWrapper(trafficExtensions["global-authn-wasm-high-prio-app"]),
 				},
-				extensions.PluginPhase_AUTHZ: {
-					convertToWasmPluginWrapper(wasmPlugins["authz-high-prio-ingress"]),
-					convertToWasmPluginWrapper(wasmPlugins["global-authz-med-prio-app"]),
+				extensions.TrafficExtension_AUTHZ: {
+					convertToTrafficExtensionWrapper(trafficExtensions["authz-wasm-high-prio-ingress"]),
+					convertToTrafficExtensionWrapper(trafficExtensions["global-authz-lua-med-prio-app"]),
 				},
 			},
 		},
 		{
 			// Detailed tests regarding TrafficSelector are in extension_test.go
 			// Just test the integrity here.
-			// This testcase is identical with "testns-2", but `listenerInfo`` is specified.
-			// 1. `global-authn-high-prio-app` matched, because it has a port matching clause with "1234"
-			// 2. `authz-high-prio-ingress` matched, because it does not have any `match` clause
-			// 3. `global-authz-med-prio-app` not matched, because it has a port matching clause with "1235"
+			// This testcase is identical with "testns-2", but `listenerInfo` is specified.
+			// 1. `global-authn-wasm-high-prio-app` matched, because it has a port matching clause with "1234"
+			// 2. `authz-wasm-high-prio-ingress` matched, because it does not have any `match` clause
+			// 3. `global-authz-lua-med-prio-app` not matched, because it has a port matching clause with "1235"
 			name: "testns-2-with-port-match",
 			node: &Proxy{
 				ConfigNamespace: "testns-2",
@@ -1248,40 +1418,40 @@ func TestWasmPlugins(t *testing.T) {
 					},
 				},
 			},
-			listenerInfo: WasmPluginListenerInfo{
+			listenerInfo: ListenerInfo{
 				Port:  1234,
 				Class: istionetworking.ListenerClassSidecarInbound,
 			},
-			pluginType: WasmPluginTypeHTTP,
-			expectedExtensions: map[extensions.PluginPhase][]*WasmPluginWrapper{
-				extensions.PluginPhase_AUTHN: {
-					convertToWasmPluginWrapper(wasmPlugins["global-authn-high-prio-app"]),
+			chainType: FilterChainTypeHTTP,
+			expectedExtensions: map[extensions.TrafficExtension_ExecutionPhase][]*TrafficExtensionWrapper{
+				extensions.TrafficExtension_AUTHN: {
+					convertToTrafficExtensionWrapper(trafficExtensions["global-authn-wasm-high-prio-app"]),
 				},
-				extensions.PluginPhase_AUTHZ: {
-					convertToWasmPluginWrapper(wasmPlugins["authz-high-prio-ingress"]),
+				extensions.TrafficExtension_AUTHZ: {
+					convertToTrafficExtensionWrapper(trafficExtensions["authz-wasm-high-prio-ingress"]),
 				},
 			},
 		},
 	}
 
-	for _, config := range wasmPlugins {
+	for _, config := range trafficExtensions {
 		store.Create(config)
 	}
 	env.ConfigStore = store
 	m := mesh.DefaultMeshConfig()
-	env.Watcher = mesh.NewFixedWatcher(m)
+	env.Watcher = meshwatcher.NewTestWatcher(m)
 	env.Init()
 
 	// Init a new push context
 	pc := NewPushContext()
 	pc.Mesh = m
-	pc.initWasmPlugins(env)
+	pc.initTrafficExtensions(env)
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			result := pc.WasmPluginsByListenerInfo(tc.node, tc.listenerInfo, tc.pluginType)
+			result := pc.TrafficExtensionsByListenerInfo(tc.node, tc.listenerInfo, tc.chainType)
 			if !reflect.DeepEqual(tc.expectedExtensions, result) {
-				t.Errorf("WasmPlugins did not match expectations\n\ngot: %v\n\nexpected: %v", result, tc.expectedExtensions)
+				t.Errorf("TrafficExtensions did not match expectations\n\ngot: %v\n\nexpected: %v", result, tc.expectedExtensions)
 			}
 		})
 	}
@@ -1290,7 +1460,8 @@ func TestWasmPlugins(t *testing.T) {
 func TestServiceIndex(t *testing.T) {
 	g := NewWithT(t)
 	env := NewEnvironment()
-	env.ConfigStore = NewFakeStore()
+	configController := NewFakeStore()
+	env.ConfigStore = configController
 	env.ServiceDiscovery = &localServiceDiscovery{
 		services: []*Service{
 			{
@@ -1351,29 +1522,123 @@ func TestServiceIndex(t *testing.T) {
 		},
 	}
 	m := mesh.DefaultMeshConfig()
-	env.Watcher = mesh.NewFixedWatcher(m)
+	env.Watcher = meshwatcher.NewTestWatcher(m)
+	stop := test.NewStop(t)
+	env.VirtualServiceController = NewVirtualServiceController(
+		configController,
+		VSControllerOptions{KrtDebugger: krt.GlobalDebugHandler},
+		env.Watcher,
+	)
+	go configController.Run(stop)
+	go env.VirtualServiceController.Run(stop)
+	kube.WaitForCacheSync("test", stop, configController.HasSynced)
+	kube.WaitForCacheSync("test", stop, env.VirtualServiceController.HasSynced)
 	env.Init()
 
 	// Init a new push context
 	pc := NewPushContext()
-	if err := pc.InitContext(env, nil, nil); err != nil {
-		t.Fatal(err)
-	}
+	pc.InitContext(env, nil, nil)
 	si := pc.ServiceIndex
 
 	// Should have all 5 services
 	g.Expect(si.instancesByPort).To(HaveLen(5))
 	g.Expect(si.HostnameAndNamespace).To(HaveLen(5))
 
-	// Should just have "namespace"
-	g.Expect(si.exportedToNamespace).To(HaveLen(1))
+	// Should have exported and private services in the right namespaces
+	g.Expect(si.exportedToNamespace).To(HaveLen(2))
 	g.Expect(serviceNames(si.exportedToNamespace["namespace"])).To(Equal([]string{"svc-namespace"}))
+	g.Expect(serviceNames(si.exportedToNamespace["test1"])).To(Equal([]string{"svc-private"}))
 
 	g.Expect(serviceNames(si.public)).To(Equal([]string{"svc-public", "svc-unset"}))
+}
 
-	// Should just have "test1"
-	g.Expect(si.privateByNamespace).To(HaveLen(1))
-	g.Expect(serviceNames(si.privateByNamespace["test1"])).To(Equal([]string{"svc-private"}))
+// TestServiceIndexDefaultServiceExportTo verifies that meshConfig.defaultServiceExportTo entries
+// that name specific namespaces (e.g. [".", "bar"]) are honored for services that do not
+// set their own exportTo: such services stay private to their own namespace AND are exported to the
+// additional namespaces listed in the default.
+func TestServiceIndexDefaultServiceExportTo(t *testing.T) {
+	g := NewWithT(t)
+	env := NewEnvironment()
+	configController := NewFakeStore()
+	env.ConfigStore = configController
+	env.ServiceDiscovery = &localServiceDiscovery{
+		services: []*Service{
+			{
+				Hostname: "svc-unset-1",
+				Ports:    allPorts,
+				Attributes: ServiceAttributes{
+					Namespace: "test1",
+				},
+			},
+			{
+				Hostname: "svc-unset-2",
+				Ports:    allPorts,
+				Attributes: ServiceAttributes{
+					Namespace: "test2",
+				},
+			},
+			{
+				// A service that already lives in the default target namespace must not be
+				// duplicated by the additional-namespace export.
+				Hostname: "svc-bar-ns",
+				Ports:    allPorts,
+				Attributes: ServiceAttributes{
+					Namespace: "bar",
+				},
+			},
+			{
+				// An explicit exportTo still takes precedence over the default.
+				Hostname: "svc-public",
+				Ports:    allPorts,
+				Attributes: ServiceAttributes{
+					Namespace: "test1",
+					ExportTo:  sets.New(visibility.Public),
+				},
+			},
+		},
+		serviceInstances: []*ServiceInstance{
+			{
+				Endpoint: &IstioEndpoint{
+					Addresses:    []string{"192.168.1.2"},
+					EndpointPort: 8000,
+					TLSMode:      DisabledTLSModeLabel,
+				},
+			},
+		},
+	}
+	m := mesh.DefaultMeshConfig()
+	m.DefaultServiceExportTo = []string{".", "bar"}
+	env.Watcher = meshwatcher.NewTestWatcher(m)
+	stop := test.NewStop(t)
+	env.VirtualServiceController = NewVirtualServiceController(
+		configController,
+		VSControllerOptions{KrtDebugger: krt.GlobalDebugHandler},
+		env.Watcher,
+	)
+	go configController.Run(stop)
+	go env.VirtualServiceController.Run(stop)
+	kube.WaitForCacheSync("test", stop, configController.HasSynced)
+	kube.WaitForCacheSync("test", stop, env.VirtualServiceController.HasSynced)
+	env.Init()
+
+	pc := NewPushContext()
+	pc.InitContext(env, nil, nil)
+	si := pc.ServiceIndex
+
+	// Default-private services are exported to their own namespace.
+	g.Expect(serviceNames(si.exportedToNamespace["test1"])).To(Equal([]string{"svc-unset-1"}))
+	g.Expect(serviceNames(si.exportedToNamespace["test2"])).To(Equal([]string{"svc-unset-2"}))
+
+	// All default-private services are additionally exported to the bar namespace, and the
+	// service already living in bar appears exactly once (no duplicate from the export loop).
+	g.Expect(serviceNames(si.exportedToNamespace["bar"])).
+		To(Equal([]string{"svc-bar-ns", "svc-unset-1", "svc-unset-2"}))
+
+	// Services with an explicit exportTo are unaffected by the default.
+	g.Expect(serviceNames(si.public)).To(Equal([]string{"svc-public"}))
+
+	// All services are counted in the total service count.
+	g.Expect(pc.GetTotalServiceCount()).To(Equal(4))
 }
 
 func TestIsServiceVisible(t *testing.T) {
@@ -1520,6 +1785,338 @@ func TestIsServiceVisible(t *testing.T) {
 			},
 			expect: false,
 		},
+		{
+			name: "service whose namespace is bar has no exportTo map with global private and target namespace foo",
+			pushContext: &PushContext{
+				exportToDefaults: exportToDefaults{
+					service: sets.New(visibility.Private, visibility.Instance("foo")),
+				},
+			},
+			service: &Service{
+				Attributes: ServiceAttributes{
+					Namespace: "bar",
+				},
+			},
+			expect: true,
+		},
+		{
+			name: "service whose namespace is bar has no exportTo map with global private and unrelated target namespace",
+			pushContext: &PushContext{
+				exportToDefaults: exportToDefaults{
+					service: sets.New(visibility.Private, visibility.Instance("baz")),
+				},
+			},
+			service: &Service{
+				Attributes: ServiceAttributes{
+					Namespace: "bar",
+				},
+			},
+			expect: false,
+		},
+		{
+			name: "service whose namespace is foo has no exportTo map with global private and unrelated target namespace",
+			pushContext: &PushContext{
+				exportToDefaults: exportToDefaults{
+					service: sets.New(visibility.Private, visibility.Instance("baz")),
+				},
+			},
+			service: &Service{
+				Attributes: ServiceAttributes{
+					Namespace: "foo",
+				},
+			},
+			expect: true,
+		},
+		// --- serviceEntryVisibility applyToSidecars ceiling (PushContext.serviceExportTo) ---
+		{
+			name: "applyToSidecars: NAMESPACE service in foo is visible in its own namespace",
+			pushContext: &PushContext{
+				Mesh: &meshconfig.MeshConfig{
+					ServiceEntryVisibility: &meshconfig.ServiceEntryVisibility{ApplyToSidecars: true},
+				},
+			},
+			service: &Service{
+				Attributes: ServiceAttributes{
+					Namespace:  "foo",
+					ExportTo:   sets.New(visibility.Public),
+					Visibility: ServiceVisibilityNamespace,
+				},
+			},
+			expect: true,
+		},
+		{
+			name: "applyToSidecars: NAMESPACE service in bar with exportTo=* is clamped, not visible in foo",
+			pushContext: &PushContext{
+				Mesh: &meshconfig.MeshConfig{
+					ServiceEntryVisibility: &meshconfig.ServiceEntryVisibility{ApplyToSidecars: true},
+				},
+			},
+			service: &Service{
+				Attributes: ServiceAttributes{
+					Namespace:  "bar",
+					ExportTo:   sets.New(visibility.Public),
+					Visibility: ServiceVisibilityNamespace,
+				},
+			},
+			expect: false,
+		},
+		{
+			name: "applyToSidecars: PUBLIC service in bar keeps exportTo=* (visible cross-namespace in foo)",
+			pushContext: &PushContext{
+				Mesh: &meshconfig.MeshConfig{
+					ServiceEntryVisibility: &meshconfig.ServiceEntryVisibility{ApplyToSidecars: true},
+				},
+			},
+			service: &Service{
+				Attributes: ServiceAttributes{
+					Namespace:  "bar",
+					ExportTo:   sets.New(visibility.Public),
+					Visibility: ServiceVisibilityPublic,
+				},
+			},
+			expect: true,
+		},
+		{
+			name: "applyToSidecars: NONE service is not visible even in its own namespace",
+			pushContext: &PushContext{
+				Mesh: &meshconfig.MeshConfig{
+					ServiceEntryVisibility: &meshconfig.ServiceEntryVisibility{ApplyToSidecars: true},
+				},
+			},
+			service: &Service{
+				Attributes: ServiceAttributes{
+					Namespace:  "foo",
+					ExportTo:   sets.New(visibility.Public),
+					Visibility: ServiceVisibilityNone,
+				},
+			},
+			expect: false,
+		},
+		{
+			name: "applyToSidecars: explicit exportTo=~ stays None under NAMESPACE visibility",
+			pushContext: &PushContext{
+				Mesh: &meshconfig.MeshConfig{
+					ServiceEntryVisibility: &meshconfig.ServiceEntryVisibility{ApplyToSidecars: true},
+				},
+			},
+			service: &Service{
+				Attributes: ServiceAttributes{
+					Namespace:  "foo",
+					ExportTo:   sets.New(visibility.None),
+					Visibility: ServiceVisibilityNamespace,
+				},
+			},
+			expect: false,
+		},
+		{
+			name: "applyToSidecars: explicit exportTo=~ stays None even under PUBLIC visibility",
+			pushContext: &PushContext{
+				Mesh: &meshconfig.MeshConfig{
+					ServiceEntryVisibility: &meshconfig.ServiceEntryVisibility{ApplyToSidecars: true},
+				},
+			},
+			service: &Service{
+				Attributes: ServiceAttributes{
+					Namespace:  "foo",
+					ExportTo:   sets.New(visibility.None),
+					Visibility: ServiceVisibilityPublic,
+				},
+			},
+			expect: false,
+		},
+		{
+			name: "applyToSidecars: exportTo=<own ns literal> under NAMESPACE stays visible in own namespace",
+			pushContext: &PushContext{
+				Mesh: &meshconfig.MeshConfig{
+					ServiceEntryVisibility: &meshconfig.ServiceEntryVisibility{ApplyToSidecars: true},
+				},
+			},
+			service: &Service{
+				Attributes: ServiceAttributes{
+					Namespace:  "foo",
+					ExportTo:   sets.New(visibility.Instance("foo")),
+					Visibility: ServiceVisibilityNamespace,
+				},
+			},
+			expect: true,
+		},
+		{
+			name: "applyToSidecars: exportTo=<own ns literal> under PUBLIC stays visible in own namespace",
+			pushContext: &PushContext{
+				Mesh: &meshconfig.MeshConfig{
+					ServiceEntryVisibility: &meshconfig.ServiceEntryVisibility{ApplyToSidecars: true},
+				},
+			},
+			service: &Service{
+				Attributes: ServiceAttributes{
+					Namespace:  "foo",
+					ExportTo:   sets.New(visibility.Instance("foo")),
+					Visibility: ServiceVisibilityPublic,
+				},
+			},
+			expect: true,
+		},
+		{
+			name: "applyToSidecars: NONE visibility hides service despite exportTo=.",
+			pushContext: &PushContext{
+				Mesh: &meshconfig.MeshConfig{
+					ServiceEntryVisibility: &meshconfig.ServiceEntryVisibility{ApplyToSidecars: true},
+				},
+			},
+			service: &Service{
+				Attributes: ServiceAttributes{
+					Namespace:  "foo",
+					ExportTo:   sets.New(visibility.Private),
+					Visibility: ServiceVisibilityNone,
+				},
+			},
+			expect: false,
+		},
+		{
+			// [*,~] resolves to public (* wins over ~), so it is clamped, not short-circuited by the ~.
+			name: "applyToSidecars: exportTo=[*,~] in foo is clamped to own namespace (visible in foo)",
+			pushContext: &PushContext{
+				Mesh: &meshconfig.MeshConfig{
+					ServiceEntryVisibility: &meshconfig.ServiceEntryVisibility{ApplyToSidecars: true},
+				},
+			},
+			service: &Service{
+				Attributes: ServiceAttributes{
+					Namespace:  "foo",
+					ExportTo:   sets.New(visibility.Public, visibility.None),
+					Visibility: ServiceVisibilityNamespace,
+				},
+			},
+			expect: true,
+		},
+		{
+			name: "applyToSidecars: exportTo=[*,~] in bar is clamped, not visible cross-namespace in foo",
+			pushContext: &PushContext{
+				Mesh: &meshconfig.MeshConfig{
+					ServiceEntryVisibility: &meshconfig.ServiceEntryVisibility{ApplyToSidecars: true},
+				},
+			},
+			service: &Service{
+				Attributes: ServiceAttributes{
+					Namespace:  "bar",
+					ExportTo:   sets.New(visibility.Public, visibility.None),
+					Visibility: ServiceVisibilityNamespace,
+				},
+			},
+			expect: false,
+		},
+		{
+			name: "applyToSidecars: exportTo=. under NAMESPACE stays visible in own namespace",
+			pushContext: &PushContext{
+				Mesh: &meshconfig.MeshConfig{
+					ServiceEntryVisibility: &meshconfig.ServiceEntryVisibility{ApplyToSidecars: true},
+				},
+			},
+			service: &Service{
+				Attributes: ServiceAttributes{
+					Namespace:  "foo",
+					ExportTo:   sets.New(visibility.Private),
+					Visibility: ServiceVisibilityNamespace,
+				},
+			},
+			expect: true,
+		},
+		{
+			name: "applyToSidecars: exportTo=<other ns> under NAMESPACE is None (disjoint intersection)",
+			pushContext: &PushContext{
+				Mesh: &meshconfig.MeshConfig{
+					ServiceEntryVisibility: &meshconfig.ServiceEntryVisibility{ApplyToSidecars: true},
+				},
+			},
+			service: &Service{
+				Attributes: ServiceAttributes{
+					Namespace:  "foo",
+					ExportTo:   sets.New(visibility.Instance("baz")),
+					Visibility: ServiceVisibilityNamespace,
+				},
+			},
+			expect: false,
+		},
+		{
+			name: "applyToSidecars: exportTo=[foo,baz] in foo stays visible in own namespace under NAMESPACE",
+			pushContext: &PushContext{
+				Mesh: &meshconfig.MeshConfig{
+					ServiceEntryVisibility: &meshconfig.ServiceEntryVisibility{ApplyToSidecars: true},
+				},
+			},
+			service: &Service{
+				Attributes: ServiceAttributes{
+					Namespace:  "foo",
+					ExportTo:   sets.New(visibility.Instance("foo"), visibility.Instance("baz")),
+					Visibility: ServiceVisibilityNamespace,
+				},
+			},
+			expect: true,
+		},
+		{
+			name: "applyToSidecars: exportTo=[foo,baz] in baz - NAMESPACE clamps away the cross-namespace foo grant",
+			pushContext: &PushContext{
+				Mesh: &meshconfig.MeshConfig{
+					ServiceEntryVisibility: &meshconfig.ServiceEntryVisibility{ApplyToSidecars: true},
+				},
+			},
+			service: &Service{
+				Attributes: ServiceAttributes{
+					Namespace:  "baz",
+					ExportTo:   sets.New(visibility.Instance("foo"), visibility.Instance("baz")),
+					Visibility: ServiceVisibilityNamespace,
+				},
+			},
+			expect: false,
+		},
+		{
+			name: "applyToSidecars: exportTo=[foo] in baz - NAMESPACE strips the explicit foo grant",
+			pushContext: &PushContext{
+				Mesh: &meshconfig.MeshConfig{
+					ServiceEntryVisibility: &meshconfig.ServiceEntryVisibility{ApplyToSidecars: true},
+				},
+			},
+			service: &Service{
+				Attributes: ServiceAttributes{
+					Namespace:  "baz",
+					ExportTo:   sets.New(visibility.Instance("foo")),
+					Visibility: ServiceVisibilityNamespace,
+				},
+			},
+			expect: false,
+		},
+		{
+			name: "applyToSidecars: exportTo=[baz] (own ns) in baz is namespace-local, not visible in foo",
+			pushContext: &PushContext{
+				Mesh: &meshconfig.MeshConfig{
+					ServiceEntryVisibility: &meshconfig.ServiceEntryVisibility{ApplyToSidecars: true},
+				},
+			},
+			service: &Service{
+				Attributes: ServiceAttributes{
+					Namespace:  "baz",
+					ExportTo:   sets.New(visibility.Instance("baz")),
+					Visibility: ServiceVisibilityNamespace,
+				},
+			},
+			expect: false,
+		},
+		{
+			name: "applyToSidecars disabled: NAMESPACE visibility is ignored, exportTo=* governs",
+			pushContext: &PushContext{
+				Mesh: &meshconfig.MeshConfig{
+					ServiceEntryVisibility: &meshconfig.ServiceEntryVisibility{ApplyToSidecars: false},
+				},
+			},
+			service: &Service{
+				Attributes: ServiceAttributes{
+					Namespace:  "bar",
+					ExportTo:   sets.New(visibility.Public),
+					Visibility: ServiceVisibilityNamespace,
+				},
+			},
+			expect: true,
+		},
 	}
 
 	for _, c := range cases {
@@ -1529,6 +2126,97 @@ func TestIsServiceVisible(t *testing.T) {
 			g := NewWithT(t)
 			g.Expect(isVisible).To(Equal(c.expect))
 		})
+	}
+}
+
+// TestServiceExportToNeverWidens asserts the ceiling invariant of serviceExportTo across its whole
+// input space: the clamp only ever narrows. Two properties, checked for every combination:
+//
+//  1. Never broader than declared: the effective set is not reachable in any namespace the declared
+//     exportTo is not.
+//  2. Never exceeds the visibility clamp (when applyToSidecars): NONE is reachable nowhere, NAMESPACE
+//     only in the service's own namespace.
+func TestServiceExportToNeverWidens(t *testing.T) {
+	// reachable mirrors IsServiceVisible's interpretation of an exportTo set for a target namespace.
+	reachable := func(set sets.Set[visibility.Instance], target, ownNs string) bool {
+		return set.Contains(visibility.Public) ||
+			(set.Contains(visibility.Private) && target == ownNs) ||
+			set.Contains(visibility.Instance(target))
+	}
+
+	// Atoms spanning every distinct exportTo value the clamp branches on: the three symbolic scopes,
+	// own-namespace (as serviceNamespaces vary over "foo"/"baz"), another mesh namespace, and an
+	// unrelated one. The invariants must hold for any declared set (many are invalid configs that
+	// validation rejects), so enumerate every non-empty subset rather than hand-picking forms.
+	baseSet := []visibility.Instance{
+		visibility.Public,
+		visibility.Private,
+		visibility.None,
+		visibility.Instance("foo"),
+		visibility.Instance("baz"),
+		visibility.Instance("qux"),
+	}
+	// Every non-empty subset of baseSet: start with the empty set and, for each atom, add it to a copy
+	// of every subset already collected (doubling the collection each round).
+	exportToForms := []sets.Set[visibility.Instance]{sets.New[visibility.Instance]()}
+	for _, atom := range baseSet {
+		n := len(exportToForms) // freeze before appending this round
+		for i := 0; i < n; i++ {
+			withAtom := exportToForms[i].Copy()
+			withAtom.Insert(atom)
+			exportToForms = append(exportToForms, withAtom)
+		}
+	}
+	exportToForms = exportToForms[1:] // drop the empty set: it selects the mesh default, not a clamp of the declared set
+	visibilities := map[string]ServiceVisibility{
+		"PUBLIC":    ServiceVisibilityPublic,
+		"NAMESPACE": ServiceVisibilityNamespace,
+		"NONE":      ServiceVisibilityNone,
+	}
+	serviceNamespaces := []string{"foo", "baz"}
+	clientNamespaces := []string{"foo", "baz", "qux"}
+
+	for _, apply := range []bool{true, false} {
+		for visName, vis := range visibilities {
+			for _, serviceNs := range serviceNamespaces {
+				for _, declared := range exportToForms {
+					ps := &PushContext{
+						Mesh: &meshconfig.MeshConfig{
+							ServiceEntryVisibility: &meshconfig.ServiceEntryVisibility{ApplyToSidecars: apply},
+						},
+					}
+					svc := &Service{Attributes: ServiceAttributes{
+						Namespace:  serviceNs,
+						ExportTo:   declared.Copy(),
+						Visibility: vis,
+					}}
+					effective := ps.serviceExportTo(svc)
+					for _, clientNs := range clientNamespaces {
+						// Invariant 1: never reachable where the declared exportTo is not.
+						if reachable(effective, clientNs, serviceNs) && !reachable(declared, clientNs, serviceNs) {
+							t.Errorf("widened past declared: apply=%v vis=%s serviceNs=%s client=%s: declared=%v effective=%v",
+								apply, visName, serviceNs, clientNs, sets.SortedList(declared), sets.SortedList(effective))
+						}
+						if !apply {
+							continue
+						}
+						// Invariant 2: with applyToSidecars, never exceed the visibility clamp.
+						switch vis {
+						case ServiceVisibilityNone:
+							if reachable(effective, clientNs, serviceNs) {
+								t.Errorf("NONE visibility reachable: serviceNs=%s clientNs=%s: declared=%v effective=%v",
+									serviceNs, clientNs, sets.SortedList(declared), sets.SortedList(effective))
+							}
+						case ServiceVisibilityNamespace:
+							if reachable(effective, clientNs, serviceNs) && clientNs != serviceNs {
+								t.Errorf("NAMESPACE visibility reachable outside own namespace: serviceNs=%s clientNs=%s: declared=%v effective=%v",
+									serviceNs, clientNs, sets.SortedList(declared), sets.SortedList(effective))
+							}
+						}
+					}
+				}
+			}
+		}
 	}
 }
 
@@ -1543,8 +2231,11 @@ func serviceNames(svcs []*Service) []string {
 
 func TestInitPushContext(t *testing.T) {
 	env := NewEnvironment()
-	configStore := NewFakeStore()
-	_, _ = configStore.Create(config.Config{
+	m := mesh.DefaultMeshConfig()
+	env.Watcher = meshwatcher.NewTestWatcher(m)
+	fakeStore := NewFakeStore()
+	var controller ConfigStoreController = fakeStore
+	_, _ = controller.Create(config.Config{
 		Meta: config.Meta{
 			Name:             "rule1",
 			Namespace:        "test1",
@@ -1555,7 +2246,7 @@ func TestInitPushContext(t *testing.T) {
 			ExportTo: []string{".", "ns1"},
 		},
 	})
-	_, _ = configStore.Create(config.Config{
+	_, _ = controller.Create(config.Config{
 		Meta: config.Meta{
 			Name:             "rule1",
 			Namespace:        "test1",
@@ -1565,7 +2256,7 @@ func TestInitPushContext(t *testing.T) {
 			ExportTo: []string{".", "ns1"},
 		},
 	})
-	_, _ = configStore.Create(config.Config{
+	_, _ = controller.Create(config.Config{
 		Meta: config.Meta{
 			Name:             "default",
 			Namespace:        "istio-system",
@@ -1578,7 +2269,19 @@ func TestInitPushContext(t *testing.T) {
 		},
 	})
 
-	env.ConfigStore = configStore
+	env.VirtualServiceController = NewVirtualServiceController(
+		controller,
+		VSControllerOptions{KrtDebugger: krt.GlobalDebugHandler},
+		env.Watcher,
+	)
+
+	stop := test.NewStop(t)
+	go controller.Run(stop)
+	go env.VirtualServiceController.Run(stop)
+	kube.WaitForCacheSync("test", stop, controller.HasSynced)
+	kube.WaitForCacheSync("test", stop, env.VirtualServiceController.HasSynced)
+
+	env.ConfigStore = controller
 	env.ServiceDiscovery = &localServiceDiscovery{
 		services: []*Service{
 			{
@@ -1614,25 +2317,31 @@ func TestInitPushContext(t *testing.T) {
 			},
 		},
 	}
-	m := mesh.DefaultMeshConfig()
-	env.Watcher = mesh.NewFixedWatcher(m)
 	env.Init()
 
 	// Init a new push context
 	old := NewPushContext()
-	if err := old.InitContext(env, nil, nil); err != nil {
-		t.Fatal(err)
+	old.InitContext(env, nil, nil)
+
+	for _, sidecars := range old.sidecarIndex.sidecarsByNamespace {
+		for _, sidecar := range sidecars {
+			sidecar.initFunc()
+		}
 	}
 
 	// Create a new one, copying from the old one
 	// Pass a ConfigsUpdated otherwise we would just copy it directly
 	newPush := NewPushContext()
-	if err := newPush.InitContext(env, old, &PushRequest{
+	newPush.InitContext(env, old, &PushRequest{
 		ConfigsUpdated: sets.Set[ConfigKey]{
 			{Kind: kind.Secret}: {},
 		},
-	}); err != nil {
-		t.Fatal(err)
+	})
+
+	for _, sidecars := range newPush.sidecarIndex.sidecarsByNamespace {
+		for _, sidecar := range sidecars {
+			sidecar.initFunc()
+		}
 	}
 
 	// Check to ensure the update is identical to the old one
@@ -1644,7 +2353,7 @@ func TestInitPushContext(t *testing.T) {
 			AuthenticationPolicies{}, NetworkManager{}, sidecarIndex{}, Telemetries{}, ProxyConfigs{}, ConsolidatedDestRule{},
 			ClusterLocalHosts{}),
 		// These are not feasible/worth comparing
-		cmpopts.IgnoreTypes(sync.RWMutex{}, localServiceDiscovery{}, FakeStore{}, atomic.Bool{}, sync.Mutex{}),
+		cmpopts.IgnoreTypes(sync.RWMutex{}, localServiceDiscovery{}, FakeStore{}, atomic.Bool{}, sync.Mutex{}, func() {}),
 		cmpopts.IgnoreUnexported(IstioEndpoint{}),
 		cmpopts.IgnoreInterfaces(struct{ mesh.Holder }{}),
 		protocmp.Transform(),
@@ -1657,7 +2366,7 @@ func TestInitPushContext(t *testing.T) {
 func TestSidecarScope(t *testing.T) {
 	test.SetForTest(t, &features.ConvertSidecarScopeConcurrency, 10)
 	ps := NewPushContext()
-	env := &Environment{Watcher: mesh.NewFixedWatcher(&meshconfig.MeshConfig{RootNamespace: "istio-system"})}
+	env := &Environment{Watcher: meshwatcher.NewTestWatcher(&meshconfig.MeshConfig{RootNamespace: "istio-system"})}
 	ps.Mesh = env.Mesh()
 	ps.ServiceIndex.HostnameAndNamespace["svc1.default.cluster.local"] = map[string]*Service{"default": nil}
 	ps.ServiceIndex.HostnameAndNamespace["svc2.nosidecar.cluster.local"] = map[string]*Service{"nosidecar": nil}
@@ -1771,10 +2480,14 @@ func TestRootSidecarScopePropagation(t *testing.T) {
 	}
 
 	env := NewEnvironment()
-	configStore := NewFakeStore()
-
 	m := mesh.DefaultMeshConfig()
-	env.Watcher = mesh.NewFixedWatcher(m)
+	env.Watcher = meshwatcher.NewTestWatcher(m)
+	configStore := NewFakeStore()
+	virtualServiceController := NewVirtualServiceController(
+		configStore,
+		VSControllerOptions{KrtDebugger: krt.GlobalDebugHandler},
+		env.Watcher,
+	)
 
 	env.ServiceDiscovery = &localServiceDiscovery{
 		services: []*Service{
@@ -1832,6 +2545,12 @@ func TestRootSidecarScopePropagation(t *testing.T) {
 
 	_, _ = configStore.Create(rootConfig)
 	env.ConfigStore = configStore
+	env.VirtualServiceController = virtualServiceController
+	stop := test.NewStop(t)
+	go configStore.Run(stop)
+	go virtualServiceController.Run(stop)
+	kube.WaitForCacheSync("test", stop, configStore.HasSynced)
+	kube.WaitForCacheSync("test", stop, virtualServiceController.HasSynced)
 
 	testDesc := "Testing root SidecarScope for ns:%v enabled when %v is called."
 	when := "createNewContext"
@@ -1845,15 +2564,12 @@ func TestRootSidecarScopePropagation(t *testing.T) {
 	newPush = NewPushContext()
 	newPush.Mesh = env.Mesh()
 	svcName := "svc6.foo.cluster.local"
-	if err := newPush.InitContext(env, oldPush, &PushRequest{
+	newPush.InitContext(env, oldPush, &PushRequest{
 		ConfigsUpdated: sets.Set[ConfigKey]{
 			{Kind: kind.Service, Name: svcName, Namespace: "foo"}: {},
 		},
 		Reason: nil,
-		Full:   true,
-	}); err != nil {
-		t.Fatal(err)
-	}
+	})
 	when = "updateContext(with no changes)"
 	verifyServices(true, fmt.Sprintf(testDesc, otherNS, when), otherNS, newPush)
 	verifyServices(true, fmt.Sprintf(testDesc, defaultNS, when), defaultNS, newPush)
@@ -1863,7 +2579,7 @@ func TestBestEffortInferServiceMTLSMode(t *testing.T) {
 	const partialNS string = "partial"
 	const wholeNS string = "whole"
 	ps := NewPushContext()
-	env := &Environment{Watcher: mesh.NewFixedWatcher(&meshconfig.MeshConfig{RootNamespace: "istio-system"})}
+	env := &Environment{Watcher: meshwatcher.NewTestWatcher(&meshconfig.MeshConfig{RootNamespace: "istio-system"})}
 	sd := &localServiceDiscovery{}
 	env.ServiceDiscovery = sd
 	ps.Mesh = env.Mesh()
@@ -1951,10 +2667,10 @@ func TestBestEffortInferServiceMTLSMode(t *testing.T) {
 			port := &Port{
 				Port: tc.servicePort,
 			}
-			if got := ps.BestEffortInferServiceMTLSMode(nil, service, port); got != tc.wanted {
+			if got := ps.BestEffortInferServiceMTLSMode(ps.AuthnPolicies, nil, service, port); got != tc.wanted {
 				t.Fatalf("want %s, but got %s", tc.wanted, got)
 			}
-			if got := ps.BestEffortInferServiceMTLSMode(nil, externalService, port); got != MTLSUnknown {
+			if got := ps.BestEffortInferServiceMTLSMode(ps.AuthnPolicies, nil, externalService, port); got != MTLSUnknown {
 				t.Fatalf("MTLS mode for external service should always be %s, but got %s", MTLSUnknown, got)
 			}
 		})
@@ -2260,6 +2976,88 @@ func TestSetDestinationRuleMerging(t *testing.T) {
 	}
 	if !public[1].exportTo.Contains("istio-system") {
 		t.Errorf("want %s, but got %v", "istio-system", public[1].exportTo)
+	}
+}
+
+func TestSetDestinationRuleBackendPolicyMerging(t *testing.T) {
+	testhost := "backend.test.svc.cluster.local"
+	userLb := &networking.LoadBalancerSettings{
+		LbPolicy: &networking.LoadBalancerSettings_Simple{Simple: networking.LoadBalancerSettings_ROUND_ROBIN},
+	}
+	userConnPool := &networking.ConnectionPoolSettings{
+		Tcp: &networking.ConnectionPoolSettings_TCPSettings{MaxConnections: 7},
+	}
+	// TLS and RetryBudget are set by both the user rule and the backend policy; the user values must win.
+	userTLS := &networking.ClientTLSSettings{Mode: networking.ClientTLSSettings_MUTUAL}
+	userRetryBudget := &networking.TrafficPolicy_RetryBudget{MinRetryConcurrency: 5}
+	backendLb := &networking.LoadBalancerSettings{
+		LbPolicy: &networking.LoadBalancerSettings_Simple{Simple: networking.LoadBalancerSettings_LEAST_REQUEST},
+	}
+	backendTLS := &networking.ClientTLSSettings{Mode: networking.ClientTLSSettings_SIMPLE}
+	backendRetryBudget := &networking.TrafficPolicy_RetryBudget{MinRetryConcurrency: 10}
+	// OutlierDetection is set only by the backend policy, so it should fill in.
+	backendOutlier := &networking.OutlierDetection{Consecutive_5XxErrors: &wrapperspb.UInt32Value{Value: 3}}
+
+	userRule := config.Config{
+		Meta: config.Meta{Name: "user-dr", Namespace: "test", CreationTimestamp: time.Unix(2, 0)},
+		Spec: &networking.DestinationRule{
+			Host: testhost,
+			TrafficPolicy: &networking.TrafficPolicy{
+				LoadBalancer:   userLb,
+				ConnectionPool: userConnPool,
+				Tls:            userTLS,
+				RetryBudget:    userRetryBudget,
+			},
+			Subsets: []*networking.Subset{{Name: "v1"}},
+		},
+	}
+	backendRule := config.Config{
+		Meta: config.Meta{
+			Name:        "backend.test~istio-gateway",
+			Namespace:   "test",
+			Annotations: map[string]string{constants.InternalParentNames: "XBackendTrafficPolicy/policy.test"},
+		},
+		Spec: &networking.DestinationRule{
+			Host: testhost,
+			TrafficPolicy: &networking.TrafficPolicy{
+				LoadBalancer:     backendLb,
+				Tls:              backendTLS,
+				RetryBudget:      backendRetryBudget,
+				OutlierDetection: backendOutlier,
+			},
+		},
+	}
+
+	// The user DestinationRule fields must win over the backend policy regardless of which one
+	// was created first, and the backend policy fills in the fields the user rule leaves unset.
+	cases := []struct {
+		name      string
+		backendTS time.Time
+	}{
+		{name: "backend created first", backendTS: time.Unix(1, 0)},
+		{name: "backend created last", backendTS: time.Unix(3, 0)},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ps := NewPushContext()
+			ps.exportToDefaults.destinationRule = sets.New(visibility.Public)
+			backend := backendRule.DeepCopy()
+			backend.CreationTimestamp = tc.backendTS
+			ps.setDestinationRules([]config.Config{userRule, backend})
+
+			merged := ps.destinationRuleIndex.namespaceLocal["test"].specificDestRules[host.Name(testhost)]
+			assert.Equal(t, len(merged), 1)
+			tp := merged[0].rule.Spec.(*networking.DestinationRule).TrafficPolicy
+			// user fields win, including where both set the same field (Tls, RetryBudget)
+			assert.Equal(t, tp.LoadBalancer, userLb)
+			assert.Equal(t, tp.ConnectionPool, userConnPool)
+			assert.Equal(t, tp.Tls, userTLS)
+			assert.Equal(t, tp.RetryBudget, userRetryBudget)
+			// backend fills the gaps the user rule leaves unset
+			assert.Equal(t, tp.OutlierDetection, backendOutlier)
+			// user subsets carry through
+			assert.Equal(t, len(merged[0].rule.Spec.(*networking.DestinationRule).Subsets), 1)
+		})
 	}
 }
 
@@ -2598,9 +3396,10 @@ func TestSetDestinationRuleWithExportTo(t *testing.T) {
 
 func TestVirtualServiceWithExportTo(t *testing.T) {
 	ps := NewPushContext()
-	env := &Environment{Watcher: mesh.NewFixedWatcher(&meshconfig.MeshConfig{RootNamespace: "zzz"})}
+	env := &Environment{Watcher: meshwatcher.NewTestWatcher(&meshconfig.MeshConfig{RootNamespace: "zzz"})}
 	ps.Mesh = env.Mesh()
-	configStore := NewFakeStore()
+	fakeStore := NewFakeStore()
+	var controller ConfigStoreController = fakeStore
 	gatewayName := "default/gateway"
 
 	rule1 := config.Config{
@@ -2673,12 +3472,24 @@ func TestVirtualServiceWithExportTo(t *testing.T) {
 	}
 
 	for _, c := range []config.Config{rule1, rule2, rule3, rule2Gw, rule3Gw, rootNS} {
-		if _, err := configStore.Create(c); err != nil {
+		if _, err := controller.Create(c); err != nil {
 			t.Fatalf("could not create %v", c.Name)
 		}
 	}
 
-	env.ConfigStore = configStore
+	env.VirtualServiceController = NewVirtualServiceController(
+		controller,
+		VSControllerOptions{KrtDebugger: krt.GlobalDebugHandler},
+		env.Watcher,
+	)
+
+	stop := test.NewStop(t)
+	go controller.Run(stop)
+	go env.VirtualServiceController.Run(stop)
+	kube.WaitForCacheSync("test", stop, controller.HasSynced)
+	kube.WaitForCacheSync("test", stop, env.VirtualServiceController.HasSynced)
+
+	env.ConfigStore = controller
 	ps.initDefaultExportMaps()
 	ps.initVirtualServices(env)
 
@@ -2743,14 +3554,135 @@ func TestVirtualServiceWithExportTo(t *testing.T) {
 	}
 }
 
+// TestVirtualServiceWithDefaultExportTo verifies that meshConfig.defaultVirtualServiceExportTo entries
+// that name specific namespaces (e.g. [".", "ns1"]) are honored for virtual services that do not set
+// their own exportTo: such virtual services stay private to their own namespace AND are exported to the
+// additional namespaces listed in the default. It also asserts no duplicate entry is produced for the
+// virtual service's own namespace.
+func TestVirtualServiceWithDefaultExportTo(t *testing.T) {
+	ps := NewPushContext()
+	m := &meshconfig.MeshConfig{
+		RootNamespace:                 "zzz",
+		DefaultVirtualServiceExportTo: []string{".", "ns1"},
+	}
+	env := &Environment{Watcher: meshwatcher.NewTestWatcher(m)}
+	ps.Mesh = env.Mesh()
+	fakeStore := NewFakeStore()
+	var controller ConfigStoreController = fakeStore
+	gatewayName := "default/gateway"
+
+	// Mesh-gateway virtual service with no exportTo in namespace test1 -> default [".", "ns1"] applies.
+	meshRule1 := config.Config{
+		Meta: config.Meta{Name: "mesh-rule1", Namespace: "test1", GroupVersionKind: gvk.VirtualService},
+		Spec: &networking.VirtualService{Hosts: []string{"mesh-rule1.com"}},
+	}
+	// Mesh-gateway virtual service with no exportTo in namespace test2.
+	meshRule2 := config.Config{
+		Meta: config.Meta{Name: "mesh-rule2", Namespace: "test2", GroupVersionKind: gvk.VirtualService},
+		Spec: &networking.VirtualService{Hosts: []string{"mesh-rule2.com"}},
+	}
+	// Gateway-scoped virtual service with no exportTo in namespace test1.
+	gwRule := config.Config{
+		Meta: config.Meta{Name: "gw-rule", Namespace: "test1", GroupVersionKind: gvk.VirtualService},
+		Spec: &networking.VirtualService{Gateways: []string{gatewayName}, Hosts: []string{"gw-rule.com"}},
+	}
+
+	for _, c := range []config.Config{meshRule1, meshRule2, gwRule} {
+		if _, err := controller.Create(c); err != nil {
+			t.Fatalf("could not create %v", c.Name)
+		}
+	}
+
+	env.VirtualServiceController = NewVirtualServiceController(
+		controller,
+		VSControllerOptions{KrtDebugger: krt.GlobalDebugHandler},
+		env.Watcher,
+	)
+
+	stop := test.NewStop(t)
+	go controller.Run(stop)
+	go env.VirtualServiceController.Run(stop)
+	kube.WaitForCacheSync("test", stop, controller.HasSynced)
+	kube.WaitForCacheSync("test", stop, env.VirtualServiceController.HasSynced)
+
+	env.ConfigStore = controller
+	ps.initDefaultExportMaps()
+	ps.initVirtualServices(env)
+
+	cases := []struct {
+		name      string
+		proxyNs   string
+		gateway   string
+		wantHosts []string
+	}{
+		{
+			name:      "own namespace sees private default virtual service exactly once",
+			proxyNs:   "test1",
+			gateway:   constants.IstioMeshGateway,
+			wantHosts: []string{"mesh-rule1.com"},
+		},
+		{
+			name:      "additional default namespace sees virtual services exported from all namespaces",
+			proxyNs:   "ns1",
+			gateway:   constants.IstioMeshGateway,
+			wantHosts: []string{"mesh-rule1.com", "mesh-rule2.com"},
+		},
+		{
+			name:      "unrelated namespace only sees its own private default virtual service",
+			proxyNs:   "test2",
+			gateway:   constants.IstioMeshGateway,
+			wantHosts: []string{"mesh-rule2.com"},
+		},
+		{
+			name:      "unrelated namespace sees no default-private virtual services",
+			proxyNs:   "random",
+			gateway:   constants.IstioMeshGateway,
+			wantHosts: []string{},
+		},
+		{
+			name:      "gateway-scoped virtual service visible to its own namespace exactly once",
+			proxyNs:   "test1",
+			gateway:   gatewayName,
+			wantHosts: []string{"gw-rule.com"},
+		},
+		{
+			name:      "gateway-scoped virtual service exported to additional default namespace",
+			proxyNs:   "ns1",
+			gateway:   gatewayName,
+			wantHosts: []string{"gw-rule.com"},
+		},
+		{
+			name:      "gateway-scoped virtual service not visible to unrelated namespace",
+			proxyNs:   "random",
+			gateway:   gatewayName,
+			wantHosts: []string{},
+		},
+	}
+	for _, tt := range cases {
+		t.Run(tt.name, func(t *testing.T) {
+			rules := ps.VirtualServicesForGateway(tt.proxyNs, tt.gateway)
+			gotHosts := make([]string, 0)
+			for _, r := range rules {
+				vs := r.Spec.(*networking.VirtualService)
+				gotHosts = append(gotHosts, vs.Hosts...)
+			}
+			if !reflect.DeepEqual(gotHosts, tt.wantHosts) {
+				t.Errorf("want %+v, got %+v", tt.wantHosts, gotHosts)
+			}
+		})
+	}
+}
+
 func TestInitVirtualService(t *testing.T) {
 	testCase := func(legacy bool, ns1GatewayExpectedDestinations, ns5GatewayExpectedDestinations sets.String) {
 		test.SetForTest(t, &features.FilterGatewayClusterConfig, true)
 		test.SetForTest(t, &features.ScopeGatewayToNamespace, legacy)
 		ps := NewPushContext()
-		env := &Environment{Watcher: mesh.NewFixedWatcher(&meshconfig.MeshConfig{RootNamespace: "istio-system"})}
+		env := &Environment{Watcher: meshwatcher.NewTestWatcher(&meshconfig.MeshConfig{RootNamespace: "istio-system"})}
 		ps.Mesh = env.Mesh()
-		configStore := NewFakeStore()
+		fakeStore := NewFakeStore()
+		var controller ConfigStoreController = fakeStore
+
 		gatewayName := "ns1/gateway"
 		root := config.Config{
 			Meta: config.Meta{
@@ -2989,12 +3921,24 @@ func TestInitVirtualService(t *testing.T) {
 			sourceNamespaceMatchWithoutGatewayNamespace,
 			sourceNamespaceNotMatch,
 		} {
-			if _, err := configStore.Create(c); err != nil {
+			if _, err := controller.Create(c); err != nil {
 				t.Fatalf("could not create %v", c.Name)
 			}
 		}
 
-		env.ConfigStore = configStore
+		env.VirtualServiceController = NewVirtualServiceController(
+			controller,
+			VSControllerOptions{KrtDebugger: krt.GlobalDebugHandler},
+			env.Watcher,
+		)
+
+		stop := test.NewStop(t)
+		go controller.Run(stop)
+		go env.VirtualServiceController.Run(stop)
+		kube.WaitForCacheSync("test", stop, controller.HasSynced)
+		kube.WaitForCacheSync("test", stop, env.VirtualServiceController.HasSynced)
+
+		env.ConfigStore = controller
 		ps.initDefaultExportMaps()
 		ps.initVirtualServices(env)
 
@@ -3024,7 +3968,7 @@ func TestInitVirtualService(t *testing.T) {
 				"ns5/gateway": ns5GatewayExpectedDestinations,
 			}
 			if !reflect.DeepEqual(got, want) {
-				t.Errorf("destinationsByGateway: got %+v", got)
+				t.Errorf("destinationsByGateway: got %+v, want: %+v", got, want)
 			}
 		})
 	}
@@ -3042,7 +3986,7 @@ func TestInitVirtualService(t *testing.T) {
 func TestServiceWithExportTo(t *testing.T) {
 	ps := NewPushContext()
 	env := NewEnvironment()
-	env.Watcher = mesh.NewFixedWatcher(&meshconfig.MeshConfig{RootNamespace: "zzz"})
+	env.Watcher = meshwatcher.NewTestWatcher(&meshconfig.MeshConfig{RootNamespace: "zzz"})
 	ps.Mesh = env.Mesh()
 
 	svc1 := &Service{
@@ -3138,7 +4082,7 @@ func TestServiceWithExportTo(t *testing.T) {
 func TestInstancesByPort(t *testing.T) {
 	ps := NewPushContext()
 	env := NewEnvironment()
-	env.Watcher = mesh.NewFixedWatcher(&meshconfig.MeshConfig{RootNamespace: "zzz"})
+	env.Watcher = meshwatcher.NewTestWatcher(&meshconfig.MeshConfig{RootNamespace: "zzz"})
 	ps.Mesh = env.Mesh()
 
 	// Test the Service Entry merge with same host with different generates
@@ -3176,7 +4120,7 @@ func TestInstancesByPort(t *testing.T) {
 		svc5_1.Hostname.String(): {
 			svc5_1.Attributes.Namespace: {
 				Shards: map[ShardKey][]*IstioEndpoint{
-					{Cluster: "Kubernets", Provider: provider.External}: {
+					{Cluster: "Kubernetes", Provider: provider.External}: {
 						&IstioEndpoint{
 							Addresses:       []string{"1.1.1.1"},
 							EndpointPort:    7000,
@@ -3200,7 +4144,8 @@ func TestInstancesByPort(t *testing.T) {
 
 func TestGetHostsFromMeshConfig(t *testing.T) {
 	ps := NewPushContext()
-	env := &Environment{Watcher: mesh.NewFixedWatcher(&meshconfig.MeshConfig{
+	env := NewEnvironment()
+	env.Watcher = meshwatcher.NewTestWatcher(&meshconfig.MeshConfig{
 		RootNamespace: "istio-system",
 		ExtensionProviders: []*meshconfig.MeshConfig_ExtensionProvider{
 			{
@@ -3212,13 +4157,32 @@ func TestGetHostsFromMeshConfig(t *testing.T) {
 					},
 				},
 			},
+			{
+				Name: "otel-ns-scoped",
+				Provider: &meshconfig.MeshConfig_ExtensionProvider_EnvoyOtelAls{
+					EnvoyOtelAls: &meshconfig.MeshConfig_ExtensionProvider_EnvoyOpenTelemetryLogProvider{
+						Service: "bar/otel.example.com",
+						Port:    9811,
+					},
+				},
+			},
+			{
+				Name: "otel-missing-ns-scoped",
+				Provider: &meshconfig.MeshConfig_ExtensionProvider_EnvoyOtelAls{
+					EnvoyOtelAls: &meshconfig.MeshConfig_ExtensionProvider_EnvoyOpenTelemetryLogProvider{
+						Service: "wrong-ns/otel-wrong.example.com",
+						Port:    9811,
+					},
+				},
+			},
 		},
 		DefaultProviders: &meshconfig.MeshConfig_DefaultProviders{
 			AccessLogging: []string{"otel"},
 		},
-	})}
+	})
 	ps.Mesh = env.Mesh()
-	configStore := NewFakeStore()
+	fakeStore := NewFakeStore()
+	var controller ConfigStoreController = fakeStore
 	gatewayName := "ns1/gateway"
 
 	vs1 := config.Config{
@@ -3268,20 +4232,75 @@ func TestGetHostsFromMeshConfig(t *testing.T) {
 			},
 		},
 	}
+	ef := config.Config{
+		Meta: config.Meta{
+			GroupVersionKind: gvk.EnvoyFilter,
+			Annotations:      map[string]string{"envoyfilter.istio.io/referenced-services": "envoyfilter.example.com,ratelimiting/grls.ratelimiting.svc.cluster.local"},
+			Name:             "ef",
+			Namespace:        "istio-system",
+		},
+		Spec: &networking.EnvoyFilter{},
+	}
 
-	for _, c := range []config.Config{vs1, vs2} {
-		if _, err := configStore.Create(c); err != nil {
+	for _, c := range []config.Config{vs1, vs2, ef} {
+		if _, err := controller.Create(c); err != nil {
 			t.Fatalf("could not create %v", c.Name)
 		}
 	}
 
-	env.ConfigStore = configStore
+	env.VirtualServiceController = NewVirtualServiceController(
+		controller,
+		VSControllerOptions{KrtDebugger: krt.GlobalDebugHandler},
+		env.Watcher,
+	)
+
+	stop := test.NewStop(t)
+	go controller.Run(stop)
+	go env.VirtualServiceController.Run(stop)
+	kube.WaitForCacheSync("test", stop, controller.HasSynced)
+	kube.WaitForCacheSync("test", stop, env.VirtualServiceController.HasSynced)
+
+	env.ConfigStore = controller
 	test.SetForTest(t, &features.FilterGatewayClusterConfig, true)
 	ps.initTelemetry(env)
 	ps.initDefaultExportMaps()
 	ps.initVirtualServices(env)
-	assert.Equal(t, ps.virtualServiceIndex.destinationsByGateway[gatewayName], sets.String{})
-	assert.Equal(t, ps.extraServicesForProxy(nil), sets.New("otel.foo.svc.cluster.local"))
+	env.ServiceDiscovery = &localServiceDiscovery{
+		services: []*Service{
+			{
+				Hostname:   "otel.foo.svc.cluster.local",
+				Attributes: ServiceAttributes{Namespace: "foo"},
+			},
+			{
+				Hostname:   "otel.example.com",
+				Attributes: ServiceAttributes{Namespace: "bar"},
+			},
+			{
+				Hostname:   "otel-wrong.example.com",
+				Attributes: ServiceAttributes{Namespace: "some-ns"},
+			},
+			{
+				Hostname:   "envoyfilter.example.com",
+				Attributes: ServiceAttributes{Namespace: "some-ns"},
+			},
+			{
+				Hostname:   "grls.ratelimiting.svc.cluster.local",
+				Attributes: ServiceAttributes{Namespace: "ratelimiting"},
+			},
+		},
+	}
+	ps.initDefaultExportMaps()
+	ps.initEnvoyFilters(env, nil, nil)
+	ps.initServiceRegistry(env, nil)
+	proxy := &Proxy{Type: Router}
+	proxy.SetSidecarScope(ps)
+	proxy.SetGatewaysForProxy(ps)
+	patches := ps.EnvoyFilters(proxy)
+	got := sets.New(slices.Map(ps.GatewayServices(proxy, patches), func(e *Service) string {
+		return e.Hostname.String()
+	})...)
+	// Should match 2 of the 3 providers; one has a mismatched namespace though
+	assert.Equal(t, got, sets.New("otel.foo.svc.cluster.local", "otel.example.com", "envoyfilter.example.com", "grls.ratelimiting.svc.cluster.local"))
 }
 
 func TestWellKnownProvidersCount(t *testing.T) {
@@ -3336,7 +4355,6 @@ type localServiceDiscovery struct {
 	services         []*Service
 	serviceInstances []*ServiceInstance
 
-	NoopAmbientIndexes
 	NetworkGatewaysHandler
 }
 
@@ -3463,67 +4481,5 @@ func TestResolveServiceAliases(t *testing.T) {
 			})
 			assert.Equal(t, tt.output, out)
 		})
-	}
-}
-
-func BenchmarkInitServiceAccounts(b *testing.B) {
-	ps := NewPushContext()
-	index := NewEndpointIndex(DisabledCache{})
-	env := &Environment{EndpointIndex: index}
-	ps.Mesh = &meshconfig.MeshConfig{TrustDomainAliases: []string{"td1", "td2"}}
-
-	services := []*Service{
-		{
-			Hostname: "svc-unset",
-			Ports:    allPorts,
-			Attributes: ServiceAttributes{
-				Namespace: "test1",
-			},
-		},
-		{
-			Hostname: "svc-public",
-			Ports:    allPorts,
-			Attributes: ServiceAttributes{
-				Namespace: "test1",
-				ExportTo:  sets.New(visibility.Public),
-			},
-		},
-		{
-			Hostname: "svc-private",
-			Ports:    allPorts,
-			Attributes: ServiceAttributes{
-				Namespace: "test1",
-				ExportTo:  sets.New(visibility.Private),
-			},
-		},
-		{
-			Hostname: "svc-none",
-			Ports:    allPorts,
-			Attributes: ServiceAttributes{
-				Namespace: "test1",
-				ExportTo:  sets.New(visibility.None),
-			},
-		},
-		{
-			Hostname: "svc-namespace",
-			Ports:    allPorts,
-			Attributes: ServiceAttributes{
-				Namespace: "test1",
-				ExportTo:  sets.New(visibility.Instance("namespace")),
-			},
-		},
-	}
-
-	for _, svc := range services {
-		if index.shardsBySvc[string(svc.Hostname)] == nil {
-			index.shardsBySvc[string(svc.Hostname)] = map[string]*EndpointShards{}
-		}
-		index.shardsBySvc[string(svc.Hostname)][svc.Attributes.Namespace] = &EndpointShards{
-			ServiceAccounts: sets.New("spiffe://cluster.local/ns/def/sa/sa1", "spiffe://cluster.local/ns/def/sa/sa2"),
-		}
-	}
-	b.ResetTimer()
-	for n := 0; n < b.N; n++ {
-		ps.initServiceAccounts(env, services)
 	}
 }

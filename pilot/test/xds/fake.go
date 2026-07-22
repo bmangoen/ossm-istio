@@ -18,6 +18,7 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"net/http"
 	"strings"
 	"time"
 
@@ -31,10 +32,13 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/kubernetes/fake"
 	k8stesting "k8s.io/client-go/testing"
+	"k8s.io/client-go/tools/cache"
 
 	meshconfig "istio.io/api/mesh/v1alpha1"
 	"istio.io/istio/pilot/pkg/autoregistration"
 	"istio.io/istio/pilot/pkg/bootstrap"
+	"istio.io/istio/pilot/pkg/config/aggregate"
+	"istio.io/istio/pilot/pkg/config/kube/extensions"
 	"istio.io/istio/pilot/pkg/config/kube/gateway"
 	ingress "istio.io/istio/pilot/pkg/config/kube/ingress"
 	"istio.io/istio/pilot/pkg/config/memory"
@@ -43,6 +47,7 @@ import (
 	"istio.io/istio/pilot/pkg/model"
 	"istio.io/istio/pilot/pkg/networking/core"
 	"istio.io/istio/pilot/pkg/serviceregistry"
+	"istio.io/istio/pilot/pkg/serviceregistry/ambient"
 	kube "istio.io/istio/pilot/pkg/serviceregistry/kube/controller"
 	memregistry "istio.io/istio/pilot/pkg/serviceregistry/memory"
 	"istio.io/istio/pilot/pkg/serviceregistry/util/xdsfake"
@@ -50,17 +55,20 @@ import (
 	"istio.io/istio/pilot/pkg/xds/endpoints"
 	v3 "istio.io/istio/pilot/pkg/xds/v3"
 	"istio.io/istio/pilot/test/xdstest"
+	"istio.io/istio/pkg/activenotifier"
 	"istio.io/istio/pkg/adsc"
 	"istio.io/istio/pkg/cluster"
 	"istio.io/istio/pkg/config"
 	"istio.io/istio/pkg/config/constants"
 	"istio.io/istio/pkg/config/mesh"
+	"istio.io/istio/pkg/config/mesh/meshwatcher"
 	"istio.io/istio/pkg/config/schema/collections"
 	"istio.io/istio/pkg/config/schema/gvk"
 	"istio.io/istio/pkg/config/schema/gvr"
 	"istio.io/istio/pkg/config/schema/kind"
 	"istio.io/istio/pkg/keepalive"
 	kubelib "istio.io/istio/pkg/kube"
+	"istio.io/istio/pkg/kube/krt"
 	"istio.io/istio/pkg/kube/multicluster"
 	"istio.io/istio/pkg/test"
 	"istio.io/istio/pkg/test/util/retry"
@@ -109,18 +117,24 @@ type FakeOptions struct {
 	DisableSecretAuthorization bool
 	Services                   []*model.Service
 	Gateways                   []model.NetworkGateway
+
+	// If provided, this ambient index will be used instead of creating a new one.
+	// Useful for tests that need a custom in-memory ambient store.
+	AmbientIndex model.AmbientIndexes
 }
 
 type FakeDiscoveryServer struct {
 	*core.ConfigGenTest
-	t            test.Failer
-	Discovery    *xds.DiscoveryServer
-	Listener     net.Listener
-	BufListener  *bufconn.Listener
-	kubeClient   kubelib.Client
-	KubeRegistry *kube.FakeController
-	XdsUpdater   model.XDSUpdater
-	MemRegistry  *memregistry.ServiceDiscovery
+	t              test.Failer
+	Discovery      *xds.DiscoveryServer
+	DiscoveryDebug *http.ServeMux
+	Listener       net.Listener
+	BufListener    *bufconn.Listener
+	kubeClient     kubelib.Client
+	KubeRegistry   *kube.FakeController
+	AmbientIndex   ambient.Index
+	XdsUpdater     model.XDSUpdater
+	MemRegistry    *memregistry.ServiceDiscovery
 }
 
 func NewFakeDiscoveryServer(t test.Failer, opts FakeOptions) *FakeDiscoveryServer {
@@ -130,7 +144,7 @@ func NewFakeDiscoveryServer(t test.Failer, opts FakeOptions) *FakeDiscoveryServe
 	}
 
 	// Init with a dummy environment, since we have a circular dependency with the env creation.
-	s := xds.NewDiscoveryServer(model.NewEnvironment(), map[string]string{})
+	s := xds.NewDiscoveryServer(model.NewEnvironment(), map[string]string{}, krt.GlobalDebugHandler)
 	// Disable debounce to reduce test times
 	s.DebounceOptions.DebounceAfter = opts.DebounceTime
 	// Setup time to Now instead of process start to make logs not misleading
@@ -139,7 +153,6 @@ func NewFakeDiscoveryServer(t test.Failer, opts FakeOptions) *FakeDiscoveryServe
 
 	serviceHandler := func(_, curr *model.Service, _ model.Event) {
 		pushReq := &model.PushRequest{
-			Full:           true,
 			ConfigsUpdated: sets.New(model.ConfigKey{Kind: kind.ServiceEntry, Name: string(curr.Hostname), Namespace: curr.Attributes.Namespace}),
 			Reason:         model.NewReasonStats(model.ServiceUpdate),
 		}
@@ -156,8 +169,8 @@ func NewFakeDiscoveryServer(t test.Failer, opts FakeOptions) *FakeDiscoveryServe
 	if opts.NetworksWatcher != nil {
 		opts.NetworksWatcher.AddNetworksHandler(func() {
 			s.ConfigUpdate(&model.PushRequest{
-				Full:   true,
 				Reason: model.NewReasonStats(model.NetworksTrigger),
+				Forced: true,
 			})
 		})
 	}
@@ -168,7 +181,7 @@ func NewFakeDiscoveryServer(t test.Failer, opts FakeOptions) *FakeDiscoveryServe
 	mc := multicluster.NewFakeController()
 	creds := kubesecrets.NewMulticluster(opts.DefaultClusterName, mc)
 
-	configController := memory.NewSyncController(memory.MakeSkipValidation(collections.PilotGatewayAPI()))
+	configController := memory.NewController(memory.MakeSkipValidation(collections.PilotGatewayAPI()))
 	clientBuilder := opts.KubeClientBuilder
 	if clientBuilder == nil {
 		clientBuilder = func(objects ...runtime.Object) kubelib.Client {
@@ -189,13 +202,19 @@ func NewFakeDiscoveryServer(t test.Failer, opts FakeOptions) *FakeDiscoveryServe
 			NetworksWatcher: opts.NetworksWatcher,
 			SkipRun:         true,
 			ConfigCluster:   k8sCluster == opts.DefaultClusterName,
-			MeshWatcher:     mesh.NewFixedWatcher(m),
+			MeshWatcher:     meshwatcher.NewTestWatcher(m),
 			CRDs: []schema.GroupVersionResource{
 				// Install all CRDs used (mostly in Ambient)
 				gvr.AuthorizationPolicy,
 				gvr.PeerAuthentication,
-				gvr.KubernetesGateway,
 				gvr.WorkloadEntry,
+				gvr.GatewayClass,
+				gvr.KubernetesGateway,
+				gvr.HTTPRoute,
+				gvr.GRPCRoute,
+				gvr.TCPRoute,
+				gvr.TLSRoute,
+				gvr.ReferenceGrant,
 				gvr.ServiceEntry,
 			},
 		})
@@ -215,12 +234,12 @@ func NewFakeDiscoveryServer(t test.Failer, opts FakeOptions) *FakeDiscoveryServe
 	}
 
 	stop := test.NewStop(t)
-	ingr := ingress.NewController(defaultKubeClient, mesh.NewFixedWatcher(m), kube.Options{
+	ingr := ingress.NewController(defaultKubeClient, meshwatcher.NewTestWatcher(m), kube.Options{
 		DomainSuffix: "cluster.local",
-	})
-	defaultKubeClient.RunAndWait(stop)
+	}, xdsUpdater)
 
 	var gwc *gateway.Controller
+	var extc *extensions.Controller
 	cg := core.NewConfigGenTest(t, core.TestOptions{
 		Configs:             opts.Configs,
 		ConfigString:        opts.ConfigString,
@@ -232,13 +251,20 @@ func NewFakeDiscoveryServer(t test.Failer, opts FakeOptions) *FakeDiscoveryServe
 		ServiceRegistries:   registries,
 		ConfigStoreCaches:   []model.ConfigStoreController{ingr},
 		CreateConfigStore: func(c model.ConfigStoreController) model.ConfigStoreController {
-			g := gateway.NewController(defaultKubeClient, c, func(class schema.GroupVersionResource, stop <-chan struct{}) bool {
+			// Create extension controller with the aggregate controller 'c'
+			// so it can see all configs including those from the base store
+			extc = extensions.NewController(c, xdsUpdater, krt.GlobalDebugHandler)
+
+			g := gateway.NewController(defaultKubeClient, func(class schema.GroupVersionResource, stop <-chan struct{}) bool {
 				return true
-			}, nil, kube.Options{
+			}, kube.Options{
 				DomainSuffix: "cluster.local",
-			})
+			}, xdsUpdater)
 			gwc = g
-			return gwc
+
+			// Return a multi-controller that includes both extension and gateway controllers
+			multi, _ := aggregate.MakeCache([]model.ConfigStoreController{extc, gwc})
+			return multi
 		},
 		SkipRun:   true,
 		ClusterID: opts.DefaultClusterName,
@@ -256,15 +282,62 @@ func NewFakeDiscoveryServer(t test.Failer, opts FakeOptions) *FakeDiscoveryServe
 	s.Generators[v3.SecretType] = xds.NewSecretGen(creds, s.Cache, opts.DefaultClusterName, nil)
 	s.Generators[v3.ExtensionConfigurationType].(*xds.EcdsGenerator).SetCredController(creds)
 
+	debugMux := s.InitDebug(http.NewServeMux(), false, func() map[string]string {
+		return nil
+	})
+
 	memRegistry := cg.MemRegistry
 	memRegistry.XdsUpdater = s
+
+	// Create the ambient index at the server level (matching the production path in bootstrap/servicecontroller.go).
+	var ambientIdx ambient.Index
+	if opts.AmbientIndex != nil {
+		s.Env.AmbientIndexes = opts.AmbientIndex
+	} else if features.EnableAmbient {
+		meshWatcher := meshwatcher.NewTestWatcher(m)
+		mcController := multicluster.NewController(multicluster.ControllerOptions{
+			Client:          defaultKubeClient,
+			ClusterID:       opts.DefaultClusterName,
+			SystemNamespace: "istio-system",
+			MeshConfig:      meshWatcher,
+			Debugger:        krt.GlobalDebugHandler,
+		})
+		// Create the ambient index before starting the multicluster controller.
+		// This matches production ordering where ambient.New() runs during server init (phase 1),
+		// and informers are started later during server.Start() (phase 2). Creating collections
+		// before starting informers ensures no krt event processing races with field assignments
+		// inside ambient.New().
+		ambientIdx = ambient.New(ambient.Options{
+			SystemNamespace:        "istio-system",
+			DomainSuffix:           "cluster.local",
+			ClusterID:              opts.DefaultClusterName,
+			XDSUpdater:             xdsUpdater,
+			MeshConfig:             meshWatcher,
+			StatusNotifier:         activenotifier.New(false),
+			Debugger:               krt.GlobalDebugHandler,
+			MultiClusterController: mcController,
+			Flags: ambient.FeatureFlags{
+				DefaultAllowFromWaypoint:              features.DefaultAllowFromWaypoint,
+				EnableK8SServiceSelectWorkloadEntries: features.EnableK8SServiceSelectWorkloadEntries,
+			},
+		})
+		if err := mcController.Run(stop); err != nil {
+			t.Fatal(err)
+		}
+		s.Env.AmbientIndexes = ambientIdx
+	} else {
+		s.Env.AmbientIndexes = &model.NoopAmbientIndexes{}
+	}
+
+	// start the default client informers after creating the ambient index,
+	// better matching production startup behavior
+	defaultKubeClient.RunAndWait(stop)
 
 	// Setup config handlers
 	// TODO code re-use from server.go
 	configHandler := func(_, curr config.Config, event model.Event) {
 		pushReq := &model.PushRequest{
-			Full:           true,
-			ConfigsUpdated: sets.New(model.ConfigKey{Kind: kind.MustFromGVK(curr.GroupVersionKind), Name: curr.Name, Namespace: curr.Namespace}),
+			ConfigsUpdated: sets.New(model.ConfigKey{Kind: gvk.MustToKind(curr.GroupVersionKind), Name: curr.Name, Namespace: curr.Namespace}),
 			Reason:         model.NewReasonStats(model.ConfigUpdate),
 		}
 		s.ConfigUpdate(pushReq)
@@ -321,16 +394,25 @@ func NewFakeDiscoveryServer(t test.Failer, opts FakeOptions) *FakeDiscoveryServe
 	// Start the discovery server
 	s.Start(stop)
 	cg.ServiceEntryRegistry.XdsUpdater = s
+	// Start the ambient index if available (for tests that create real pods/services)
+	if ambientIdx != nil {
+		go ambientIdx.Run(stop)
+	}
 	// Now that handlers are added, get everything started
 	cg.Run()
-	kubelib.WaitForCacheSync("fake", stop,
+	syncFns := []cache.InformerSynced{
 		cg.Registry.HasSynced,
-		cg.Store().HasSynced)
+		cg.Store().HasSynced,
+	}
+	if ambientIdx != nil {
+		syncFns = append(syncFns, ambientIdx.HasSynced)
+	}
+	kubelib.WaitForCacheSync("fake", stop, syncFns...)
 	cg.ServiceEntryRegistry.ResyncEDS()
 
 	// Send an update. This ensures that even if there are no configs provided, the push context is
 	// initialized.
-	s.ConfigUpdate(&model.PushRequest{Full: true})
+	s.ConfigUpdate(&model.PushRequest{Forced: true})
 
 	// Wait until initial updates are committed
 	c := s.InboundUpdates.Load()
@@ -343,15 +425,17 @@ func NewFakeDiscoveryServer(t test.Failer, opts FakeOptions) *FakeDiscoveryServe
 
 	bufListener, _ := listener.(*bufconn.Listener)
 	fake := &FakeDiscoveryServer{
-		t:             t,
-		Discovery:     s,
-		Listener:      listener,
-		BufListener:   bufListener,
-		ConfigGenTest: cg,
-		kubeClient:    defaultKubeClient,
-		KubeRegistry:  defaultKubeController,
-		XdsUpdater:    xdsUpdater,
-		MemRegistry:   memRegistry,
+		t:              t,
+		Discovery:      s,
+		DiscoveryDebug: debugMux,
+		Listener:       listener,
+		BufListener:    bufListener,
+		ConfigGenTest:  cg,
+		kubeClient:     defaultKubeClient,
+		KubeRegistry:   defaultKubeController,
+		AmbientIndex:   ambientIdx,
+		XdsUpdater:     xdsUpdater,
+		MemRegistry:    memRegistry,
 	}
 
 	return fake
@@ -513,7 +597,7 @@ func getKubernetesObjects(t test.Failer, opts FakeOptions) map[cluster.ID][]runt
 func kubernetesObjectsFromString(s string) ([]runtime.Object, error) {
 	var objects []runtime.Object
 	decode := kubelib.IstioCodec.UniversalDeserializer().Decode
-	objectStrs := strings.Split(s, "---")
+	objectStrs := strings.Split(s, "\n---\n")
 	for _, s := range objectStrs {
 		if len(strings.TrimSpace(s)) == 0 {
 			continue

@@ -22,6 +22,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -31,6 +32,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	core "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
@@ -60,6 +62,9 @@ const (
 
 	// JwtPubKeyRefreshIntervalOnFailureResetThreshold is the threshold to reset the refresh interval on failure.
 	JwtPubKeyRefreshIntervalOnFailureResetThreshold = 60 * time.Minute
+
+	// How many times should we attempt to update a cache bucket via load + compare and swap before giving up.
+	JwtMaxCacheBucketUpdateCompareAndSwapAttempts = 10
 
 	// How many times should we retry the failed network fetch on main flow. The main flow
 	// means it's called when Pilot is pushing configs. Do not retry to make sure not to block Pilot
@@ -176,6 +181,7 @@ func newJwksResolverWithCABundlePaths(
 			Transport: &http.Transport{
 				Proxy:             http.ProxyFromEnvironment,
 				DisableKeepAlives: true,
+				DialContext:       blockedCIDRDialContext,
 			},
 		},
 	}
@@ -201,6 +207,7 @@ func newJwksResolverWithCABundlePaths(
 			Transport: &http.Transport{
 				Proxy:             http.ProxyFromEnvironment,
 				DisableKeepAlives: true,
+				DialContext:       blockedCIDRDialContext,
 				TLSClientConfig: &tls.Config{
 					// nolint: gosec // user explicitly opted into insecure
 					InsecureSkipVerify: features.JwksResolverInsecureSkipVerify,
@@ -228,29 +235,45 @@ func (r *JwksResolver) GetPublicKey(issuer string, jwksURI string, timeout time.
 	key := jwtKey{issuer: issuer, jwksURI: jwksURI}
 	if val, found := r.keyEntries.Load(key); found {
 		e := val.(jwtPubKeyEntry)
-		// Update cached key's last used time.
-		e.lastUsedTime = now
-		e.timeout = timeout
-		r.keyEntries.Store(key, e)
+
+		if !r.updateCacheBucket(key, func(entry *jwtPubKeyEntry) {
+			entry.timeout = timeout
+			if now.Sub(entry.lastUsedTime) > 0 {
+				entry.lastUsedTime = now // Update if lastUsedTime is before "now"
+			}
+		}) {
+			// Updating the cache bucket may fail if enough competing goroutines are writing to this bucket at the same time.
+			// We set the number of CompareAndSwap attempts to be sufficiently large such that its most likely as a result of
+			// a large number of parallel GetPublicKey calls (since the refresher will only ever have 1 goroutine writing to the cache at a given time).
+			// As a result, it's likely that lastUsedTime will be approximately up to date since so many cache hits are being processed at the same time.
+			log.Warnf("Failed to update lastUsedTime in the cache for %q due to write contention", jwksURI)
+		}
+
 		if e.pubKey == "" {
 			return e.pubKey, errEmptyPubKeyFoundInCache
 		}
 		return e.pubKey, nil
 	}
 
-	var err error
-	var pubKey string
-	if jwksURI == "" {
+	var (
+		err    error
+		pubKey string
+	)
+
+	if jwksURI == "" && issuer == "" {
+		err = fmt.Errorf("jwksURI and issuer are both empty")
+		log.Errorf("Failed to fetch public key: %v", err)
+	} else if jwksURI == "" {
 		// Fetch the jwks URI if it is not hardcoded on config.
 		jwksURI, err = r.resolveJwksURIUsingOpenID(issuer, timeout)
 	}
 	if err != nil {
-		log.Errorf("Failed to jwks URI from %q: %v", issuer, err)
+		log.Errorf("Failed to get jwks URI from issuer %q: %v", issuer, err)
 	} else {
 		var resp []byte
 		resp, err = r.getRemoteContentWithRetry(jwksURI, networkFetchRetryCountOnMainFlow, timeout)
 		if err != nil {
-			log.Errorf("Failed to fetch public key from %q: %v", jwksURI, err)
+			log.Errorf("Failed to fetch public key from jwks URI %q: %v", jwksURI, err)
 		}
 		pubKey = string(resp)
 	}
@@ -274,12 +297,13 @@ func (r *JwksResolver) BuildLocalJwks(jwksURI, jwtIssuer, jwtPubKey string, time
 	if jwtPubKey == "" {
 		// jwtKeyResolver should never be nil since the function is only called in Discovery Server request processing
 		// workflow, where the JWT key resolver should have already been initialized on server creation.
+		// CIDR blocking is handled at the transport level by blockedCIDRDialContext on both HTTP clients.
 		jwtPubKey, err = r.GetPublicKey(jwtIssuer, jwksURI, timeout)
 		if err != nil {
-			log.Infof("The JWKS key is not yet fetched for issuer %s (%s), using a fake JWKS for now", jwtIssuer, jwksURI)
-			// This is a temporary workaround to reject a request with JWT token by using a fake jwks when istiod failed to fetch it.
-			// TODO(xulingqing): Find a better way to reject the request without using the fake jwks.
-			jwtPubKey = FakeJwks
+			log.Warnf("JWKS fetch failed for issuer %s (%s), using public-only JWKS with discarded private key - JWT requests will be rejected", jwtIssuer, jwksURI)
+			// fail closed: use a public key where the private key has been permanently discarded
+			// nobody can sign valid JWTs because the private key doesn't exist anywhere
+			jwtPubKey = PublicOnlyJwks
 		}
 	}
 	return &envoy_jwt.JwtProvider_LocalJwks{
@@ -291,29 +315,17 @@ func (r *JwksResolver) BuildLocalJwks(jwksURI, jwtIssuer, jwtPubKey string, time
 	}
 }
 
-// FakeJwks is a fake jwks, generated by following code
-/*
-	fakeJwksRSAKey, _ := rsa.GenerateKey(rand.Reader, 2048)
-	key, _ := jwk.FromRaw(fakeJwksRSAKey)
-	rsaKey, _ := key.(jwk.RSAPrivateKey)
-	res, _ := json.Marshal(rsaKey)
-	fmt.Printf("{\"keys\":[ %s]}\n", string(res))
-*/
-// it should be static across different instances and versions.
-// more details can be found: https://github.com/istio/istio/pull/47661.
+// PublicOnlyJwks is a JWKS containing a public RSA key where the private key was generated and immediately discarded.
+// This is used as a fail-closed fallback when JWKS fetch fails - since nobody has the private key, no valid JWTs can be forged.
+// The private key (d, p, q, dp, dq, qi) does not exist anywhere, making it cryptographically impossible to sign JWTs that
+// would validate against this public key.
 // nolint: lll
-const FakeJwks = `{
+const PublicOnlyJwks = `{
   "keys": [
     {
-      "d": "T6cYL1_1mWHQLtOcbOgWV6HjhS0HVh3Apt4xEar5beaMBX3IYLFITz684DOHNy5dzaxTRqvGj-zHEgNrgy2T-Izoo2Z-xJ2Zse6wQ4R0xbwd0by8IbhiePcjgNWXXzildMHkBVrxNZhUICpb_r8efTHZfEwc6FPjJDVgJKtEc6WGCOiWnRYcGTTlsB5-QrQQlDFLmrU2Z6QDmqJU33aDJFr_qzmRiVNXeHuhlNca2JnKNPpxjRVsy7Kbc8PorxiPijnLzV8_pccsMyLvA8pWUl5FRtAJNSss7x_81HEcInlj7yA896zMiELSPps1rW68yVvpuKEuYulzGi4z74gz0Q",
-      "dp": "YkH_MFMlgnGZntOCXLhib1LLW1JJCYmTzebn-JSluFJbG_qQgzuZkUu5s2cYBHmiZkDGmnTDOAYXrOaQSgVIBQMPxMqdUf8WjRIlEb88zvKpM_Curp59wuy6MhI7Ej3xKiixHX3bIq5Qujk3ZdsDbHUi3HH56-V7cdFKccqlg6E",
-      "dq": "CXCwRpRgbtqzLcsfuy-5IUZosrvEDHCrFh0C-A6OYvKpHzn8PDwb62YGddhiHzSrgr1EUgykQxiIF2xG8dBaq8xXg9Bh4G1kkgIsqJmL5DG1lwyh_-Jt4nPyiLHZ--ERc48cjj515uRpGd-CWXdIf2EWYaJNsEkiNaYEClJQIA8",
-      "e": "AQAB",
       "kty": "RSA",
-      "n": "vqS7RN4b34i3_5YyhygtBe33gI6GK_0ldW8WMZaunS28T-WAzJOAoZ7E9Y0mHS8vcDES0eZIUpp6Ft9sRPhOlzQfo_7l-3DnaD9LxJVKdXjE1jugxfI9YX1qJpD9S9wRZxQIhPky9UzZDkpFh_KpL6pZUt4cbPtW0VCctjqvpI11yHNk4CEbzw-RRFLMJkLFJqgPa2JPzGZ-TqJdkSDQ7UtRiKzjRcWGnAdLsTq6WabDA1Fn1JVI9TWu-YDbLufDUDco46qyPgpxAqcRQG39cWZAQzMwNEZ-Yec_WiqDYqGTU6K8BBWeEIuMhiWfxGmtqX35rb9Qk_qeYDsqqT95Pw",
-      "p": "7EK8xaN7qCdWCeQ1ptXWvuc6qotZc6oD-j1ecgel9FqmfkmaioVEbEAfP_N73QAjw-sU60sK3XK8LV4fkGUoJV-MDvmiCzy3wUPe-adSaTCxFykgOm6SPA9NKCqAh8lUm6GUm9RZkjwkv4xzZ8pJjng3d74WXx7zhTEH6yi4E00",
-      "q": "zpJPbhAn79s_jPm4OhOvvPKT-ISN6EyLu_g6joh1Dzf-HCF149KKQfuLDtwDCsCNf1cE_BCb4qoHAVBLDjbqusQF019zNIFTHeUL8oMpbv-5of7km0K8oo-DQp5b8u05PKaEQu3OXmRZFwuO6dSTPvXO094X-8vm791FLcJ-4Ls",
-      "qi": "SXz-JeBcTYMcO5lDBlrI9qd2eMQAYfVFDyq523L-RFhdravaxaYutT7dWk5f4Smzbh5KtvKifcFUMnV88On4HCiTrdBjLJJhIYqZQwzP8hYbXZlw4SvCtXKUrvLwLEUQaYg6bopp4VJ5c3XCZD5z3paHlZ45oCDsMeSEWxAD6lo"
+      "e": "AQAB",
+      "n": "0xObjM0UvS_oaazjpEYlAbwctEJ4L8pH3OuTb7qth7gUwqet-EzQB4dgFdvSdMgrLnSncQGRjpEYz3F3viIbH-3EN3TxSlPNviHxeOdyiBVfumN8dMxbLvVJUpfNOnvmMxJcl-8NNjAwcOjk4otSALaYgYYyOPyvKtgVdrQr-FoubWX4yrjxW-MJ2-7OBeepUUNOsVwGV23YX03sVkkyvY3otRflkBcY3_HKpBxJl9wk2GyOShN4_PNUF9-vwfnvOXMbCDX-w4PTef4geeb_GiT40YCKHTKMSPVanGRn5GExIWmki-mmqh94-mPTJyBR74ShspL3BxPZitDL574T1w"
     }
   ]
 }`
@@ -407,6 +419,32 @@ func (r *JwksResolver) getRemoteContentWithRetry(uri string, retry int, timeout 
 	// Return the last fetch directly, reaching here means we have tried `retry` times, this will be
 	// the last time for the retry.
 	return getPublicKey()
+}
+
+func (r *JwksResolver) updateCacheBucket(key jwtKey, updateFunc func(*jwtPubKeyEntry)) bool {
+	for attempt := 0; attempt < JwtMaxCacheBucketUpdateCompareAndSwapAttempts; attempt++ {
+		val, found := r.keyEntries.Load(key)
+		if !found {
+			return false
+		}
+
+		e := val.(jwtPubKeyEntry)
+		newEntry := jwtPubKeyEntry{
+			pubKey:            e.pubKey,
+			timeout:           e.timeout,
+			lastRefreshedTime: e.lastRefreshedTime,
+			lastUsedTime:      e.lastUsedTime,
+		}
+		updateFunc(&newEntry)
+
+		// CompareAndSwap will not modify the cache unless the bucket has not been altered since we loaded it. If multiple
+		// goroutines are updating the bucket at the same time, one is guaranteed to succeed.
+		if r.keyEntries.CompareAndSwap(key, e, newEntry) {
+			return true
+		}
+	}
+
+	return false
 }
 
 func (r *JwksResolver) refresher() {
@@ -506,12 +544,28 @@ func (r *JwksResolver) refresh(jwksURIBackgroundChannel bool) bool {
 				return
 			}
 			newPubKey := string(resp)
-			r.keyEntries.Store(k, jwtPubKeyEntry{
-				pubKey:            newPubKey,
-				lastRefreshedTime: now,            // update the lastRefreshedTime if we get a success response from the network.
-				lastUsedTime:      e.lastUsedTime, // keep original lastUsedTime.
-				timeout:           e.timeout,
-			})
+			if !r.updateCacheBucket(k, func(entry *jwtPubKeyEntry) {
+				entry.lastRefreshedTime = now
+				entry.pubKey = newPubKey
+			}) {
+				// While unlikely, in the event we are unable to update the cached entry via compare and swap, forcefully write refreshed data to the cache.
+				log.Warnf("Failed to safely update cache for JWT public key from %q due to write contention, forcefully writing refreshed JWKs to cache", jwksURI)
+
+				lastUsedTime := e.lastUsedTime
+				timeout := e.timeout
+				if latestEntry, found := r.keyEntries.Load(k); found {
+					lastUsedTime = latestEntry.(jwtPubKeyEntry).lastUsedTime
+					timeout = latestEntry.(jwtPubKeyEntry).timeout
+				}
+
+				r.keyEntries.Store(k, jwtPubKeyEntry{
+					lastRefreshedTime: now,
+					pubKey:            newPubKey,
+					lastUsedTime:      lastUsedTime,
+					timeout:           timeout,
+				})
+			}
+
 			isNewKey, err := compareJWKSResponse(oldPubKey, newPubKey)
 			if err != nil {
 				hasErrors.Store(true)
@@ -545,6 +599,35 @@ func (r *JwksResolver) refresh(jwksURIBackgroundChannel bool) bool {
 // (right now calls it from initDiscoveryService in pkg/bootstrap/server.go).
 func (r *JwksResolver) Close() {
 	closeChan <- true
+}
+
+// blockedCIDRDialContext is a custom dialContext that blocks connections to IP addresses
+// in CIDR ranges using the dialer's Control callback, which receives the resolved
+// IP address for each connection attempt.
+func blockedCIDRDialContext(ctx context.Context, network, addr string) (net.Conn, error) {
+	dialer := &net.Dialer{}
+
+	if len(features.BlockedCIDRsInJWKURIs) > 0 {
+		dialer.Control = func(network, address string, c syscall.RawConn) error {
+			host, _, err := net.SplitHostPort(address)
+			if err != nil {
+				return err
+			}
+			ip := net.ParseIP(host)
+			if ip == nil {
+				return fmt.Errorf("unable to parse IP from resolved address %s", address)
+			}
+			for _, cidr := range features.BlockedCIDRsInJWKURIs {
+				if cidr.Contains(ip) {
+					return fmt.Errorf("connection to %s (resolved IP %s) blocked: IP is in blocked CIDR range %s",
+						addr, ip.String(), cidr.String())
+				}
+			}
+			return nil
+		}
+	}
+
+	return dialer.DialContext(ctx, network, addr)
 }
 
 // Compare two JWKS responses, returning true if there is a difference and false otherwise

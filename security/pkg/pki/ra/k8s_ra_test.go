@@ -314,9 +314,6 @@ func initFakeKubeClient(t test.Failer, certificate []byte) kube.CLIClient {
 					continue
 				}
 				csr.Status.Certificate = certificate
-				// fake clientset doesn't handle resource version, so we need to delay the update
-				// to make sure watchers can catch the event
-				time.Sleep(time.Millisecond)
 				client.Kube().CertificatesV1().CertificateSigningRequests().UpdateStatus(ctx, csr, metav1.UpdateOptions{})
 			}
 		}
@@ -327,7 +324,7 @@ func initFakeKubeClient(t test.Failer, certificate []byte) kube.CLIClient {
 func createFakeK8sRA(client kube.Client, caCertFile string) (*KubernetesRA, error) {
 	defaultCertTTL := 30 * time.Minute
 	maxCertTTL := time.Hour
-	caSigner := "kubernates.io/kube-apiserver-client"
+	caSigner := "kubernetes.io/kube-apiserver-client"
 	raOpts := &IstioRAOptions{
 		ExternalCAType: ExtCAK8s,
 		DefaultCertTTL: defaultCertTTL,

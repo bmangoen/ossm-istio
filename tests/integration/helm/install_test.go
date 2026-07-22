@@ -1,5 +1,4 @@
 //go:build integ
-// +build integ
 
 // Copyright Istio Authors
 //
@@ -24,15 +23,21 @@ import (
 	"strings"
 	"testing"
 
+	klabels "k8s.io/apimachinery/pkg/labels"
+	"k8s.io/apimachinery/pkg/selection"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/yaml"
 
+	"istio.io/api/label"
 	"istio.io/istio/pkg/test/framework"
 	kubecluster "istio.io/istio/pkg/test/framework/components/cluster/kube"
+	"istio.io/istio/pkg/test/framework/components/crd"
 	"istio.io/istio/pkg/test/framework/components/namespace"
 	"istio.io/istio/pkg/test/helm"
 	"istio.io/istio/tests/util/sanitycheck"
 )
+
+const numericNamespaceInstallEnvVar = "ISTIO_TEST_HELM_NUMERIC_NAMESPACE"
 
 // TestDefaultInstall tests Istio installation using Helm with default options
 func TestDefaultInstall(t *testing.T) {
@@ -42,6 +47,43 @@ func TestDefaultInstall(t *testing.T) {
 	framework.
 		NewTest(t).
 		Run(setupInstallation(values, false, DefaultNamespaceConfig, ""))
+}
+
+func TestRevisionedInstall(t *testing.T) {
+	values := map[string]interface{}{
+		"global":          map[string]interface{}{},
+		"defaultRevision": "testrev",
+		"revision":        "testrev",
+	}
+	revision := "testrev"
+	framework.
+		NewTest(t).
+		Run(baseSetup(values, false, DefaultNamespaceConfig, func(t framework.TestContext) {
+			// Install gateway API CRDs
+			crd.DeployGatewayAPIOrSkip(t)
+			// Verify we can create a Gateway successfully
+			sampleGateway := `
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: sample
+  namespace: default
+spec:
+  gatewayClassName: istio
+  listeners:
+  - name: http
+    protocol: HTTP
+    port: 80
+`
+			t.ConfigIstio().Eval("default", nil, fmt.Sprint(sampleGateway)).ApplyOrFail(t)
+			selector := klabels.NewSelector()
+			req, _ := klabels.NewRequirement(label.IoK8sNetworkingGatewayGatewayName.Name, selection.Equals, []string{"sample"})
+			selector.Add(*req)
+			VerifyPodReady(t, t.Clusters().Default(), "default", selector.String())
+			if !t.Settings().NoCleanup {
+				t.ConfigIstio().Eval("default", nil, fmt.Sprint(sampleGateway)).DeleteOrFail(t)
+			}
+		}, revision))
 }
 
 // TestAmbientInstall tests Istio ambient profile installation using Helm
@@ -160,6 +202,49 @@ func TestRevisionedReleaseChannels(t *testing.T) {
 		}, revision))
 }
 
+func TestNativeNftablesInstall(t *testing.T) {
+	values := map[string]interface{}{
+		"global": map[string]interface{}{
+			"nativeNftables": true,
+		},
+	}
+	framework.
+		NewTest(t).
+		Run(setupInstallation(values, false, DefaultNamespaceConfig, ""))
+}
+
+// TestNumericNamespaceInstall verifies Helm install when the control-plane namespace is numeric-only.
+// Such names must remain strings in rendered manifests (e.g. YAML fields that would otherwise parse as numbers).
+//
+// This test is opt-in only. Set ISTIO_TEST_HELM_NUMERIC_NAMESPACE=1 to run it, as conflicts with other tests due to CRD/CR owner references.
+func TestNumericNamespaceInstall(t *testing.T) {
+	if os.Getenv(numericNamespaceInstallEnvVar) != "1" {
+		t.Skipf("Skipping TestNumericNamespaceInstall; set %s=1 to run", numericNamespaceInstallEnvVar)
+	}
+
+	numericNS := "123456"
+	nsConfig := NewNamespaceConfig(
+		types.NamespacedName{Name: BaseReleaseName, Namespace: numericNS},
+		types.NamespacedName{Name: IstiodReleaseName, Namespace: numericNS},
+		types.NamespacedName{Name: IngressReleaseName, Namespace: numericNS},
+	)
+	values := map[string]interface{}{
+		"global": map[string]interface{}{
+			"istioNamespace": numericNS,
+		},
+		// Gateway injection sets CA_ADDR from global.istioNamespace, but xDS uses
+		// proxyConfig.DiscoveryAddress which defaults to istiod.istio-system.svc when
+		// PROXY_CONFIG is empty. Set discoveryAddress explicitly for non-istio-system installs.
+		"podAnnotations": map[string]interface{}{
+			"proxy.istio.io/config": fmt.Sprintf(`{"discoveryAddress":"istiod.%s.svc:15012"}`, numericNS),
+		},
+	}
+	framework.
+		NewTest(t).
+		Run(setupInstallation(values, false, nsConfig, ""))
+}
+
+// nolint: unparam
 func setupInstallation(values map[string]interface{}, isAmbient bool, config NamespaceConfig, revision string) func(t framework.TestContext) {
 	return baseSetup(values, isAmbient, config, func(t framework.TestContext) {
 		sanitycheck.RunTrafficTest(t, isAmbient)
@@ -227,9 +312,12 @@ func baseSetup(values map[string]interface{}, isAmbient bool, config NamespaceCo
 		VerifyInstallation(t, cs, config, true, isAmbient, revision)
 		verifyValidation(t, revision)
 
-		check(t)
 		t.Cleanup(func() {
-			DeleteIstio(t, h, cs, config, isAmbient)
+			if !t.Settings().NoCleanup {
+				DeleteIstio(t, h, cs, config, isAmbient)
+			}
 		})
+
+		check(t)
 	}
 }

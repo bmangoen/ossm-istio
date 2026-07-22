@@ -71,6 +71,14 @@ type TLS struct {
 
 	Alpn       []string
 	ServerName string
+
+	// MinVersion sets the minimum TLS version. Valid values: "1.0", "1.1", "1.2", "1.3".
+	// Defaults to "1.2".
+	MinVersion string
+
+	// CurvePreferences specifies the TLS curve preferences.
+	// Valid values: "P-256", "P-384", "P-521", "X25519", "X25519MLKEM768"
+	CurvePreferences []string
 }
 
 type HBONE struct {
@@ -178,6 +186,9 @@ type CallOptions struct {
 	// HBONE settings.
 	HBONE HBONE
 
+	// DoubleHBONE settings
+	DoubleHBONE HBONE
+
 	// Message to be sent.
 	Message string
 
@@ -226,6 +237,10 @@ func (o CallOptions) DeepCopy() CallOptions {
 	if o.TLS.Alpn != nil {
 		clone.TLS.Alpn = make([]string, len(o.TLS.Alpn))
 		copy(clone.TLS.Alpn, o.TLS.Alpn)
+	}
+	if o.TLS.CurvePreferences != nil {
+		clone.TLS.CurvePreferences = make([]string, len(o.TLS.CurvePreferences))
+		copy(clone.TLS.CurvePreferences, o.TLS.CurvePreferences)
 	}
 	return clone
 }

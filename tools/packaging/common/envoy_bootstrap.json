@@ -11,7 +11,7 @@
         "thread": "%t"
       }
 {{- else }}
-        "text_format": "%Y-%m-%dT%T.%fZ\t%l\tenvoy %n %g:%#\t%v\tthread=%t"
+      "text_format": "%Y-%m-%dT%T.%fZ\t%l\tenvoy %n %g:%#\t%v\tthread=%t"
 {{- end }}
     }
   },
@@ -38,16 +38,16 @@
     "metadata": {{ .meta_json_str }}
   },
   "layered_runtime": {
-      "layers": [
-          {
-            "name": "global config",
-            "static_layer": {{ .runtime_flags }}
-          },
-          {
-              "name": "admin",
-              "admin_layer": {}
-          }
-      ]
+    "layers": [
+      {
+        "name": "global config",
+        "static_layer": {{ .runtime_flags }}
+      },
+      {
+        "name": "admin",
+        "admin_layer": {}
+      }
+    ]
   },
   "bootstrap_extensions": [
     {{- if .metadata_discovery }}
@@ -73,10 +73,15 @@
       }
     }
   ],
+  {{- if .stats_flush_interval }}
+  "stats_flush_interval": "{{ .stats_flush_interval }}",
+  {{- end }}
+  {{- if .stats_eviction_interval }}
+  "stats_eviction_interval": "{{ .stats_eviction_interval }}",
+  {{- end }}
   "stats_config": {
     "use_all_default_tags": false,
     "stats_tags": [
-      {{- if .delimited_stats_tags_enabled }}
       {
         "tag_name": "cluster_name",
         "regex": "^cluster(\\.(.+);)"
@@ -85,16 +90,6 @@
         "tag_name": "http_conn_manager_prefix",
         "regex": "^http\\.(((?:[_.[:digit:]\\w]*|[_\\[\\]aAbBcCdDeEfF[:digit:]\\w\\:]*));\\.)"
       },
-      {{- else }}
-      {
-        "tag_name": "cluster_name",
-        "regex": "^cluster\\.((.+?(\\..+?\\.svc\\.cluster\\.local)?)\\.)"
-      },
-      {
-        "tag_name": "http_conn_manager_prefix",
-        "regex": "^http\\.(((?:[_.[:digit:]]*|[_\\[\\]aAbBcCdDeEfF[:digit:]]*))\\.)"
-      },
-      {{- end }}
       {
         "tag_name": "thread_name",
         "regex": "^server(\\.(.+))\\.watchdog"
@@ -308,7 +303,7 @@
               "endpoint": {
                 "address":{
                   "pipe": {
-                    "path": "./var/run/secrets/workload-spiffe-uds/socket"
+                    "path": "./var/run/secrets/workload-spiffe-uds/{{ .workload_identity_socket_file }}"
                   }
                 }
               }
@@ -316,6 +311,37 @@
           }]
         }
       },
+      {{- if .custom_file_path }}
+      {
+        "name": "sds-files-grpc",
+        "alt_stat_name": "sds-files-grpc;",
+        "type": "STATIC",
+        "typed_extension_protocol_options": {
+          "envoy.extensions.upstreams.http.v3.HttpProtocolOptions": {
+           "@type": "type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions",
+           "explicit_http_config": {
+            "http2_protocol_options": {}
+           }
+          }
+        },
+        "connect_timeout": "1s",
+        "lb_policy": "ROUND_ROBIN",
+        "load_assignment": {
+          "cluster_name": "sds-files-grpc",
+          "endpoints": [{
+            "lb_endpoints": [{
+              "endpoint": {
+                "address":{
+                  "pipe": {
+                    "path": "{{ .custom_file_path }}"
+                  }
+                }
+              }
+            }]
+          }]
+        }
+      },
+      {{- end }}
       {
         "name": "xds-grpc",
         "alt_stat_name": "xds-grpc;",
@@ -531,6 +557,37 @@
         }
       }
       {{ end }}
+      {{ if .enable_self_discovery }}
+      ,
+      {
+        "name": "local_cluster",
+        "alt_stat_name": "local_cluster;",
+        "type": "EDS",
+        "connect_timeout": "1s",
+        "load_balancing_policy": {
+          "policies": [{
+            "typed_extension_config": {
+              "name": "envoy.load_balancing_policies.least_request",
+              "typed_config": {
+                "@type": "type.googleapis.com/envoy.extensions.load_balancing_policies.least_request.v3.LeastRequest",
+                "locality_lb_config": {
+                  "zone_aware_lb_config": {
+                    "min_cluster_size": "1"
+                  }
+                }
+              }
+            }
+          }]
+        },
+        "eds_cluster_config": {
+          "eds_config": {
+            "ads": {},
+            "resource_api_version": "V3"
+          },
+          "service_name": "local_cluster"
+        }
+      }
+      {{ end }}
     ],
     "listeners":[
       {
@@ -550,10 +607,8 @@
             "port_value": {{ .envoy_prometheus_port }}
           }
         },
-        {{- if .bypass_overload_manager}}
         "ignore_global_conn_limit": true,
         "bypass_overload_manager": true,
-        {{ end}}
         {{- if .dual_stack }}
         "additionalAddresses": [
           {
@@ -601,48 +656,289 @@
                     ]
                   },
                   "http_filters": [
-                  {{- if .stats_compression }}
+                  {{- if .envoy_metrics_stats_compression }}
                   {
-                    "name": "envoy.filters.http.compressor",
+                    "name": "envoy.filters.http.compressor.brotli",
                     "typed_config": {
                       "@type": "type.googleapis.com/envoy.extensions.filters.http.compressor.v3.Compressor",
-                      {{- if eq .stats_compression "gzip"}}
                       "compressor_library": {
-                        "name": "text_optimized",
-                        "typed_config": {
-                          "@type": "type.googleapis.com/envoy.extensions.compression.gzip.compressor.v3.Gzip"
-                        }
-                      }
-                      {{- else if eq .stats_compression "zstd"}}
-                      "compressor_library": {
-                        "name": "text_optimized",
-                        "typed_config": {
-                          "@type": "type.googleapis.com/envoy.extensions.compression.zstd.compressor.v3.Zstd"
-                        }
-                      }
-                      {{- else if eq .stats_compression "brotli"}}
-                      "compressor_library": {
-                        "name": "text_optimized",
+                        "name": "stats_brotli",
                         "typed_config": {
                           "@type": "type.googleapis.com/envoy.extensions.compression.brotli.compressor.v3.Brotli"
                         }
+                      },
+                      "response_direction_config": {
+                        "common_config": {
+                          "content_type": [
+                            "text/plain",
+                            "application/vnd.google.protobuf",
+                            "application/openmetrics-text",
+                            "application/openmetrics-protobuf"
+                          ]
+                        }
                       }
-                      {{- end }}
                     }
                   },
-                  {{- end }}
+                  {
+                    "name": "envoy.filters.http.compressor.zstd",
+                    "typed_config": {
+                      "@type": "type.googleapis.com/envoy.extensions.filters.http.compressor.v3.Compressor",
+                      "compressor_library": {
+                        "name": "stats_zstd",
+                        "typed_config": {
+                          "@type": "type.googleapis.com/envoy.extensions.compression.zstd.compressor.v3.Zstd"
+                        }
+                      },
+                      "response_direction_config": {
+                        "common_config": {
+                          "content_type": [
+                            "text/plain",
+                            "application/vnd.google.protobuf",
+                            "application/openmetrics-text",
+                            "application/openmetrics-protobuf"
+                          ]
+                        }
+                      }
+                    }
+                  },
+                  {
+                    "name": "envoy.filters.http.compressor.gzip",
+                    "typed_config": {
+                      "@type": "type.googleapis.com/envoy.extensions.filters.http.compressor.v3.Compressor",
+                      "compressor_library": {
+                        "name": "stats_gzip",
+                        "typed_config": {
+                          "@type": "type.googleapis.com/envoy.extensions.compression.gzip.compressor.v3.Gzip"
+                        }
+                      },
+                      "response_direction_config": {
+                        "common_config": {
+                          "content_type": [
+                            "text/plain",
+                            "application/vnd.google.protobuf",
+                            "application/openmetrics-text",
+                            "application/openmetrics-protobuf"
+                          ]
+                        }
+                      }
+                    }
+                  },
+                  {{- end}}
                   {
                     "name": "envoy.filters.http.router",
                     "typed_config": {
                       "@type": "type.googleapis.com/envoy.extensions.filters.http.router.v3.Router"
                     }
-                  }]
+                  }
+                ]
                 }
               }
             ]
           }
         ]
       },
+      {{- if .secure_metrics_port }}
+      {
+        "name": "{{ .wildcard }}_{{ .secure_metrics_port }}",
+        "address": {
+          "socket_address": {
+            "protocol": "TCP",
+            "address": "{{ .wildcard }}",
+            "port_value": {{ .secure_metrics_port }}
+          }
+        },
+        "ignore_global_conn_limit": true,
+        "bypass_overload_manager": true,
+        "listener_filters": [
+          {
+            "name": "envoy.filters.listener.tls_inspector",
+            "typed_config": {
+              "@type": "type.googleapis.com/envoy.extensions.filters.listener.tls_inspector.v3.TlsInspector"
+            }
+          }
+        ],
+        "filter_chains": [
+          {
+            "filter_chain_match": {
+              "transport_protocol": "tls"
+            },
+            "transport_socket": {
+              "name": "envoy.transport_sockets.tls",
+              "typed_config": {
+                "@type": "type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.DownstreamTlsContext",
+                "require_client_certificate": true,
+                "common_tls_context": {
+                  "tls_certificate_sds_secret_configs": [
+                    {
+                      "name": "default",
+                      "sds_config": {
+                        "api_config_source": {
+                          "api_type": "GRPC",
+                          "grpc_services": [{"envoy_grpc": {"cluster_name": "sds-grpc"}}],
+                          "set_node_on_first_message_only": true,
+                          "transport_api_version": "V3"
+                        },
+                        "resource_api_version": "V3"
+                      }
+                    }
+                  ],
+                  "combined_validation_context": {
+                    "default_validation_context": {},
+                    "validation_context_sds_secret_config": {
+                      "name": "ROOTCA",
+                      "sds_config": {
+                        "api_config_source": {
+                          "api_type": "GRPC",
+                          "grpc_services": [{"envoy_grpc": {"cluster_name": "sds-grpc"}}],
+                          "set_node_on_first_message_only": true,
+                          "transport_api_version": "V3"
+                        },
+                        "resource_api_version": "V3"
+                      }
+                    }
+                  }
+                }
+              }
+            },
+            "filters": [
+              {
+                "name": "envoy.filters.network.http_connection_manager",
+                "typed_config": {
+                  "@type": "type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager",
+                  "codec_type": "AUTO",
+                  "stat_prefix": "secure_stats",
+                  "route_config": {
+                    "virtual_hosts": [
+                      {
+                        "name": "backend",
+                        "domains": ["*"],
+                        "routes": [
+                          {
+                            "match": {"prefix": "/stats/prometheus"},
+                            "route": {"cluster": "prometheus_stats"}
+                          }
+                        ]
+                      }
+                    ]
+                  },
+                  "http_filters": [
+                    {
+                      "name": "envoy.filters.http.router",
+                      "typed_config": {
+                        "@type": "type.googleapis.com/envoy.extensions.filters.http.router.v3.Router"
+                      }
+                    }
+                  ]
+                }
+              }
+            ]
+          }
+        ]
+      },
+      {{ end }}
+      {{- if .secure_merged_metrics_port }}
+      {
+        "name": "{{ .wildcard }}_{{ .secure_merged_metrics_port }}",
+        "address": {
+          "socket_address": {
+            "protocol": "TCP",
+            "address": "{{ .wildcard }}",
+            "port_value": {{ .secure_merged_metrics_port }}
+          }
+        },
+        "ignore_global_conn_limit": true,
+        "bypass_overload_manager": true,
+        "listener_filters": [
+          {
+            "name": "envoy.filters.listener.tls_inspector",
+            "typed_config": {
+              "@type": "type.googleapis.com/envoy.extensions.filters.listener.tls_inspector.v3.TlsInspector"
+            }
+          }
+        ],
+        "filter_chains": [
+          {
+            "filter_chain_match": {
+              "transport_protocol": "tls"
+            },
+            "transport_socket": {
+              "name": "envoy.transport_sockets.tls",
+              "typed_config": {
+                "@type": "type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.DownstreamTlsContext",
+                "require_client_certificate": true,
+                "common_tls_context": {
+                  "tls_certificate_sds_secret_configs": [
+                    {
+                      "name": "default",
+                      "sds_config": {
+                        "api_config_source": {
+                          "api_type": "GRPC",
+                          "grpc_services": [{"envoy_grpc": {"cluster_name": "sds-grpc"}}],
+                          "set_node_on_first_message_only": true,
+                          "transport_api_version": "V3"
+                        },
+                        "resource_api_version": "V3"
+                      }
+                    }
+                  ],
+                  "combined_validation_context": {
+                    "default_validation_context": {},
+                    "validation_context_sds_secret_config": {
+                      "name": "ROOTCA",
+                      "sds_config": {
+                        "api_config_source": {
+                          "api_type": "GRPC",
+                          "grpc_services": [{"envoy_grpc": {"cluster_name": "sds-grpc"}}],
+                          "set_node_on_first_message_only": true,
+                          "transport_api_version": "V3"
+                        },
+                        "resource_api_version": "V3"
+                      }
+                    }
+                  }
+                }
+              }
+            },
+            "filters": [
+              {
+                "name": "envoy.filters.network.http_connection_manager",
+                "typed_config": {
+                  "@type": "type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager",
+                  "codec_type": "AUTO",
+                  "stat_prefix": "secure_merged_stats",
+                  "route_config": {
+                    "virtual_hosts": [
+                      {
+                        "name": "backend",
+                        "domains": ["*"],
+                        "routes": [
+                          {
+                            "match": {"prefix": "/stats/prometheus"},
+                            "route": {"cluster": "agent"}
+                          },
+                          {
+                            "match": {"prefix": "/metrics"},
+                            "route": {"cluster": "agent"}
+                          }
+                        ]
+                      }
+                    ]
+                  },
+                  "http_filters": [
+                    {
+                      "name": "envoy.filters.http.router",
+                      "typed_config": {
+                        "@type": "type.googleapis.com/envoy.extensions.filters.http.router.v3.Router"
+                      }
+                    }
+                  ]
+                }
+              }
+            ]
+          }
+        ]
+      },
+      {{ end }}
       {
         "name": "{{ .wildcard }}_{{ .envoy_status_port }}",
         "address": {
@@ -652,10 +948,8 @@
              "port_value": {{ .envoy_status_port }}
            }
         },
-        {{- if .bypass_overload_manager}}
         "ignore_global_conn_limit": true,
         "bypass_overload_manager": true,
-        {{ end}}
         {{- if .dual_stack }}
         "additionalAddresses": [
           {
@@ -669,6 +963,17 @@
           }
         ],
         {{- end}}
+        {{- if .envoy_status_port_enable_proxy_protocol }}
+        "listener_filters": [
+          {
+            "name": "envoy.listener.proxy_protocol",
+            "typed_config": {
+              "@type": "type.googleapis.com/envoy.extensions.filters.listener.proxy_protocol.v3.ProxyProtocol",
+              "allow_requests_without_proxy_protocol": true,
+            }
+          }
+        ],
+        {{- end }}
         "filter_chains": [
           {
             "filters": [
@@ -711,6 +1016,17 @@
         ]
       }
     ]
+  },
+  "overload_manager": {
+    "resource_monitors": [
+      {
+        "name": "envoy.resource_monitors.global_downstream_max_connections",
+        "typed_config": {
+          "@type": "type.googleapis.com/envoy.extensions.resource_monitors.downstream_connections.v3.DownstreamConnectionsConfig",
+          "max_active_downstream_connections": {{.global_downstream_max_connections}}
+        }
+      }
+    ]
   }
   {{- if .zipkin }}
   ,
@@ -751,29 +1067,6 @@
       }
     }
   }
-  {{- else if .openCensusAgent }}
-  ,
-  "tracing": {
-    "http": {
-      "name": "envoy.tracers.opencensus",
-      "typed_config": {
-        "@type": "type.googleapis.com/envoy.config.trace.v3.OpenCensusConfig",
-        "ocagent_exporter_enabled": true,
-        "ocagent_address": "{{ .openCensusAgent }}",
-        "incoming_trace_context": {{ .openCensusAgentContexts }},
-        "outgoing_trace_context": {{ .openCensusAgentContexts }},
-        "trace_config": {
-          "constant_sampler": {
-            "decision": "ALWAYS_PARENT"
-          },
-          "max_number_of_annotations": 200,
-          "max_number_of_attributes": 200,
-          "max_number_of_message_events": 200,
-          "max_number_of_links": 200
-        }
-      }
-    }
-  }
   {{ end }}
   {{ if or .envoy_metrics_service_address .statsd }}
   ,
@@ -808,29 +1101,25 @@
     {{ end }}
   ]
   {{ end }}
-  {{ if or .outlier_log_path .load_stats_config_json_str .deferred_cluster_creation}}
+  {{ if or .outlier_log_path .load_stats_config_json_str .enable_self_discovery }}
   ,
   "cluster_manager": {
-    {{- if .deferred_cluster_creation}}
-    "enable_deferred_cluster_creation": true,
-    {{- end}}
+    {{- if .enable_self_discovery }}
+    "local_cluster_name": "local_cluster",
+    {{- end }}
     {{- if .outlier_log_path}}
     "outlier_detection": {
       "event_log_path": "{{ .outlier_log_path }}"
-    }
-    {{- end}}
-    {{- if and .outlier_log_path .load_stats_config_json_str }}
-    ,
+    },
     {{- end}}
     {{- if .load_stats_config_json_str }}
-    "load_stats_config": {{- .load_stats_config_json_str }}
+    "load_stats_config": {{- .load_stats_config_json_str }},
     {{- end }}
+    "enable_deferred_cluster_creation": true
   }
   {{- end }}
-  {{ if .deferred_stats_creation }}
   ,
   "deferred_stat_options": {
     "enable_deferred_creation_stats": true
   }
-  {{ end }}
 }

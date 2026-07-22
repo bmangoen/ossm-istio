@@ -22,6 +22,7 @@ import (
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/types"
 
+	"istio.io/istio/pilot/pkg/features"
 	"istio.io/istio/pkg/config/labels"
 	kubelib "istio.io/istio/pkg/kube"
 	"istio.io/istio/pkg/kube/controllers"
@@ -33,10 +34,6 @@ import (
 
 var log = istiolog.RegisterScope("untaint", "CNI node-untaint controller")
 
-const (
-	TaintName = "cni.istio.io/not-ready"
-)
-
 var istioCniLabels = map[string]string{
 	"k8s-app": "istio-cni-node",
 }
@@ -47,6 +44,7 @@ type NodeUntainter struct {
 	cnilabels   labels.Instance
 	ourNs       string
 	queue       controllers.Queue
+	taintName   string
 }
 
 func filterNamespace(ns string) func(any) bool {
@@ -59,7 +57,7 @@ func filterNamespace(ns string) func(any) bool {
 	}
 }
 
-func NewNodeUntainter(stop <-chan struct{}, kubeClient kubelib.Client, cniNs, sysNs string) *NodeUntainter {
+func NewNodeUntainter(stop <-chan struct{}, kubeClient kubelib.Client, cniNs, sysNs string, debugger *krt.DebugHandler) *NodeUntainter {
 	log.Debugf("starting node untainter with labels %v", istioCniLabels)
 	ns := cniNs
 	if ns == "" {
@@ -68,6 +66,7 @@ func NewNodeUntainter(stop <-chan struct{}, kubeClient kubelib.Client, cniNs, sy
 	podsClient := kclient.NewFiltered[*v1.Pod](kubeClient, kclient.Filter{
 		ObjectFilter:    kubetypes.NewStaticObjectFilter(filterNamespace(ns)),
 		ObjectTransform: kubelib.StripPodUnusedFields,
+		FieldSelector:   "status.phase!=Failed",
 	})
 	nodes := kclient.NewFiltered[*v1.Node](kubeClient, kclient.Filter{ObjectTransform: kubelib.StripNodeUnusedFields})
 	nt := &NodeUntainter{
@@ -75,16 +74,18 @@ func NewNodeUntainter(stop <-chan struct{}, kubeClient kubelib.Client, cniNs, sy
 		nodesClient: nodes,
 		cnilabels:   labels.Instance(istioCniLabels),
 		ourNs:       ns,
+		taintName:   features.NodeUntaintTaintName,
 	}
-	nt.setup(stop)
+	nt.setup(stop, debugger)
 	return nt
 }
 
-func (n *NodeUntainter) setup(stop <-chan struct{}) {
-	nodes := krt.WrapClient[*v1.Node](n.nodesClient)
-	pods := krt.WrapClient[*v1.Pod](n.podsClient)
+func (n *NodeUntainter) setup(stop <-chan struct{}, debugger *krt.DebugHandler) {
+	opts := krt.NewOptionsBuilder(stop, "node-untaint", debugger)
+	nodes := krt.WrapClient[*v1.Node](n.nodesClient, opts.WithName("nodes")...)
+	pods := krt.WrapClient[*v1.Pod](n.podsClient, opts.WithName("pods")...)
 
-	readyCniPods := krt.NewCollection(pods, func(ctx krt.HandlerContext, p *v1.Pod) *v1.Pod {
+	readyCniPods := krt.NewCollection(pods, func(ctx krt.HandlerContext, p *v1.Pod) **v1.Pod {
 		log.Debugf("cniPods event: %s", p.Name)
 		if p.Namespace != n.ourNs {
 			return nil
@@ -96,35 +97,35 @@ func (n *NodeUntainter) setup(stop <-chan struct{}) {
 			return nil
 		}
 		log.Debugf("pod %s on node %s ready!", p.Name, p.Spec.NodeName)
-		return p
-	}, krt.WithStop(stop))
+		return &p
+	}, opts.WithName("cni-pods")...)
 
 	// these are all the nodes that have a ready cni pod. if the cni pod is ready,
 	// it means we are ok scheduling pods to it.
-	readyCniNodes := krt.NewCollection(readyCniPods, func(ctx krt.HandlerContext, p v1.Pod) *v1.Node {
+	readyCniNodes := krt.NewCollection(readyCniPods, func(ctx krt.HandlerContext, p *v1.Pod) **v1.Node {
 		pnode := krt.FetchOne(ctx, nodes, krt.FilterKey(p.Spec.NodeName))
 		if pnode == nil {
 			return nil
 		}
 		node := *pnode
-		if !hasTaint(node) {
+		if !n.hasTaint(node) {
 			return nil
 		}
-		return node
-	}, krt.WithStop(stop))
+		return pnode
+	}, opts.WithName("ready-cni-nodes")...)
 
 	n.queue = controllers.NewQueue("untaint nodes",
 		controllers.WithReconciler(n.reconcileNode),
 		controllers.WithMaxAttempts(5))
 
 	// remove the taints from readyCniNodes
-	readyCniNodes.Register(func(o krt.Event[v1.Node]) {
+	readyCniNodes.Register(func(o krt.Event[*v1.Node]) {
 		if o.Event == controllers.EventDelete {
 			return
 		}
 		if o.New != nil {
-			log.Debugf("adding node to queue event: %s", o.New.Name)
-			n.queue.AddObject(o.New)
+			log.Debugf("adding node to queue event: %s", (*o.New).Name)
+			n.queue.AddObject(*o.New)
 		}
 	})
 }
@@ -147,15 +148,15 @@ func (n *NodeUntainter) reconcileNode(key types.NamespacedName) error {
 		return nil
 	}
 
-	err := removeReadinessTaint(n.nodesClient, node)
+	err := removeReadinessTaint(n.nodesClient, node, n.taintName)
 	if err != nil {
-		log.Errorf("failed to remove readiness taint from node %v: %v", node.Name, err)
+		log.Errorf("failed to remove readiness taint '%v' from node %v: %v", n.taintName, node.Name, err)
 	}
 	return err
 }
 
-func removeReadinessTaint(nodesClient kclient.Client[*v1.Node], node *v1.Node) error {
-	updatedTaint := deleteTaint(node.Spec.Taints)
+func removeReadinessTaint(nodesClient kclient.Client[*v1.Node], node *v1.Node, taintName string) error {
+	updatedTaint := deleteTaint(node.Spec.Taints, taintName)
 	if len(updatedTaint) == len(node.Spec.Taints) {
 		// nothing to remove..
 		return nil
@@ -190,10 +191,10 @@ func removeReadinessTaint(nodesClient kclient.Client[*v1.Node], node *v1.Node) e
 }
 
 // deleteTaint removes all the taints that have the same key and effect to given taintToDelete.
-func deleteTaint(taints []v1.Taint) []v1.Taint {
+func deleteTaint(taints []v1.Taint, taintName string) []v1.Taint {
 	newTaints := []v1.Taint{}
 	for i := range taints {
-		if taints[i].Key == TaintName {
+		if taints[i].Key == taintName {
 			continue
 		}
 		newTaints = append(newTaints, taints[i])
@@ -201,9 +202,9 @@ func deleteTaint(taints []v1.Taint) []v1.Taint {
 	return newTaints
 }
 
-func hasTaint(n *v1.Node) bool {
-	for _, taint := range n.Spec.Taints {
-		if taint.Key == TaintName {
+func (n *NodeUntainter) hasTaint(node *v1.Node) bool {
+	for _, taint := range node.Spec.Taints {
+		if taint.Key == n.taintName {
 			return true
 		}
 	}

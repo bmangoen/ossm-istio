@@ -38,19 +38,22 @@ type envoy struct {
 
 // Envoy binary flags
 type ProxyConfig struct {
-	LogLevel          string
-	ComponentLogLevel string
-	NodeIPs           []string
-	Sidecar           bool
-	LogAsJSON         bool
-	OutlierLogPath    string
+	LogLevel           string
+	ComponentLogLevel  string
+	NodeIPs            []string
+	Sidecar            bool
+	LogAsJSON          bool
+	OutlierLogPath     string
+	SkipDeprecatedLogs bool
 
-	BinaryPath    string
-	ConfigPath    string
-	ConfigCleanup bool
-	AdminPort     int32
-	DrainDuration *durationpb.Duration
-	Concurrency   int32
+	BinaryPath         string
+	ConfigPath         string
+	ConfigCleanup      bool
+	AdminPort          int32
+	DrainDuration      *durationpb.Duration
+	Concurrency        int32
+	FileFlushInterval  *durationpb.Duration
+	FileFlushMinSizeKB uint32
 
 	// For unit testing, in combination with NoEnvoy prevents agent.Run from blocking
 	TestOnly    bool
@@ -70,6 +73,10 @@ func NewProxy(cfg ProxyConfig) Proxy {
 	} else if cfg.ComponentLogLevel != "" {
 		// Use the old setting if we don't set any component log levels in LogLevel
 		args = append(args, "--component-log-level", cfg.ComponentLogLevel)
+	}
+
+	if cfg.SkipDeprecatedLogs {
+		args = append(args, "--skip-deprecated-logs")
 	}
 
 	// Explicitly enable core dumps. This may be desirable more often (by default), but for now we only set it in VM tests.
@@ -121,6 +128,11 @@ func (e *envoy) args(fname string, overrideFname string) []string {
 	if network.AllIPv6(e.NodeIPs) {
 		proxyLocalAddressType = "v6"
 	}
+	fileFlushInterval := "1000" // Default 1s
+	if e.FileFlushInterval != nil {
+		fileFlushInterval = fmt.Sprint(e.FileFlushInterval.AsDuration().Milliseconds())
+	}
+
 	startupArgs := []string{
 		"-c", fname,
 		"--drain-time-s", fmt.Sprint(int(e.DrainDuration.AsDuration().Seconds())),
@@ -132,9 +144,13 @@ func (e *envoy) args(fname string, overrideFname string) []string {
 		// At low QPS access logs are unlikely a bottleneck, and these users will now see logs after 1s rather than 10s.
 		// At high QPS (>250 QPS) we will log the same amount as we will log due to exceeding buffer size, rather
 		// than the flush interval.
-		"--file-flush-interval-msec", "1000",
+		"--file-flush-interval-msec", fileFlushInterval,
 		"--disable-hot-restart", // We don't use it, so disable it to simplify Envoy's logic
 		"--allow-unknown-static-fields",
+	}
+
+	if e.FileFlushMinSizeKB > 0 {
+		startupArgs = append(startupArgs, "--file-flush-min-size-kb", fmt.Sprint(e.FileFlushMinSizeKB))
 	}
 
 	startupArgs = append(startupArgs, e.extraArgs...)
@@ -156,8 +172,6 @@ func (e *envoy) args(fname string, overrideFname string) []string {
 	return startupArgs
 }
 
-var HostIP = os.Getenv("HOST_IP")
-
 // readBootstrapToJSON reads a config file, in YAML or JSON, and returns JSON string
 func readBootstrapToJSON(fname string) (string, error) {
 	b, err := os.ReadFile(fname)
@@ -167,7 +181,15 @@ func readBootstrapToJSON(fname string) (string, error) {
 
 	// Replace host with HOST_IP env var if it is "$(HOST_IP)".
 	// This is to support some tracer setting (Datadog, Zipkin), where "$(HOST_IP)" is used for address.
-	b = bytes.ReplaceAll(b, []byte("$(HOST_IP)"), []byte(HostIP))
+	HostIPEnv := os.Getenv("HOST_IP")
+
+	if strings.Contains(HostIPEnv, ":") { // For IPv6, address needs to be of form `[ff06::c3]:8126`
+		HostIPEnv = "[" + HostIPEnv + "]"
+		// Avoid adding extra [] where users add them explicitly
+		b = bytes.ReplaceAll(b, []byte("[$(HOST_IP)]"), []byte(HostIPEnv))
+	}
+	b = bytes.ReplaceAll(b, []byte("$(HOST_IP)"), []byte(HostIPEnv))
+
 	converted, err := yaml.YAMLToJSON(b)
 	if err != nil {
 		return "", fmt.Errorf("failed to convert to JSON: %s, %v", fname, err)
@@ -188,7 +210,8 @@ func (e *envoy) Run(abort <-chan error) error {
 	/* #nosec */
 	cmd := exec.Command(e.BinaryPath, args...)
 	cmd.Env = os.Environ()
-	if common_features.CompliancePolicy == common_features.FIPS_140_2 {
+	if common_features.CompliancePolicy == common_features.FIPS_140_2 ||
+		common_features.CompliancePolicy == common_features.FIPS_140_3 {
 		// Limit the TLSv1.2 ciphers in google_grpc client in Envoy to the compliant ciphers.
 		cmd.Env = append(cmd.Env,
 			"GRPC_SSL_CIPHER_SUITES=ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384")

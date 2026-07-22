@@ -31,20 +31,41 @@ type ConnectionsFilter struct {
 	Namespace string
 	Direction string
 	Raw       bool
+	// Workload filters connections to only those belonging to a specific workload by pod name.
+	// Supports both "name" (with Namespace set separately) and "name.namespace" formats.
+	Workload string
+}
+
+// normalize parses a "name.namespace" Workload field into separate Workload and Namespace
+// when Namespace is not already set.
+func (f *ConnectionsFilter) normalize() {
+	if f.Workload != "" && f.Namespace == "" {
+		if parts := strings.SplitN(f.Workload, ".", 2); len(parts) == 2 {
+			f.Workload = parts[0]
+			f.Namespace = parts[1]
+		}
+	}
 }
 
 func (c *ConfigWriter) PrintConnectionsDump(filter ConnectionsFilter, outputFormat string) error {
+	filter.normalize()
 	d := c.ztunnelDump
 	workloads := maps.Values(d.WorkloadState)
 	workloads = slices.SortFunc(workloads, func(a, b WorkloadState) int {
 		if r := cmp.Compare(a.Info.Namespace, b.Info.Namespace); r != 0 {
 			return r
 		}
-		return cmp.Compare(a.Info.Namespace, b.Info.Namespace)
+		// Compare name if namespaces are the same
+		return cmp.Compare(a.Info.Name, b.Info.Name)
 	})
 	workloads = slices.FilterInPlace(workloads, func(state WorkloadState) bool {
 		if filter.Namespace != "" && filter.Namespace != state.Info.Namespace {
 			return false
+		}
+		if filter.Workload != "" {
+			if !strings.EqualFold(filter.Workload, state.Info.Name) {
+				return false
+			}
 		}
 		return true
 	})
@@ -62,6 +83,7 @@ func (c *ConfigWriter) PrintConnectionsDump(filter ConnectionsFilter, outputForm
 }
 
 func (c *ConfigWriter) PrintConnectionsSummary(filter ConnectionsFilter) error {
+	filter.normalize()
 	w := c.tabwriter()
 	d := c.ztunnelDump
 	serviceNames := map[string]string{}
@@ -101,27 +123,30 @@ func (c *ConfigWriter) PrintConnectionsSummary(filter ConnectionsFilter) error {
 		}
 		return addr
 	}
-	fmt.Fprintln(w, "WORKLOAD\tDIRECTION\tLOCAL\tREMOTE\tREMOTE TARGET")
+	fmt.Fprintln(w, "WORKLOAD\tDIRECTION\tLOCAL\tREMOTE\tREMOTE TARGET\tPROTOCOL")
 	workloads := maps.Values(d.WorkloadState)
 	workloads = slices.SortFunc(workloads, func(a, b WorkloadState) int {
 		if r := cmp.Compare(a.Info.Namespace, b.Info.Namespace); r != 0 {
 			return r
 		}
-		return cmp.Compare(a.Info.Namespace, b.Info.Namespace)
+		return cmp.Compare(a.Info.Name, b.Info.Name)
 	})
 	for _, wl := range workloads {
 		if filter.Namespace != "" && filter.Namespace != wl.Info.Namespace {
 			continue
 		}
 		name := fmt.Sprintf("%s.%s", wl.Info.Name, wl.Info.Namespace)
+		if filter.Workload != "" && !strings.EqualFold(filter.Workload, wl.Info.Name) {
+			continue
+		}
 		if filter.Direction != "outbound" {
 			for _, c := range wl.Connections.Inbound {
-				fmt.Fprintf(w, "%v\tInbound\t%v\t%v\t%v\n", name, lookupIP(c.ActualDst), lookupIP(c.Src), c.OriginalDst)
+				fmt.Fprintf(w, "%v\tInbound\t%v\t%v\t%v\t%v\n", name, lookupIP(c.ActualDst), lookupIP(c.Src), c.OriginalDst, c.Protocol)
 			}
 		}
 		if filter.Direction != "inbound" {
 			for _, c := range wl.Connections.Outbound {
-				fmt.Fprintf(w, "%v\tOutbound\t%v\t%v\t%v\n", name, lookupIP(c.Src), lookupIP(c.ActualDst), lookupIP(c.OriginalDst))
+				fmt.Fprintf(w, "%v\tOutbound\t%v\t%v\t%v\t%v\n", name, lookupIP(c.Src), lookupIP(c.ActualDst), lookupIP(c.OriginalDst), c.Protocol)
 			}
 		}
 	}

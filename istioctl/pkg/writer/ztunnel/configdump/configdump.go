@@ -25,11 +25,21 @@ import (
 	"istio.io/istio/pkg/maps"
 )
 
+// TargetWorkload identifies a specific workload pod that was targeted by the user.
+// When set, commands should filter output to only show data relevant to this workload.
+type TargetWorkload struct {
+	Name      string
+	Namespace string
+}
+
 // ConfigWriter is a writer for processing responses from the Ztunnel Admin config_dump endpoint
 type ConfigWriter struct {
 	Stdout      io.Writer
 	ztunnelDump *ZtunnelDump
 	FullDump    []byte
+	// TargetWorkload is set when the user targeted a workload pod (not a ztunnel pod).
+	// Commands use this to filter output to only the targeted workload.
+	TargetWorkload *TargetWorkload
 }
 
 type rawDump struct {
@@ -89,21 +99,38 @@ func (c *ConfigWriter) PrintBootstrapDump(outputFormat string) error {
 	return nil
 }
 
-func (c *ConfigWriter) PrintFullSummary() error {
+func (c *ConfigWriter) printHeaders(summary string, withHeaders bool) {
+	if withHeaders {
+		_, _ = c.Stdout.Write([]byte("------ "))
+		_, _ = c.Stdout.Write([]byte(summary))
+		_, _ = c.Stdout.Write([]byte(" ------\n\n"))
+	}
+}
+
+func (c *ConfigWriter) PrintFullSummary(withHeaders bool) error {
 	_, _ = c.Stdout.Write([]byte("\n"))
+	c.printHeaders("WORKLOAD INFO", withHeaders)
 	if err := c.PrintWorkloadSummary(WorkloadFilter{}); err != nil {
 		return err
 	}
 	_, _ = c.Stdout.Write([]byte("\n"))
+	c.printHeaders("SERVICE INFO", withHeaders)
 	if err := c.PrintServiceSummary(ServiceFilter{}); err != nil {
 		return err
 	}
 	_, _ = c.Stdout.Write([]byte("\n"))
+	c.printHeaders("POLICY INFO", withHeaders)
 	if err := c.PrintPolicySummary(PolicyFilter{}); err != nil {
 		return err
 	}
 	_, _ = c.Stdout.Write([]byte("\n"))
+	c.printHeaders("SECRET INFO", withHeaders)
 	if err := c.PrintSecretSummary(); err != nil {
+		return err
+	}
+	_, _ = c.Stdout.Write([]byte("\n"))
+	c.printHeaders("CONNECTIONS INFO", withHeaders)
+	if err := c.PrintConnectionsSummary(ConnectionsFilter{}); err != nil {
 		return err
 	}
 	return nil
